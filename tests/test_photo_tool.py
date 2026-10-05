@@ -25,11 +25,19 @@ class StarStub:
         self.context = context
 
 
+class FilterStub:
+    @staticmethod
+    def on_llm_request(*_args, **_kwargs):
+        return lambda function: function
+
+
 def _install_astrbot_stubs() -> None:
     """Provide only the AstrBot public API surface used by this plugin."""
     astrbot = types.ModuleType("astrbot")
     api = types.ModuleType("astrbot.api")
     api.logger = types.SimpleNamespace(exception=lambda *_args, **_kwargs: None)
+    api_event = types.ModuleType("astrbot.api.event")
+    api_event.filter = FilterStub
     api_star = types.ModuleType("astrbot.api.star")
     api_star.Context = object
     api_star.Star = StarStub
@@ -39,6 +47,7 @@ def _install_astrbot_stubs() -> None:
     tool.FunctionTool = FunctionToolStub
     astrbot.api = api
     astrbot.core = core
+    api.event = api_event
     api.star = api_star
     core.agent = agent
     agent.tool = tool
@@ -46,6 +55,7 @@ def _install_astrbot_stubs() -> None:
         {
             "astrbot": astrbot,
             "astrbot.api": api,
+            "astrbot.api.event": api_event,
             "astrbot.api.star": api_star,
             "astrbot.core": core,
             "astrbot.core.agent": agent,
