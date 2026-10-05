@@ -17,7 +17,7 @@ class PhotoService:
             return "PHOTO_SEND_FAILED"
 
         try:
-            await gallery_tool.call(
+            delegated_result = await gallery_tool.call(
                 current_context,
                 category="林小满",
                 count=1,
@@ -26,4 +26,6 @@ class PhotoService:
             logger.exception("send_xiaoman_photo delegation failed")
             return "PHOTO_SEND_FAILED"
 
-        return "PHOTO_SENT"
+        if delegated_result == "已从 林小满 分类发送 1 张图片。":
+            return "PHOTO_SENT"
+        return "PHOTO_SEND_FAILED"

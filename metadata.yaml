@@ -5,7 +5,7 @@ desc: |
   注册无参数 Function Tool `send_xiaoman_photo()`。
   仅在上层 LLM 已根据人格和上下文决定向当前聊天对象发送林小满的一张照片时调用。
   本插件不负责人格、记忆、日程、好感度或图片生成。
-version: 0.1.0
+version: 0.1.1
 author: QHongboQ
 repo: https://github.com/QHongboQ/astrbot_plugin_xiaoman_personal_interface
 astrbot_version: ">=4.28.2"

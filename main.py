@@ -2,10 +2,10 @@
 
 from astrbot.api.star import Context, Star
 
-from tools.photo_tool import XiaomanPhotoTool
+from .tools.photo_tool import XiaomanPhotoTool
 
 
-class XiaomanPersonalInterface(Star):
+class Main(Star):
     """Register the single LLM tool exposed by this plugin."""
 
     def __init__(self, context: Context, config: dict | None = None) -> None:

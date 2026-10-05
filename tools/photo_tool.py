@@ -2,7 +2,7 @@
 
 from astrbot.core.agent.tool import FunctionTool
 
-from services.photo_service import PhotoService
+from ..services.photo_service import PhotoService
 
 
 class XiaomanPhotoTool(FunctionTool):
