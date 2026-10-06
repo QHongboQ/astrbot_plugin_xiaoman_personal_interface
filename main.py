@@ -5,6 +5,12 @@ from astrbot.api.event import filter
 from astrbot.api.star import Context, Star
 
 from .services.gallery_route_adapter import guard_directed_look_request
+from .services.group_identity_context_patch import (
+    ensure_angelheart_identity_context_patch,
+    install_group_identity_context_patch,
+    uninstall_angelheart_identity_context_patch,
+    uninstall_group_identity_context_patch,
+)
 from .services.tool_visibility_adapter import hide_gallery_tool_for_xiaoman_request
 from .tools.photo_tool import XiaomanPhotoTool
 
@@ -15,10 +21,24 @@ class Main(Star):
     def __init__(self, context: Context, config: dict | None = None) -> None:
         super().__init__(context)
         self.context.add_llm_tools(XiaomanPhotoTool(context))
+        self._group_identity_patch_installed = install_group_identity_context_patch()
+        self._angelheart_identity_patch_seen = (
+            ensure_angelheart_identity_context_patch()
+        )
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
     async def guard_directed_gallery_route(self, event) -> None:
-        """Keep explicitly directed ``看...`` messages on the normal LLM route."""
+        """Prepare compatibility shims and protect directed look requests."""
+        try:
+            if ensure_angelheart_identity_context_patch():
+                self._angelheart_identity_patch_seen = True
+        except Exception:
+            # AngelHeart compatibility must never block an incoming message.
+            logger.warning(
+                "Xiaoman AngelHeart identity adapter failed open",
+                exc_info=True,
+            )
+
         try:
             guard_directed_look_request(event)
         except Exception:
@@ -33,3 +53,13 @@ class Main(Star):
         except Exception:
             # Visibility changes are request-local and must fail open.
             logger.warning("Xiaoman tool visibility adapter failed open", exc_info=True)
+
+    async def terminate(self) -> None:
+        """Restore runtime formatters when this plugin instance is unloaded."""
+        if self._angelheart_identity_patch_seen:
+            uninstall_angelheart_identity_context_patch()
+            self._angelheart_identity_patch_seen = False
+
+        if self._group_identity_patch_installed:
+            uninstall_group_identity_context_patch()
+            self._group_identity_patch_installed = False
