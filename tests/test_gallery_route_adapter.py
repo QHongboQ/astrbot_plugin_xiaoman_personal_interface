@@ -163,7 +163,13 @@ class GalleryRouteAdapterTests(unittest.TestCase):
         self.assertIn((("all",), {"priority": 100}), FilterStub.calls)
 
     def test_all_directed_look_forms_bypass_airi(self):
-        for message in ("看看你的自拍", "看你的照片", "看看林小满", "  看看你的照片\t"):
+        for message in (
+            "看看你的自拍",
+            "看你的照片",
+            "看看林小满",
+            "  看看你的照片\t",
+            "小满小满我要看看你的照片",
+        ):
             with self.subTest(message=message):
                 handlers = self._handlers()
                 event = Event(message, directed=True, handlers=handlers)
@@ -187,18 +193,84 @@ class GalleryRouteAdapterTests(unittest.TestCase):
         self.assertFalse(ADAPTER_MODULE.guard_directed_look_request(event))
         self.assertEqual(len(handlers), 4)
 
-    def test_ambiguous_photo_phrases_are_not_classified_or_intercepted(self):
+    def test_required_natural_xiaoman_photo_requests_are_intercepted(self):
         for message in (
+            "小满小满我要看看你的照片",
+            "小满小满，我要看看你的照片",
+            "小满，我想看看你的自拍",
+            "林小满给我看看照片",
+            "给我看看你的照片",
+            "我想看看你的照片",
+            "我想看一下你的自拍",
+            "我要看你的照片",
+            "能不能让我看看你的照片",
+            "可以给我看看你的照片吗",
+            "给我来一张你的照片",
+            "给我来张自拍",
+            "发张你的照片给我",
+            "发一张自拍给我",
+            "我想看看你",
+            "让我看看小满",
+            "想看看林小满",
             "小满小满看看照片",
             "小满看看照片",
-            "林小满给我看看照片",
         ):
             with self.subTest(message=message):
                 handlers = self._handlers()
                 event = Event(message, directed=True, handlers=handlers)
+                self.assertTrue(ADAPTER_MODULE.guard_directed_look_request(event))
+                # The route guard must remove only Airi's generic handler.
+                self.assertEqual(len(handlers), 3)
+                self.assertEqual(
+                    [handler.handler_name for handler in handlers],
+                    ["before", "cmd_gallery_help", "handle_gallery_message"],
+                )
+                self.assertEqual(event.message_str, message)
+
+    def test_false_positive_image_and_unrelated_requests_are_not_intercepted(self):
+        for message in (
+            "帮我看看这张照片",
+            "你看看我发的图片",
+            "这张照片好看吗",
+            "帮我分析一下这张图",
+            "看看这个截图是什么意思",
+            "我发给你的照片看到了吗",
+            "看看商品主图",
+            "看看这个文件",
+            "你在干嘛",
+            "今天怎么样",
+            "你觉得照片重要吗",
+        ):
+            with self.subTest(message=message):
+                handlers = self._handlers()
+                event = Event(message, directed=True, handlers=handlers)
+
                 self.assertFalse(ADAPTER_MODULE.guard_directed_look_request(event))
                 self.assertEqual(len(handlers), 4)
                 self.assertEqual(event.message_str, message)
+
+    def test_critical_regression_changes_only_activated_handler_list_contents(self):
+        handlers = self._handlers()
+        handlers_identity = id(handlers)
+        event = Event("小满小满我要看看你的照片", directed=True, handlers=handlers)
+        original_message = event.message_str
+        original_message_obj = event.message_obj
+
+        self.assertTrue(ADAPTER_MODULE.is_directed_look_request(event))
+        self.assertTrue(ADAPTER_MODULE.guard_directed_look_request(event))
+
+        self.assertEqual(id(event.get_extra("activated_handlers")), handlers_identity)
+        self.assertEqual(event.message_str, original_message)
+        self.assertIs(event.message_obj, original_message_obj)
+        self.assertEqual(event.stop_calls, 0)
+        self.assertEqual(
+            [(item.handler_module_path, item.handler_name) for item in handlers],
+            [
+                ("data.plugins.other.main", "before"),
+                (AIRI_MODULE, "cmd_gallery_help"),
+                ("data.plugins.other.main", "handle_gallery_message"),
+            ],
+        )
 
     def test_failure_to_read_handlers_fails_open(self):
         class BrokenEvent:
