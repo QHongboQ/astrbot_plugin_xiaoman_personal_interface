@@ -1,17 +1,60 @@
 """Per-event guard for Airi Gallery's generic no-prefix browse handler."""
 
+import re
+
 from astrbot.api import logger
 
 
 AIRI_PLUGIN_SEGMENT = "astrbot_plugin_airi_gallery"
 AIRI_GENERIC_HANDLER_NAME = "handle_gallery_message"
 
+_PHOTO_REQUEST_PATTERNS = (
+    re.compile(
+        r"(?:我(?:想|要|想要)?|想|要|让我|给我|能不能|可以|能否|麻烦)?"
+        r"(?:看(?:看|一下|下|一眼)?|瞅瞅)"
+        r"(?:你|小满|林小满)(?:本人)?(?:的)?"
+        r"(?:照片|自拍|相片|写真)?"
+    ),
+    re.compile(
+        r"(?:我(?:想|要|想要)?|想|要|给我|能不能|可以|能否|麻烦)?"
+        r"(?:发|来|给)(?:我)?(?:一|几)?(?:张|个)?"
+        r"(?:你|小满|林小满)?(?:的)?(?:照片|自拍|相片|写真)"
+    ),
+)
+
+_USER_IMAGE_REFERENCE_PATTERNS = (
+    re.compile(r"(?:这|那)(?:张|个|幅)?(?:照片|图片|图|相片)"),
+    re.compile(r"(?:我|刚才|上面)(?:发|传|贴)(?:的|过的)?(?:照片|图片|图|相片)"),
+)
+
+
+def _normalize_message(message: str) -> str:
+    """Drop whitespace and light punctuation without changing event content."""
+    return re.sub(r"[\s，。！？、,.!?~～]+", "", message)
+
+
+def _is_explicit_self_photo_request(message: str) -> bool:
+    """Match a narrow set of natural requests for Xiaoman's own photo."""
+    normalized = _normalize_message(message)
+    if not normalized:
+        return False
+
+    if any(pattern.search(normalized) for pattern in _USER_IMAGE_REFERENCE_PATTERNS):
+        return False
+
+    return any(pattern.search(normalized) for pattern in _PHOTO_REQUEST_PATTERNS)
+
 
 def is_directed_look_request(event) -> bool:
-    """Return whether this is a directly invoked message beginning with ``看``."""
+    """Return whether a directed message should bypass Airi's generic browse route."""
     if not bool(getattr(event, "is_at_or_wake_command", False)):
         return False
-    return str(getattr(event, "message_str", "") or "").strip().startswith("看")
+
+    message = str(getattr(event, "message_str", "") or "").strip()
+    if message.startswith("看"):
+        return True
+
+    return _is_explicit_self_photo_request(message)
 
 
 def is_airi_generic_browse_handler(handler) -> bool:
@@ -26,7 +69,7 @@ def guard_directed_look_request(event) -> bool:
     """Remove Airi's generic handler in place for this one directed event.
 
     AstrBot's request stage retains the activated-handler list object while
-    iterating it, so slice assignment is required.  All inspection failures
+    iterating it, so slice assignment is required. All inspection failures
     intentionally fail open to preserve the normal chat route.
     """
     if not is_directed_look_request(event):
