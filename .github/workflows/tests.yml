@@ -58,7 +58,11 @@ jobs:
         run: python -m pip install "AstrBot==4.28.2"
 
       - name: Fetch official Airi Gallery v2.11.15 source
-        run: git clone --depth 1 https://github.com/Lidure/astrbot_plugin_airi_gallery.git .official-airi-gallery
+        run: |
+          git init .official-airi-gallery
+          git -C .official-airi-gallery remote add origin https://github.com/Lidure/astrbot_plugin_airi_gallery.git
+          git -C .official-airi-gallery fetch --depth 1 origin 7d42636898763618d2efabe6047af1a74551fd8b
+          git -C .official-airi-gallery checkout --detach FETCH_HEAD
 
-      - name: Run route-guard runtime smoke
+      - name: Run plugin and route runtime smoke
         run: python tests/runtime_smoke.py .official-airi-gallery

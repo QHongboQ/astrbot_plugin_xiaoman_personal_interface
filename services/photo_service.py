@@ -1,6 +1,18 @@
 """Delegation service for the existing photo-sending tool."""
 
+import re
+
 from astrbot.api import logger
+
+
+_SUCCESS_RESULT = re.compile(
+    r"^\s*已从\s*林小满\s*分类发送\s*1\s*张图片\s*[。.!！]?\s*$"
+)
+
+
+def _confirms_requested_photo_send(result) -> bool:
+    """Accept only Airi's explicit confirmation for the requested category/count."""
+    return isinstance(result, str) and _SUCCESS_RESULT.fullmatch(result) is not None
 
 
 class PhotoService:
@@ -26,6 +38,6 @@ class PhotoService:
             logger.exception("send_xiaoman_photo delegation failed")
             return "PHOTO_SEND_FAILED"
 
-        if delegated_result == "已从 林小满 分类发送 1 张图片。":
+        if _confirms_requested_photo_send(delegated_result):
             return "PHOTO_SENT"
         return "PHOTO_SEND_FAILED"

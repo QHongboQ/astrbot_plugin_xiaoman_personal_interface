@@ -33,6 +33,10 @@ class FilterStub:
         FilterStub.calls.append((_args, _kwargs))
         return lambda function: function
 
+    @staticmethod
+    def on_llm_request(*_args, **_kwargs):
+        return lambda function: function
+
 
 def _install_astrbot_stubs() -> None:
     astrbot = types.ModuleType("astrbot")
@@ -87,10 +91,13 @@ def _load_modules():
     _install_package_path(PACKAGE_NAME, PLUGIN_ROOT)
     main = importlib.import_module(f"{PACKAGE_NAME}.main")
     adapter = importlib.import_module(f"{PACKAGE_NAME}.services.gallery_route_adapter")
-    return main, adapter
+    visibility = importlib.import_module(
+        f"{PACKAGE_NAME}.services.tool_visibility_adapter"
+    )
+    return main, adapter, visibility
 
 
-MAIN_MODULE, ADAPTER_MODULE = _load_modules()
+MAIN_MODULE, ADAPTER_MODULE, VISIBILITY_ADAPTER = _load_modules()
 
 
 class Handler:
@@ -180,6 +187,19 @@ class GalleryRouteAdapterTests(unittest.TestCase):
         self.assertFalse(ADAPTER_MODULE.guard_directed_look_request(event))
         self.assertEqual(len(handlers), 4)
 
+    def test_ambiguous_photo_phrases_are_not_classified_or_intercepted(self):
+        for message in (
+            "小满小满看看照片",
+            "小满看看照片",
+            "林小满给我看看照片",
+        ):
+            with self.subTest(message=message):
+                handlers = self._handlers()
+                event = Event(message, directed=True, handlers=handlers)
+                self.assertFalse(ADAPTER_MODULE.guard_directed_look_request(event))
+                self.assertEqual(len(handlers), 4)
+                self.assertEqual(event.message_str, message)
+
     def test_failure_to_read_handlers_fails_open(self):
         class BrokenEvent:
             is_at_or_wake_command = True
@@ -224,6 +244,46 @@ class GalleryRouteAdapterTests(unittest.TestCase):
         self.assertFalse(any("astrbot_plugin_airi_gallery" in name for name in imported_modules))
         self.assertNotIn("monkey", source.lower())
         self.assertNotIn("stop_event", source)
+
+
+class ToolVisibilityAdapterTests(unittest.TestCase):
+    class ToolSet:
+        def __init__(self, names):
+            self._names = list(names)
+            self.removed = []
+
+        def names(self):
+            return list(self._names)
+
+        def remove_tool(self, name):
+            self.removed.append(name)
+            self._names = [item for item in self._names if item != name]
+
+    def test_hides_only_gallery_send_when_wrapper_is_present(self):
+        tool_set = self.ToolSet(
+            ["send_xiaoman_photo", "gallery_send", "tts_speak", "other"]
+        )
+        req = types.SimpleNamespace(func_tool=tool_set)
+
+        self.assertTrue(VISIBILITY_ADAPTER.hide_gallery_tool_for_xiaoman_request(req))
+        self.assertEqual(tool_set.removed, ["gallery_send"])
+        self.assertEqual(tool_set.names(), ["send_xiaoman_photo", "tts_speak", "other"])
+
+    def test_does_not_add_wrapper_or_hide_gallery_when_wrapper_missing(self):
+        tool_set = self.ToolSet(["gallery_send", "tts_speak"])
+        req = types.SimpleNamespace(func_tool=tool_set)
+
+        self.assertFalse(VISIBILITY_ADAPTER.hide_gallery_tool_for_xiaoman_request(req))
+        self.assertEqual(tool_set.removed, [])
+        self.assertEqual(tool_set.names(), ["gallery_send", "tts_speak"])
+
+    def test_missing_or_incompatible_tool_set_fails_open(self):
+        for req in (types.SimpleNamespace(func_tool=None), types.SimpleNamespace()):
+            with self.subTest(req=req):
+                self.assertFalse(VISIBILITY_ADAPTER.hide_gallery_tool_for_xiaoman_request(req))
+
+    def test_hook_is_registered(self):
+        self.assertTrue(callable(MAIN_MODULE.Main.hide_delegated_gallery_tool))
 
 
 if __name__ == "__main__":

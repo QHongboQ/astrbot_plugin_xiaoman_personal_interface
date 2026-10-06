@@ -31,6 +31,10 @@ class FilterStub:
     def event_message_type(*_args, **_kwargs):
         return lambda function: function
 
+    @staticmethod
+    def on_llm_request(*_args, **_kwargs):
+        return lambda function: function
+
     EventMessageType = types.SimpleNamespace(ALL="all")
 
 
@@ -157,14 +161,14 @@ class PluginLoadTests(unittest.TestCase):
             f"{PACKAGE_NAME}.tools.photo_tool",
         )
 
-    def test_main_registers_only_the_photo_tool_without_voice_hooks(self):
+    def test_main_registers_photo_tool_and_request_local_visibility_hook(self):
         context = PluginContext(ToolManager())
         plugin = MAIN_MODULE.Main(context)
         source = inspect.getsource(MAIN_MODULE.Main)
 
         self.assertEqual([tool.name for tool in context.registered_tools], ["send_xiaoman_photo"])
         self.assertFalse(hasattr(plugin, "on_using_llm_tool"))
-        self.assertNotIn("on_llm_request", source)
+        self.assertIn("on_llm_request", source)
         self.assertNotIn("on_using_llm_tool", source)
 
     def test_runtime_source_has_no_voice_or_mimo_logic(self):
@@ -206,6 +210,8 @@ class XiaomanPhotoToolTests(unittest.TestCase):
                 "additionalProperties": False,
             },
         )
+        self.assertIn("照片", tool.description)
+        self.assertIn("若决定不发送，则正常回复而不要调用", tool.description)
 
     def test_gallery_success_returns_photo_sent(self):
         gallery_tool = GalleryTool(result=SUCCESS_RESULT)
@@ -221,6 +227,17 @@ class XiaomanPhotoToolTests(unittest.TestCase):
             gallery_tool.calls,
             [(current_context, {"category": "林小满", "count": 1})],
         )
+
+    def test_gallery_success_tolerates_spacing_and_optional_punctuation(self):
+        for result_text in (
+            "已从林小满分类发送1张图片",
+            "  已从  林小满 分类发送 1 张图片！  ",
+        ):
+            with self.subTest(result_text=result_text):
+                tool = XiaomanPhotoTool(
+                    PluginContext(ToolManager(GalleryTool(result=result_text)))
+                )
+                self.assertEqual(self._invoke(tool, object()), "PHOTO_SENT")
 
     def test_gallery_normal_failure_result_returns_failed(self):
         gallery_tool = GalleryTool(result="图库分类 林小满 中没有可用的图片。")

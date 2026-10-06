@@ -12,8 +12,9 @@ class XiaomanPhotoTool(FunctionTool):
         super().__init__(
             name="send_xiaoman_photo",
             description=(
-                "向当前聊天对象发送林小满的一张照片。"
-                "仅在上层人格和上下文已经决定发送时调用。"
+                "向当前聊天对象发送林小满本人/自拍的一张真实照片。"
+                "当用户请求林小满的照片或自拍时，若你根据人格和上下文决定愿意发送，调用此工具；"
+                "若决定不发送，则正常回复而不要调用。是否调用由你根据当前人格和上下文决定。"
             ),
             parameters={
                 "type": "object",
