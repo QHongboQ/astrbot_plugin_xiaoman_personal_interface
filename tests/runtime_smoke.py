@@ -13,6 +13,10 @@ import re
 
 from astrbot.api.star import Star
 from astrbot.core.agent.tool import FunctionTool, ToolSet
+from astrbot.core.pipeline.waking_check.stage import WakingCheckStage
+from astrbot.core.message.components import Plain
+from astrbot.core.platform.message_type import MessageType
+from astrbot.core.star.session_plugin_manager import SessionPluginManager
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -113,6 +117,56 @@ class Event:
         self.stop_calls += 1
 
 
+class WakingEvent(Event):
+    """Small event double for the real v4.28.2 WakingCheckStage.process."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__([])
+        self.message_str = message
+        self.message_obj = types.SimpleNamespace(type=MessageType.GROUP_MESSAGE)
+        self.is_at_or_wake_command = False
+        self.is_wake = False
+        self.role = "member"
+        self.plugins_name = None
+        self.unified_msg_origin = "qq:group:smoke"
+
+    def set_extra(self, key: str, value) -> None:
+        if not hasattr(self, "_extras"):
+            self._extras = {}
+        self._extras[key] = value
+
+    def get_extra(self, key: str | None = None, default=None):
+        extras = getattr(self, "_extras", {})
+        return extras.get(key, default) if key is not None else extras
+
+    def get_messages(self):
+        return [Plain(self.message_str)]
+
+    def get_message_str(self) -> str:
+        return self.message_str
+
+    def get_sender_id(self) -> str:
+        return "sender-smoke"
+
+    def get_self_id(self) -> str:
+        return "bot-smoke"
+
+    def get_group_id(self) -> str:
+        return "group-smoke"
+
+    def get_platform_name(self) -> str:
+        return "aiocqhttp"
+
+    def is_private_chat(self) -> bool:
+        return False
+
+    def get_message_type(self):
+        return MessageType.GROUP_MESSAGE
+
+    async def send(self, _result) -> None:
+        raise AssertionError("WakingCheck should not send a response in this smoke")
+
+
 async def run(official_airi_root: Path | None = None) -> None:
     assert importlib.metadata.version("AstrBot") == "4.28.2"
     main = load_main()
@@ -169,6 +223,61 @@ async def run(official_airi_root: Path | None = None) -> None:
         ("data.plugins.other.main", "before"),
         (AIRI_MODULE, "cmd_gallery_help"),
     ]
+
+    # Exercise AstrBot's real wake-prefix stripping and activated-handler selection.
+    config = {
+        "platform_settings": {
+            "friend_message_needs_wake_prefix": False,
+            "ignore_bot_self_message": False,
+            "ignore_at_all": False,
+            "unique_session": False,
+        },
+        "admins_id": [],
+        "wake_prefix": ["小满小满"],
+        "disable_builtin_commands": False,
+        "plugin_set": ["*"],
+    }
+    waking = WakingCheckStage()
+    await waking.initialize(
+        types.SimpleNamespace(
+            astrbot_config=config,
+            db_helper=None,
+            astrbot_config_id="runtime-smoke",
+        )
+    )
+    original_filter = SessionPluginManager.filter_handlers_by_session
+
+    async def keep_handlers(_event, activated):
+        return activated
+
+    SessionPluginManager.filter_handlers_by_session = staticmethod(keep_handlers)
+    try:
+        for incoming, expected_reroute in (
+            ("小满小满，给我看看照片", True),
+            ("小满小满来张自拍", True),
+            ("小满小满看看默认", False),
+        ):
+            waking_event = WakingEvent(incoming)
+            await waking.process(waking_event)
+            assert waking_event.is_at_or_wake_command is True
+            assert waking_event.message_str == incoming[len("小满小满") :].strip()
+            activated = waking_event.get_extra("activated_handlers")
+            assert any(
+                item.handler_module_path == AIRI_MODULE
+                and item.handler_name == "handle_gallery_message"
+                for item in activated
+            )
+            await plugin.guard_directed_gallery_route(waking_event)
+            has_generic = any(
+                item.handler_module_path == AIRI_MODULE
+                and item.handler_name == "handle_gallery_message"
+                for item in activated
+            )
+            assert has_generic is (not expected_reroute)
+            assert waking_event.stop_calls == 0
+    finally:
+        SessionPluginManager.filter_handlers_by_session = original_filter
+
     assert "on_llm_request" in inspect.getsource(main.Main.hide_delegated_gallery_tool)
 
 
