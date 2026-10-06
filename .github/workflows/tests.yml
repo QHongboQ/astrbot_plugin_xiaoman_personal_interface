@@ -64,5 +64,5 @@ jobs:
           git -C .official-airi-gallery fetch --depth 1 origin 7d42636898763618d2efabe6047af1a74551fd8b
           git -C .official-airi-gallery checkout --detach FETCH_HEAD
 
-      - name: Run plugin and route runtime smoke
+      - name: Run plugin and Airi prefix-mode smoke
         run: python tests/runtime_smoke.py .official-airi-gallery

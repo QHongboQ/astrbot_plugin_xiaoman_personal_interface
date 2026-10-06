@@ -28,14 +28,8 @@ class StarStub:
 
 class FilterStub:
     @staticmethod
-    def event_message_type(*_args, **_kwargs):
-        return lambda function: function
-
-    @staticmethod
     def on_llm_request(*_args, **_kwargs):
         return lambda function: function
-
-    EventMessageType = types.SimpleNamespace(ALL="all")
 
 
 def _install_astrbot_stubs() -> None:
@@ -170,6 +164,42 @@ class PluginLoadTests(unittest.TestCase):
         self.assertFalse(hasattr(plugin, "on_using_llm_tool"))
         self.assertIn("on_llm_request", source)
         self.assertNotIn("on_using_llm_tool", source)
+
+    def test_no_natural_language_routing_hook_or_message_workaround_remains(self):
+        source = (PLUGIN_ROOT / "main.py").read_text(encoding="utf-8")
+        for removed_route_marker in (
+            "event_message_type",
+            "guard_directed_gallery_route",
+            "gallery_route_adapter",
+            "message_str",
+            "stop_event",
+        ):
+            self.assertNotIn(removed_route_marker, source)
+
+        for path in (PLUGIN_ROOT / "services").glob("*.py"):
+            content = path.read_text(encoding="utf-8")
+            self.assertNotIn("message_str", content)
+            self.assertNotIn("stop_event", content)
+
+    def test_request_local_visibility_hides_only_generic_gallery_tool(self):
+        class ToolSetStub:
+            def __init__(self, names):
+                self._names = list(names)
+
+            def names(self):
+                return list(self._names)
+
+            def remove_tool(self, name):
+                self._names.remove(name)
+
+        req = types.SimpleNamespace(
+            func_tool=ToolSetStub(["send_xiaoman_photo", "gallery_send", "tts_speak"])
+        )
+        plugin = MAIN_MODULE.Main(PluginContext(ToolManager()))
+
+        asyncio.run(plugin.hide_delegated_gallery_tool(None, req))
+
+        self.assertEqual(req.func_tool.names(), ["send_xiaoman_photo", "tts_speak"])
 
     def test_runtime_source_has_no_voice_or_mimo_logic(self):
         runtime_sources = [
