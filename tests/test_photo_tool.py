@@ -30,6 +30,10 @@ class FilterStub:
     def on_llm_request(*_args, **_kwargs):
         return lambda function: function
 
+    @staticmethod
+    def on_using_llm_tool(*_args, **_kwargs):
+        return lambda function: function
+
 
 def _install_astrbot_stubs() -> None:
     """Provide only the AstrBot public API surface used by this plugin."""
