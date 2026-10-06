@@ -255,6 +255,7 @@ async def run(official_airi_root: Path | None = None) -> None:
         for incoming, expected_reroute in (
             ("小满小满，给我看看照片", True),
             ("小满小满来张自拍", True),
+            ("小满小满看看天文台照片", False),
             ("小满小满看看默认", False),
         ):
             waking_event = WakingEvent(incoming)
@@ -262,12 +263,14 @@ async def run(official_airi_root: Path | None = None) -> None:
             assert waking_event.is_at_or_wake_command is True
             assert waking_event.message_str == incoming[len("小满小满") :].strip()
             activated = waking_event.get_extra("activated_handlers")
+            activated_id = id(activated)
             assert any(
                 item.handler_module_path == AIRI_MODULE
                 and item.handler_name == "handle_gallery_message"
                 for item in activated
             )
             await plugin.guard_directed_gallery_route(waking_event)
+            assert id(waking_event.get_extra("activated_handlers")) == activated_id
             has_generic = any(
                 item.handler_module_path == AIRI_MODULE
                 and item.handler_name == "handle_gallery_message"

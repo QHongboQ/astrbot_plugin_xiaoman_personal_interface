@@ -300,6 +300,29 @@ class GalleryRouteAdapterTests(unittest.TestCase):
                     self.assertEqual(len(handlers), 4)
                     self.assertEqual(event.message_str, message)
 
+    def test_open_class_competing_targets_and_explicit_self_precedence(self):
+        # The first family intentionally uses arbitrary nouns absent from the
+        # classifier: noun modifiers are competing visual targets, not a list.
+        competing = (
+            "给我看看天文台照片",
+            "发张猫咪自拍给我",
+            "来一张旅行相片",
+            "看看朋友的写真",
+            "看看用户上传的截图",
+        )
+        positive = (
+            "小满给我看看照片",
+            "能不能告訴我你长什么样",
+            "给我看看你自己的照片",
+            "小满小满，来张自拍",
+        )
+        for message in competing:
+            with self.subTest(kind="competing", message=message):
+                self.assertFalse(ADAPTER_MODULE.is_directed_look_request(Event(message, directed=True, handlers=[])))
+        for message in positive:
+            with self.subTest(kind="self-or-implicit", message=message):
+                self.assertTrue(ADAPTER_MODULE.is_directed_look_request(Event(message, directed=True, handlers=[])))
+
     def test_non_directed_visual_request_is_not_rerouted(self):
         for message in ("给我看看照片", "来一张自拍", "照片呢"):
             with self.subTest(message=message):
