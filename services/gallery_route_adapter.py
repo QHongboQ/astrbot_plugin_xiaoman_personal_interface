@@ -16,7 +16,8 @@ _ACTION = re.compile(
     r"|来|整|弄|找|有没(?:有)?|有没有|有|"
     r"看一看|看一下|看一眼|看看|看下|瞅一眼|瞅瞅|瞧一眼|瞧瞧|看"
 )
-_MEDIA_OBJECT = re.compile(r"截图|照片|自拍|相片|写真|图片|图像|影像|美照|图|文件")
+_MEDIA_OBJECT = re.compile(r"截图|照片|自拍|相片|写真|图片|图像|影像|美照|文件")
+_PERSONAL_MEDIA_OBJECT = re.compile(r"照片|自拍|相片|写真|图片|图像|影像|美照")
 _APPEARANCE_OBJECT = re.compile(
     r"长什么样|长啥样|什么样子|啥样|长相|模样|外貌|长得"
 )
@@ -34,6 +35,20 @@ _ACTION_FILLER = re.compile(r"^(?:一下|一眼|一张|张|个)")
 _VISUAL_QUALIFIER = re.compile(
     r"(?:好看|漂亮|可爱|帅气|清晰|高清|精美|精致|唯美|复古|经典|新|旧|美)(?:的)?$"
 )
+_DESCRIPTIVE_PREDICATE = re.compile(
+    r"(?:穿|戴|拿|抱|坐|站|走|跑|跳|笑|写|画|读|喝|吃|弹|唱|工作|学习).+"
+    r"(?:着|了|过|的)?$"
+)
+_LOCATIVE_MODIFIER = re.compile(
+    r"(?:在|于).+(?:里|中|内|上|下|旁|附近)?(?:的)?(?:本人|自己)?$"
+    r"|.+(?:里|中|内|上|下|旁|附近)的?(?:本人|自己)?$"
+)
+_TEMPORAL_MODIFIER = re.compile(
+    r"(?:今天|明天|昨天|今晚|今早|明早|昨晚|本周|下周|上周|本月|下月|上月|今年|明年|去年)(?:的)?"
+    r"|\d{1,4}(?:年|月|日|号|点|时|周|星期)(?:\d{1,4}(?:月|日|号|点|时)?)?(?:的)?$"
+)
+_STATE_MODIFIER = re.compile(r".+(?:状态|外观|样子|模样).*(?:的)?$")
+_DEGREE_ADJECTIVE = re.compile(r"(?:很|挺|比较|特别|非常|有点|有些).+的$")
 _USER_SOURCE = re.compile(r"(?<!给)我(?:刚(?:才)?|最近)?(?:发(?:给你)?|上传|传|拍)(?:的|给你的)")
 _DEICTIC_REFERENCE = re.compile(r"(?:上面|刚才|这(?:张|个|幅)|那(?:张|个|幅))")
 _IMAGE_ANALYSIS = re.compile(r"分析|识别|解释|总结|提取|OCR", re.IGNORECASE)
@@ -70,6 +85,23 @@ def _modifier_before_visual_object(message: str, visual_match: re.Match) -> str:
     return prefix
 
 
+def _is_descriptive_modifier(modifier: str) -> bool:
+    """Recognize modifier syntax that describes Xiaoman rather than naming a target.
+
+    Predicate, locative, temporal and marked state/adjective structures are
+    open-class: their nouns/adjectives are not enumerated in the classifier.
+    Bare nominal compounds and genitives remain target-bearing by default.
+    """
+    return bool(
+        _VISUAL_QUALIFIER.fullmatch(modifier)
+        or _DESCRIPTIVE_PREDICATE.fullmatch(modifier)
+        or _LOCATIVE_MODIFIER.fullmatch(modifier)
+        or _TEMPORAL_MODIFIER.fullmatch(modifier)
+        or _STATE_MODIFIER.fullmatch(modifier)
+        or _DEGREE_ADJECTIVE.fullmatch(modifier)
+    )
+
+
 def _resolve_visual_target(message: str, visual_match: re.Match | None) -> str:
     """Resolve explicit self/other target before allowing a directed implicit target."""
     if visual_match is None:
@@ -85,6 +117,12 @@ def _resolve_visual_target(message: str, visual_match: re.Match | None) -> str:
     if not modifier:
         return "implicit"
 
+    # Chinese can place the explicit person head after a descriptive clause:
+    # "穿外套的本人照片" / "某日期的本人自拍".
+    person_head = re.search(r"(?:本人|自己)$", modifier)
+    if person_head and _is_descriptive_modifier(modifier[: person_head.start()]):
+        return "self"
+
     user_owner = _USER_OWNER.match(modifier)
     if user_owner:
         # The user is the possessor/source of the requested visual object.
@@ -98,13 +136,13 @@ def _resolve_visual_target(message: str, visual_match: re.Match | None) -> str:
         # Possession scopes over the entire noun phrase. Any lexical modifier
         # between Xiaoman's possessor and the media head names another target,
         # regardless of whether Chinese repeats 的.
-        if remaining:
+        if remaining and not _is_descriptive_modifier(remaining):
             return "competing"
         return "self"
 
     # A noun phrase attached to the visual object supplies its own target.
     # This is open-class, so an unfamiliar noun does not need a code change.
-    if _VISUAL_QUALIFIER.fullmatch(modifier):
+    if _is_descriptive_modifier(modifier):
         return "implicit"
     return "competing"
 
@@ -123,6 +161,14 @@ def _is_xiaoman_visual_request(message: str, *, directed: bool) -> bool:
     # command such as "看看默认" has neither a self target nor appearance intent.
     if visual_match is None:
         return bool(_SELF_VIEW_TARGET.search(message) or _APPEARANCE_OBJECT.search(message))
+
+    # Screenshots, files and similar references are generic artifacts, not
+    # personal visual media. They never inherit Xiaoman as an omitted target.
+    if (
+        _MEDIA_OBJECT.fullmatch(visual_match.group(0))
+        and not _PERSONAL_MEDIA_OBJECT.fullmatch(visual_match.group(0))
+    ):
+        return False
 
     prefix = message[: visual_match.start()]
     if _USER_SOURCE.search(prefix) or _DEICTIC_REFERENCE.search(message[: visual_match.end()]):

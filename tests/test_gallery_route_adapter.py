@@ -352,6 +352,42 @@ class GalleryRouteAdapterTests(unittest.TestCase):
             with self.subTest(kind="not-routed", message=message):
                 self.assertFalse(ADAPTER_MODULE.is_directed_look_request(Event(message, directed=True, handlers=[])))
 
+    def test_open_class_descriptive_modifier_families_inherit_xiaoman(self):
+        # Each group varies the value while retaining the grammatical marker;
+        # no garment, location or time value is encoded in production rules.
+        descriptive_families = {
+            "predicate/clothing": (
+                "给我看看穿蓝色外套的照片",
+                "给我看看你穿正式礼服的照片",
+                "想看你戴圆框眼镜的照片",
+                "发个穿运动服的本人自拍",
+            ),
+            "location": (
+                "发个在陶艺工作室的自拍",
+                "发张在市立图书馆的照片",
+                "来张画室中的本人自拍",
+            ),
+            "time": (
+                "来张今天的照片",
+                "发张下周的自拍",
+                "想看2031年5月的本人照片",
+            ),
+            "state/activity": (
+                "给我看看很疲倦的照片",
+                "想看有点紧张状态的自拍",
+                "发张笑着的照片",
+            ),
+        }
+        for family, messages in descriptive_families.items():
+            for message in messages:
+                with self.subTest(family=family, message=message):
+                    self.assertTrue(ADAPTER_MODULE.is_directed_look_request(Event(message, directed=True, handlers=[])))
+
+    def test_generic_visual_and_reference_media_do_not_inherit_target(self):
+        for message in ("发个截图", "发个文件", "给我发张截图", "想看文件"):
+            with self.subTest(message=message):
+                self.assertFalse(ADAPTER_MODULE.is_directed_look_request(Event(message, directed=True, handlers=[])))
+
     def test_non_directed_visual_request_is_not_rerouted(self):
         for message in ("给我看看照片", "来一张自拍", "照片呢"):
             with self.subTest(message=message):
