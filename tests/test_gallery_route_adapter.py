@@ -323,6 +323,35 @@ class GalleryRouteAdapterTests(unittest.TestCase):
             with self.subTest(kind="self-or-implicit", message=message):
                 self.assertTrue(ADAPTER_MODULE.is_directed_look_request(Event(message, directed=True, handlers=[])))
 
+    def test_grammatical_roles_sources_actors_and_complete_possessives(self):
+        routed = (
+            "给我发张你的照片",
+            "请给我发一张你的自拍",
+            "发给我你的照片",
+            "看看你的照片",
+            "发个自拍",
+            "自拍发一下",
+        )
+        not_routed = (
+            "我发的照片",
+            "我刚发给你的照片",
+            "我上传的照片",
+            "你看看照片",
+            "你看看图片",
+            "看看你的猫照片",
+            "看看你的朋友照片",
+            "看看你的作品照片",
+            "看看你的猫的照片",
+            "看看你朋友的照片",
+            "你的照片真好看",
+        )
+        for message in routed:
+            with self.subTest(kind="routed", message=message):
+                self.assertTrue(ADAPTER_MODULE.is_directed_look_request(Event(message, directed=True, handlers=[])))
+        for message in not_routed:
+            with self.subTest(kind="not-routed", message=message):
+                self.assertFalse(ADAPTER_MODULE.is_directed_look_request(Event(message, directed=True, handlers=[])))
+
     def test_non_directed_visual_request_is_not_rerouted(self):
         for message in ("给我看看照片", "来一张自拍", "照片呢"):
             with self.subTest(message=message):
