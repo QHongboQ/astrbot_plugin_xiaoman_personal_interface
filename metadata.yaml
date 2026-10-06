@@ -6,7 +6,7 @@ desc: |
   仅在上层 LLM 已根据人格和上下文决定向当前聊天对象发送林小满的一张照片时调用。
   自然语言路由由正常 LLM 处理；显式图库浏览命令由 Airi Gallery 处理。
   本插件不负责 TTS、人格、记忆、日程、好感度或图片生成。
-version: 0.2.1
+version: 0.2.2
 author: QHongboQ
 repo: https://github.com/QHongboQ/astrbot_plugin_xiaoman_personal_interface
 astrbot_version: ">=4.28.2"

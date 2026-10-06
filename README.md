@@ -31,6 +31,10 @@ send_xiaoman_photo()
 
 本版本不包含任何 TTS、语音提示、表演标签或 MiMo 逻辑。
 
+## 管理员测试模式
+
+仅 AstrBot 管理员 UID `979675497` 可使用 `/xiaoman_test on|off|status`。模式按 UMO 会话隔离、仅保存在内存中，插件重启后关闭；启用期间只对当前管理员会话提供测试放行 guidance，并在该事件中隔离 AngelHeart。
+
 ## 安装与验证
 
 在 AstrBot 插件页安装本仓库 Release 的 ZIP，或将本目录放入 AstrBot 插件目录后重启/重载插件。

@@ -27,9 +27,24 @@ class StarStub:
 
 
 class FilterStub:
+    class PermissionType:
+        ADMIN = "admin"
+
+    class EventMessageType:
+        GROUP_MESSAGE = 1
+        PRIVATE_MESSAGE = 2
+
+    @staticmethod
+    def _decorator(*_args, **_kwargs):
+        return lambda function: function
+
     @staticmethod
     def on_llm_request(*_args, **_kwargs):
         return lambda function: function
+
+    permission_type = _decorator
+    command = _decorator
+    event_message_type = _decorator
 
 
 def _install_astrbot_stubs() -> None:
@@ -43,6 +58,8 @@ def _install_astrbot_stubs() -> None:
     )
     api_event = types.ModuleType("astrbot.api.event")
     api_event.filter = FilterStub
+    api_event.EventMessageType = FilterStub.EventMessageType
+    api_event.PermissionType = FilterStub.PermissionType
     api_star = types.ModuleType("astrbot.api.star")
     api_star.Context = object
     api_star.Star = StarStub
@@ -168,17 +185,14 @@ class PluginLoadTests(unittest.TestCase):
     def test_no_natural_language_routing_hook_or_message_workaround_remains(self):
         source = (PLUGIN_ROOT / "main.py").read_text(encoding="utf-8")
         for removed_route_marker in (
-            "event_message_type",
             "guard_directed_gallery_route",
             "gallery_route_adapter",
-            "message_str",
             "stop_event",
         ):
             self.assertNotIn(removed_route_marker, source)
 
         for path in (PLUGIN_ROOT / "services").glob("*.py"):
             content = path.read_text(encoding="utf-8")
-            self.assertNotIn("message_str", content)
             self.assertNotIn("stop_event", content)
 
     def test_request_local_visibility_hides_only_generic_gallery_tool(self):
