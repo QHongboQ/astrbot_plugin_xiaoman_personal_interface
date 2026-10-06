@@ -173,5 +173,146 @@ class GroupIdentityPatchLifecycleTests(unittest.TestCase):
         )
 
 
+class AngelHeartIdentityPatchTests(unittest.TestCase):
+    MODULE_NAMES = (
+        "data.plugins.astrbot_plugin_angel_heart.core.utils.xml_formatter",
+        "data.plugins.astrbot_plugin_angel_heart.core.utils.context_utils",
+        "data.plugins.astrbot_plugin_angel_heart.core.message_processor",
+    )
+
+    def setUp(self):
+        self.saved_modules = {
+            name: sys.modules.get(name)
+            for name in self.MODULE_NAMES
+        }
+
+        xml_module = types.ModuleType(self.MODULE_NAMES[0])
+        context_module = types.ModuleType(self.MODULE_NAMES[1])
+        processor_module = types.ModuleType(self.MODULE_NAMES[2])
+
+        def format_message_to_text(
+            msg,
+            alias="AngelHeart",
+            wrapper_tag=None,
+            use_relative_time=False,
+        ):
+            if (
+                isinstance(msg, dict)
+                and msg.get("role") == "user"
+                and ":GroupMessage:" in str(msg.get("chat_id", ""))
+                and msg.get("sender_name") != "tool_result"
+                and "sender_name" in msg
+            ):
+                role_label = msg.get("sender_role") or "群友"
+                header = (
+                    f"[群友: {msg.get('sender_name')} "
+                    f"(ID: {msg.get('sender_id', 'Unknown')}, {role_label})]"
+                )
+                body = f"{header} (2026-10-05 22:35): {msg.get('content', '')}"
+            else:
+                body = f"ORIGINAL:{msg.get('content', '')}"
+
+            if wrapper_tag:
+                return f"<{wrapper_tag}>\n{body}\n</{wrapper_tag}>"
+            return body
+
+        self.original_formatter = format_message_to_text
+        xml_module.format_message_to_text = format_message_to_text
+        context_module.format_message_to_text = format_message_to_text
+        processor_module.format_message_to_text = format_message_to_text
+
+        sys.modules.update(
+            {
+                self.MODULE_NAMES[0]: xml_module,
+                self.MODULE_NAMES[1]: context_module,
+                self.MODULE_NAMES[2]: processor_module,
+            }
+        )
+        self.xml_module = xml_module
+        self.context_module = context_module
+        self.processor_module = processor_module
+
+    def tearDown(self):
+        PATCH.uninstall_angelheart_identity_context_patch()
+        for name, module in self.saved_modules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+    def test_patches_canonical_and_already_imported_formatter_references(self):
+        self.assertTrue(PATCH.ensure_angelheart_identity_context_patch())
+        self.assertIs(
+            self.xml_module.format_message_to_text,
+            self.context_module.format_message_to_text,
+        )
+        self.assertIs(
+            self.xml_module.format_message_to_text,
+            self.processor_module.format_message_to_text,
+        )
+
+        msg = {
+            "role": "user",
+            "content": "你好",
+            "sender_name": "白丝少妇",
+            "sender_id": "2409043649",
+            "sender_role": "群友",
+            "chat_id": "default:GroupMessage:1153387215",
+        }
+        rendered = self.context_module.format_message_to_text(msg)
+
+        self.assertEqual(
+            rendered,
+            "[昵称：白丝少妇 | QQ号：2409043649 | 群号：1153387215 | 身份：群友] "
+            "(2026-10-05 22:35): 你好",
+        )
+        self.assertEqual(msg["sender_name"], "白丝少妇")
+        self.assertEqual(msg["sender_id"], "2409043649")
+
+    def test_system_notice_like_sender_name_remains_a_labeled_name(self):
+        self.assertTrue(PATCH.ensure_angelheart_identity_context_patch())
+        msg = {
+            "role": "user",
+            "content": "欢迎加入",
+            "sender_name": "群主邀请了“白丝少妇”加入了群聊",
+            "sender_id": "2409043649",
+            "sender_role": "群主",
+            "chat_id": "default:GroupMessage:1439184369",
+        }
+
+        rendered = self.xml_module.format_message_to_text(msg)
+
+        self.assertIn("昵称：群主邀请了“白丝少妇”加入了群聊", rendered)
+        self.assertIn("QQ号：2409043649", rendered)
+        self.assertIn("群号：1439184369", rendered)
+        self.assertIn("身份：群主", rendered)
+
+    def test_private_messages_are_not_rewritten(self):
+        self.assertTrue(PATCH.ensure_angelheart_identity_context_patch())
+        msg = {
+            "role": "user",
+            "content": "私聊",
+            "sender_name": "用户",
+            "sender_id": "10001",
+            "chat_id": "default:FriendMessage:10001",
+        }
+
+        self.assertEqual(
+            self.xml_module.format_message_to_text(msg),
+            "ORIGINAL:私聊",
+        )
+
+    def test_repeated_ensure_is_idempotent_and_uninstall_restores_all_references(self):
+        self.assertTrue(PATCH.ensure_angelheart_identity_context_patch())
+        first_wrapper = self.xml_module.format_message_to_text
+        self.assertTrue(PATCH.ensure_angelheart_identity_context_patch())
+        self.assertIs(self.xml_module.format_message_to_text, first_wrapper)
+
+        self.assertTrue(PATCH.uninstall_angelheart_identity_context_patch())
+        self.assertIs(self.xml_module.format_message_to_text, self.original_formatter)
+        self.assertIs(self.context_module.format_message_to_text, self.original_formatter)
+        self.assertIs(self.processor_module.format_message_to_text, self.original_formatter)
+
+
 if __name__ == "__main__":
     unittest.main()
