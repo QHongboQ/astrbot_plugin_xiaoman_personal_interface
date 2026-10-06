@@ -87,9 +87,31 @@ _install_astrbot_stubs()
 MAIN_MODULE, GUIDANCE_MODULE = _load_plugin_modules()
 
 
-class PluginContext:
-    def add_llm_tools(self, *_tools):
+class ToolManager:
+    def __init__(self, tts_tool=None, error=None):
+        self.tts_tool = tts_tool
+        self.error = error
+        self.requested_names = []
+
+    def get_func(self, name):
+        self.requested_names.append(name)
+        if self.error is not None:
+            raise self.error
+        if name == "tts_speak":
+            return self.tts_tool
         return None
+
+
+class PluginContext:
+    def __init__(self, tool_manager=None):
+        self.tool_manager = tool_manager or ToolManager(tts_tool=object())
+        self.registered_tools = []
+
+    def add_llm_tools(self, *tools):
+        self.registered_tools.extend(tools)
+
+    def get_llm_tool_manager(self):
+        return self.tool_manager
 
 
 class Request:
@@ -98,8 +120,8 @@ class Request:
 
 
 class VoiceGuidanceTests(unittest.TestCase):
-    def _run_hook(self, system_prompt=""):
-        plugin = MAIN_MODULE.Main(PluginContext())
+    def _run_hook(self, system_prompt="", *, tool_manager=None):
+        plugin = MAIN_MODULE.Main(PluginContext(tool_manager))
         request = Request(system_prompt)
         asyncio.run(plugin.on_llm_request(object(), request))
         return request
@@ -134,25 +156,72 @@ class VoiceGuidanceTests(unittest.TestCase):
 
         self.assertEqual(request.system_prompt, GUIDANCE_MODULE.XIAOMAN_MIMO_VOICE_GUIDANCE)
 
-    def test_guidance_contains_required_stable_rules(self):
+    def test_guidance_is_skipped_when_tts_speak_is_missing(self):
+        manager = ToolManager(tts_tool=None)
+        request = self._run_hook("original", tool_manager=manager)
+
+        self.assertEqual(request.system_prompt, "original")
+        self.assertEqual(manager.requested_names, ["tts_speak"])
+
+    def test_guidance_is_skipped_when_tool_manager_lookup_fails(self):
+        manager = ToolManager(error=RuntimeError("tool lookup failed"))
+        request = self._run_hook("original", tool_manager=manager)
+
+        self.assertEqual(request.system_prompt, "original")
+
+    def test_guidance_contains_preferred_baseline_tag(self):
+        baseline = "语速稍快，连续说，停顿很短"
+
+        self.assertEqual(GUIDANCE_MODULE.BASELINE_PERFORMANCE_TAG, baseline)
+        self.assertEqual(GUIDANCE_MODULE.SUPPORTED_PERFORMANCE_TAGS[0], baseline)
+        self.assertIn(f"（{baseline}）", GUIDANCE_MODULE.XIAOMAN_MIMO_VOICE_GUIDANCE)
+
+    def test_supported_tags_are_explicit_and_stable(self):
+        self.assertEqual(
+            GUIDANCE_MODULE.SUPPORTED_PERFORMANCE_TAGS,
+            (
+                "语速稍快，连续说，停顿很短",
+                "轻笑",
+                "心虚",
+                "委屈",
+                "不耐烦",
+                "疲惫",
+                "撒娇",
+                "气声",
+                "鼻音",
+                "稍慢，语气放软",
+                "放慢一点，重点说",
+            ),
+        )
+
+    def test_guidance_requires_only_whitelisted_tags(self):
         guidance = GUIDANCE_MODULE.XIAOMAN_MIMO_VOICE_GUIDANCE
 
-        for required_text in (
-            "自然略快",
-            "连续",
-            "短停顿",
-            "0～1 个最常见",
-            "最多使用 2 个标签",
-            "轻笑",
-            "心虚",
-            "委屈",
-            "稍慢，语气放软",
-            "放慢一点，重点说",
-        ):
-            self.assertIn(required_text, guidance)
+        self.assertIn("只能使用上面的白名单标签", guidance)
+        self.assertIn("不要发明、改写或组合新的括号控制词", guidance)
 
-    def test_guidance_explicitly_forbids_tag_stacking(self):
-        self.assertIn("不要连续堆叠多个标签", GUIDANCE_MODULE.XIAOMAN_MIMO_VOICE_GUIDANCE)
+    def test_guidance_limits_short_replies_to_two_tags(self):
+        guidance = GUIDANCE_MODULE.XIAOMAN_MIMO_VOICE_GUIDANCE
+
+        self.assertIn("普通短回复总数最多 2 个", guidance)
+        self.assertIn("不要连续堆叠多个标签", guidance)
+
+    def test_guidance_contains_local_slowing_rules(self):
+        guidance = GUIDANCE_MODULE.XIAOMAN_MIMO_VOICE_GUIDANCE
+
+        self.assertIn("稍慢，语气放软", guidance)
+        self.assertIn("放慢一点，重点说", guidance)
+        self.assertIn("不要让整段都变慢", guidance)
+
+    def test_helper_detects_registered_tts_speak(self):
+        context = PluginContext(ToolManager(tts_tool=object()))
+
+        self.assertTrue(GUIDANCE_MODULE.is_tts_speak_available(context))
+
+    def test_helper_returns_false_for_missing_tts_speak(self):
+        context = PluginContext(ToolManager(tts_tool=None))
+
+        self.assertFalse(GUIDANCE_MODULE.is_tts_speak_available(context))
 
     def test_hook_exception_preserves_normal_request_flow(self):
         request = Request("untouched")
@@ -162,3 +231,7 @@ class VoiceGuidanceTests(unittest.TestCase):
             asyncio.run(plugin.on_llm_request(object(), request))
 
         self.assertEqual(request.system_prompt, "untouched")
+
+
+if __name__ == "__main__":
+    unittest.main()
