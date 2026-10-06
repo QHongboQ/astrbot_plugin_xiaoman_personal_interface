@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib
+import inspect
 import sys
 import types
 import unittest
@@ -27,19 +28,21 @@ class StarStub:
 
 class FilterStub:
     @staticmethod
-    def on_llm_request(*_args, **_kwargs):
+    def event_message_type(*_args, **_kwargs):
         return lambda function: function
 
-    @staticmethod
-    def on_using_llm_tool(*_args, **_kwargs):
-        return lambda function: function
+    EventMessageType = types.SimpleNamespace(ALL="all")
 
 
 def _install_astrbot_stubs() -> None:
     """Provide only the AstrBot public API surface used by this plugin."""
     astrbot = types.ModuleType("astrbot")
     api = types.ModuleType("astrbot.api")
-    api.logger = types.SimpleNamespace(exception=lambda *_args, **_kwargs: None)
+    api.logger = types.SimpleNamespace(
+        exception=lambda *_args, **_kwargs: None,
+        warning=lambda *_args, **_kwargs: None,
+        debug=lambda *_args, **_kwargs: None,
+    )
     api_event = types.ModuleType("astrbot.api.event")
     api_event.filter = FilterStub
     api_star = types.ModuleType("astrbot.api.star")
@@ -153,6 +156,37 @@ class PluginLoadTests(unittest.TestCase):
             type(context.registered_tools[0]).__module__,
             f"{PACKAGE_NAME}.tools.photo_tool",
         )
+
+    def test_main_registers_only_the_photo_tool_without_voice_hooks(self):
+        context = PluginContext(ToolManager())
+        plugin = MAIN_MODULE.Main(context)
+        source = inspect.getsource(MAIN_MODULE.Main)
+
+        self.assertEqual([tool.name for tool in context.registered_tools], ["send_xiaoman_photo"])
+        self.assertFalse(hasattr(plugin, "on_using_llm_tool"))
+        self.assertNotIn("on_llm_request", source)
+        self.assertNotIn("on_using_llm_tool", source)
+
+    def test_runtime_source_has_no_voice_or_mimo_logic(self):
+        runtime_sources = [
+            (PLUGIN_ROOT / "main.py").read_text(encoding="utf-8"),
+            *(path.read_text(encoding="utf-8") for path in (PLUGIN_ROOT / "services").glob("*.py")),
+            *(path.read_text(encoding="utf-8") for path in (PLUGIN_ROOT / "tools").glob("*.py")),
+        ]
+        source = "\n".join(runtime_sources).lower()
+
+        for forbidden in (
+            "tts_speak",
+            "mimo",
+            "voice_tool",
+            "语速稍快",
+            "轻笑",
+            "心虚",
+            "委屈",
+            "不耐烦",
+            "疲惫",
+        ):
+            self.assertNotIn(forbidden, source)
 
 
 class XiaomanPhotoToolTests(unittest.TestCase):

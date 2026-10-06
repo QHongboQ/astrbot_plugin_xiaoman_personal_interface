@@ -4,23 +4,22 @@ from astrbot.api import logger
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star
 
-from .services.voice_tool_adapter import decorate_tts_speak_tool_args
+from .services.gallery_route_adapter import guard_directed_look_request
 from .tools.photo_tool import XiaomanPhotoTool
 
 
 class Main(Star):
-    """Register Xiaoman's stable LLM-facing capabilities."""
+    """Expose the photo tool and protect Xiaoman-directed conversations."""
 
     def __init__(self, context: Context, config: dict | None = None) -> None:
         super().__init__(context)
         self.context.add_llm_tools(XiaomanPhotoTool(context))
 
-    @filter.on_using_llm_tool()
-    async def on_using_llm_tool(self, event, tool, tool_args) -> None:
-        """Adapt only a concrete tts_speak invocation; never alter LLM prompts."""
-        if getattr(tool, "name", None) != "tts_speak":
-            return
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
+    async def guard_directed_gallery_route(self, event) -> None:
+        """Keep explicitly directed ``看...`` messages on the normal LLM route."""
         try:
-            decorate_tts_speak_tool_args(tool_args)
+            guard_directed_look_request(event)
         except Exception:
-            logger.exception("failed to adapt Xiaoman tts_speak arguments")
+            # The guard must never block chat if an event implementation changes.
+            logger.warning("Xiaoman gallery route guard failed open", exc_info=True)
