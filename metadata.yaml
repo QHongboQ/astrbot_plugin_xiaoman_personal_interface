@@ -3,9 +3,9 @@ display_name: 林小满个人接口
 short_desc: 提供林小满照片能力与稳定的 MiMo 语音表演指引。
 desc: |
   注册无参数 Function Tool `send_xiaoman_photo()`，并向主 LLM 追加稳定的林小满 MiMo 语音表演规则。
-  照片工具仅在上层 LLM 已根据人格和上下文决定向当前聊天对象发送林小满的一张照片时调用。
+  语音指导仅在公开的 `tts_speak` Function Tool 可用时注入，并使用固定白名单标签。
   本插件不负责 TTS 合成、人格、记忆、日程、好感度或图片生成。
-version: 0.1.2
+version: 0.1.3
 author: QHongboQ
 repo: https://github.com/QHongboQ/astrbot_plugin_xiaoman_personal_interface
 astrbot_version: ">=4.28.2"
