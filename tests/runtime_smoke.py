@@ -119,6 +119,14 @@ async def run(official_airi_root: Path | None = None) -> None:
     context = Context()
     plugin = main.Main(context)
     assert isinstance(plugin, Star)
+
+    from astrbot.builtin_stars.astrbot.group_chat_context import GroupChatContext
+
+    assert getattr(
+        GroupChatContext._format_message,
+        "__xiaoman_identity_context_patch__",
+        False,
+    )
     assert [tool.name for tool in context.tools] == ["send_xiaoman_photo"]
     assert type(context.tools[0]).__module__ == f"{PACKAGE_NAME}.tools.photo_tool"
     assert "照片" in context.tools[0].description
@@ -170,6 +178,13 @@ async def run(official_airi_root: Path | None = None) -> None:
         (AIRI_MODULE, "cmd_gallery_help"),
     ]
     assert "on_llm_request" in inspect.getsource(main.Main.hide_delegated_gallery_tool)
+
+    await plugin.terminate()
+    assert not getattr(
+        GroupChatContext._format_message,
+        "__xiaoman_identity_context_patch__",
+        False,
+    )
 
 
 if __name__ == "__main__":
