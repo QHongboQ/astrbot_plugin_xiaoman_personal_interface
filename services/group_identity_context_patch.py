@@ -1,9 +1,10 @@
-"""Compatibility shim for explicit QQ group identity labels in AstrBot context."""
+"""Compatibility shims for explicit QQ group identity labels in LLM context."""
 
 from __future__ import annotations
 
 import functools
 import re
+import sys
 from typing import Any
 
 
@@ -13,6 +14,14 @@ _ORIGINAL_ATTR = "__xiaoman_identity_context_original__"
 _REFCOUNT_ATTR = "__xiaoman_identity_context_refcount__"
 _TIME_PATTERN = r"\d{2}:\d{2}:\d{2}"
 
+_ANGELHEART_MODULE_TOKEN = "astrbot_plugin_angel_heart"
+_ANGELHEART_FORMATTER_SUFFIX = ".core.utils.xml_formatter"
+_ANGELHEART_PATCH_MARKER = "__xiaoman_angelheart_identity_patch__"
+_ANGELHEART_ORIGINAL_ATTR = "__xiaoman_angelheart_identity_original__"
+_AH_NAME_SENTINEL = "__XIAOMAN_NAME__"
+_AH_ID_SENTINEL = "__XIAOMAN_QQ__"
+_AH_ROLE_SENTINEL = "__XIAOMAN_ROLE__"
+
 
 def _warn(message: str, *, exc_info: bool = False) -> None:
     """Log through AstrBot when available without making it an import-time dependency."""
@@ -21,7 +30,7 @@ def _warn(message: str, *, exc_info: bool = False) -> None:
 
         logger.warning(message, exc_info=exc_info)
     except Exception:
-        # This compatibility layer must never prevent the plugin from loading.
+        # Compatibility patches must never prevent the plugin from loading.
         pass
 
 
@@ -31,6 +40,15 @@ def _clean_identity_value(value: Any) -> str:
         return "未知"
     text = " ".join(str(value).split())
     return text or "未知"
+
+
+def _extract_group_id_from_chat_id(chat_id: Any) -> str:
+    """Extract the group number from an AstrBot unified group origin."""
+    text = str(chat_id or "")
+    marker = ":GroupMessage:"
+    if marker not in text:
+        return ""
+    return text.split(marker, 1)[1].strip()
 
 
 def rewrite_group_context_record(rendered: str, event: Any) -> str:
@@ -146,3 +164,143 @@ def uninstall_group_identity_context_patch() -> bool:
     except Exception:
         _warn("Xiaoman group identity patch uninstall failed", exc_info=True)
         return False
+
+
+def _make_angelheart_formatter_wrapper(original):
+    """Wrap AngelHeart's formatter without mutating its message dictionaries."""
+
+    @functools.wraps(original)
+    def wrapped(msg, *args, **kwargs):
+        try:
+            if not isinstance(msg, dict):
+                return original(msg, *args, **kwargs)
+
+            chat_id = str(msg.get("chat_id", "") or "")
+            if (
+                msg.get("role") != "user"
+                or msg.get("sender_name") == "tool_result"
+                or ":GroupMessage:" not in chat_id
+                or "sender_name" not in msg
+            ):
+                return original(msg, *args, **kwargs)
+
+            sender_name = msg.get("sender_name", "成员")
+            sender_id = msg.get("sender_id", "Unknown")
+            sender_role = msg.get("sender_role") or "群友"
+            group_id = _extract_group_id_from_chat_id(chat_id)
+
+            shadow = dict(msg)
+            shadow["sender_name"] = _AH_NAME_SENTINEL
+            shadow["sender_id"] = _AH_ID_SENTINEL
+            shadow["sender_role"] = _AH_ROLE_SENTINEL
+
+            rendered = original(shadow, *args, **kwargs)
+            if not isinstance(rendered, str):
+                return rendered
+
+            old_header = (
+                f"[群友: {_AH_NAME_SENTINEL} "
+                f"(ID: {_AH_ID_SENTINEL}, {_AH_ROLE_SENTINEL})]"
+            )
+            if old_header not in rendered:
+                # AngelHeart changed its formatter. Return the untouched original form.
+                return original(msg, *args, **kwargs)
+
+            explicit_header = (
+                f"[昵称：{_clean_identity_value(sender_name)}"
+                f" | QQ号：{_clean_identity_value(sender_id)}"
+                f" | 群号：{_clean_identity_value(group_id)}"
+                f" | 身份：{_clean_identity_value(sender_role)}]"
+            )
+            return rendered.replace(old_header, explicit_header, 1)
+        except Exception:
+            _warn(
+                "Xiaoman AngelHeart identity patch failed open for one message",
+                exc_info=True,
+            )
+            return original(msg, *args, **kwargs)
+
+    setattr(wrapped, _ANGELHEART_PATCH_MARKER, True)
+    setattr(wrapped, _ANGELHEART_ORIGINAL_ATTR, original)
+    return wrapped
+
+
+def ensure_angelheart_identity_context_patch() -> bool:
+    """Patch loaded AngelHeart formatter references after all plugin imports.
+
+    AngelHeart imports format_message_to_text into several modules. This function
+    replaces both the canonical formatter and any already-bound references that still
+    point to the same original callable. Repeated calls are idempotent.
+    """
+    try:
+        modules = list(sys.modules.items())
+        formatter_pairs = []
+
+        for module_name, module in modules:
+            if (
+                not module
+                or _ANGELHEART_MODULE_TOKEN not in module_name
+                or not module_name.endswith(_ANGELHEART_FORMATTER_SUFFIX)
+            ):
+                continue
+
+            current = getattr(module, "format_message_to_text", None)
+            if not callable(current):
+                continue
+
+            if getattr(current, _ANGELHEART_PATCH_MARKER, False):
+                original = getattr(current, _ANGELHEART_ORIGINAL_ATTR, None)
+                if callable(original):
+                    formatter_pairs.append((original, current))
+                continue
+
+            wrapper = _make_angelheart_formatter_wrapper(current)
+            setattr(module, "format_message_to_text", wrapper)
+            formatter_pairs.append((current, wrapper))
+
+        if not formatter_pairs:
+            return False
+
+        for module_name, module in modules:
+            if not module or _ANGELHEART_MODULE_TOKEN not in module_name:
+                continue
+
+            candidate = getattr(module, "format_message_to_text", None)
+            if not callable(candidate):
+                continue
+
+            for original, wrapper in formatter_pairs:
+                if candidate is original:
+                    setattr(module, "format_message_to_text", wrapper)
+                    break
+
+        return True
+    except Exception:
+        _warn("Xiaoman AngelHeart identity patch was not installed", exc_info=True)
+        return False
+
+
+def uninstall_angelheart_identity_context_patch() -> bool:
+    """Restore every loaded AngelHeart formatter reference owned by this plugin."""
+    restored = False
+    try:
+        for module_name, module in list(sys.modules.items()):
+            if not module or _ANGELHEART_MODULE_TOKEN not in module_name:
+                continue
+
+            current = getattr(module, "format_message_to_text", None)
+            if not callable(current) or not getattr(
+                current,
+                _ANGELHEART_PATCH_MARKER,
+                False,
+            ):
+                continue
+
+            original = getattr(current, _ANGELHEART_ORIGINAL_ATTR, None)
+            if callable(original):
+                setattr(module, "format_message_to_text", original)
+                restored = True
+        return restored
+    except Exception:
+        _warn("Xiaoman AngelHeart identity patch uninstall failed", exc_info=True)
+        return restored
