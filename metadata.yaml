@@ -1,10 +1,10 @@
 name: astrbot_plugin_xiaoman_personal_interface
 display_name: 林小满个人接口
-short_desc: 向 LLM 提供经人格决策后发送林小满照片的工具，并保护定向自然语言请求。
+short_desc: 向 LLM 提供经人格决策后发送林小满照片的工具。
 desc: |
   注册无参数 Function Tool `send_xiaoman_photo()`。
   仅在上层 LLM 已根据人格和上下文决定向当前聊天对象发送林小满的一张照片时调用。
-  对直接唤醒林小满且以“看”开头的消息，仅跳过 Airi Gallery 的通用无前缀浏览处理器，保留原始文本交给正常 LLM 流程。
+  自然语言路由由正常 LLM 处理；显式图库浏览命令由 Airi Gallery 处理。
   本插件不负责 TTS、人格、记忆、日程、好感度或图片生成。
 version: 0.2.1
 author: QHongboQ
