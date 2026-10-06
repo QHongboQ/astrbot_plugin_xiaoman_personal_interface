@@ -5,6 +5,10 @@ from astrbot.api.event import filter
 from astrbot.api.star import Context, Star
 
 from .services.gallery_route_adapter import guard_directed_look_request
+from .services.group_identity_context_patch import (
+    install_group_identity_context_patch,
+    uninstall_group_identity_context_patch,
+)
 from .services.tool_visibility_adapter import hide_gallery_tool_for_xiaoman_request
 from .tools.photo_tool import XiaomanPhotoTool
 
@@ -15,6 +19,7 @@ class Main(Star):
     def __init__(self, context: Context, config: dict | None = None) -> None:
         super().__init__(context)
         self.context.add_llm_tools(XiaomanPhotoTool(context))
+        self._group_identity_patch_installed = install_group_identity_context_patch()
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
     async def guard_directed_gallery_route(self, event) -> None:
@@ -33,3 +38,9 @@ class Main(Star):
         except Exception:
             # Visibility changes are request-local and must fail open.
             logger.warning("Xiaoman tool visibility adapter failed open", exc_info=True)
+
+    async def terminate(self) -> None:
+        """Restore AstrBot's formatter when this plugin instance is unloaded."""
+        if self._group_identity_patch_installed:
+            uninstall_group_identity_context_patch()
+            self._group_identity_patch_installed = False
