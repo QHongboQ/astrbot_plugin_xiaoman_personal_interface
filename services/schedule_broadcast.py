@@ -367,19 +367,18 @@ class ScheduleBroadcastService:
                 "slot_end": str(slot.get("end", "")),
             })
 
-        raw_context = [
-            {key: slot.get(key, "") for key in ("start", "end", "name", "state")}
-            for slot in schedule.get("slots", []) if isinstance(slot, dict)
-        ]
         for window in windows:
             cover_id = f"{local_date.isoformat()}-P{window['index']:02d}"
-            duration = int((window["cover_end"] - window["cover_start"]).total_seconds() // 60)
+            peak_duration = int((window["peak_end"] - window["peak_start"]).total_seconds() // 60)
+            primary_activity = self._primary_peak_activity(
+                schedule, local_date, timezone, window["peak_start"], window["peak_end"]
+            )
             context = {
                 "activity_id": cover_id,
-                "duration_minutes": duration,
+                "peak_duration_minutes": peak_duration,
                 "peak_start": window["peak_start"].isoformat(),
                 "peak_end": window["peak_end"].isoformat(),
-                "nearby_raw_slots": raw_context,
+                "primary_activity": primary_activity,
             }
             for kind, trigger in (("PEAK_START", window["cover_start"]), ("PEAK_END", window["cover_end"])):
                 if trigger + timedelta(seconds=int(self._get("grace_seconds", 60))) < now.astimezone(_zone(timezone)):
@@ -388,7 +387,9 @@ class ScheduleBroadcastService:
                     "id": f"{cover_id}-{kind}",
                     "kind": kind,
                     "activity_id": cover_id,
-                    "activity_duration_minutes": duration,
+                    "activity_duration_minutes": (
+                        primary_activity["duration_minutes"] if primary_activity else None
+                    ),
                     "trigger_at": trigger.isoformat(),
                     "message": "",
                     "sent": False,
@@ -397,6 +398,36 @@ class ScheduleBroadcastService:
                 })
         entries.sort(key=lambda item: item["trigger_at"])
         return entries
+
+    def _primary_peak_activity(self, schedule, local_date, timezone, peak_start, peak_end):
+        candidates = []
+        zone = _zone(timezone)
+        peak_duration = peak_end - peak_start
+        minimum_overlap = max(timedelta(minutes=30), peak_duration / 2)
+        for index, slot in enumerate(schedule.get("slots", [])):
+            if not isinstance(slot, dict):
+                continue
+            start, start_next_day = self._clock(slot.get("start"))
+            end, end_next_day = self._clock(slot.get("end"))
+            name, state = str(slot.get("name", "")).strip(), str(slot.get("state", "")).strip()
+            if start is None or not (name or state):
+                continue
+            activity_start = datetime.combine(local_date + timedelta(days=int(start_next_day)), start, tzinfo=zone)
+            if end is None:
+                continue
+            activity_end = datetime.combine(local_date + timedelta(days=int(end_next_day)), end, tzinfo=zone)
+            if not end_next_day and activity_end <= activity_start:
+                activity_end += timedelta(days=1)
+            overlap = min(activity_end, peak_end) - max(activity_start, peak_start)
+            activity_duration = activity_end - activity_start
+            if overlap < minimum_overlap:
+                continue
+            candidates.append((overlap, -index, {
+                "name": name, "state": state,
+                "start": str(slot.get("start", "")), "end": str(slot.get("end", "")),
+                "duration_minutes": int(activity_duration.total_seconds() // 60),
+            }))
+        return max(candidates, key=lambda item: (item[0], item[1]))[2] if candidates else None
 
     def _prompt_lines(self, entries, schedule, day_kind):
         lines = []
@@ -407,14 +438,19 @@ class ScheduleBroadcastService:
                 "trigger_at": entry["trigger_at"],
                 "name": entry.get("name", ""),
                 "state": entry.get("state", ""),
+                "time_segment": [entry.get("slot_start", ""), entry.get("slot_end", "")],
                 "activity_context": entry.get("activity_context", {}),
             }
             lines.append(json.dumps(item, ensure_ascii=False))
         instructions = (
             f"目标日期 {schedule.get('local_date', '')}，日期性质 {day_kind}。"
             "为所有 ID 一次性生成消息，输出 JSON 对象且键为 ID。"
-            "同一 activity_id 的 PEAK_START 和 PEAK_END 必须描述同一个可信、持续足够久的大型活动；"
-            "开始消息表达离开，结束消息表达活动结束/返回。普通 NORMAL 消息忠于原日程。"
+            "保留默认 Persona 的活泼、随性、吐槽和情绪变化，像本人随口发消息，不要写成通知或固定模板。"
+            "每条都必须独立可懂：没看过前文的群友也要能知道具体在做什么；不要只写情绪、去/回/结束等空泛结论。"
+            "NORMAL 必须依据给出的 name、state 和 time_segment 明确说出原日程中的事情；可自然表达情绪，但不得补造地点、人物、原因、结果或与日程矛盾。"
+            "PEAK_START 与同 activity_id 的 PEAK_END 必须依据共享的 primary_activity 描述同一件具体活动：开始说将去/开始做什么，结束说这件事做完了；不可换成别的活动。primary_activity 的 duration_minutes 必须与 peak_duration_minutes 相称，不要把短暂子活动说成覆盖整个高峰。"
+            "若 primary_activity 为 null，表示日程无法确定高峰时的具体活动；不得猜测或虚构，只能自然、诚实地说要忙一阵/忙完了，且不能只写溜了或回来了。"
+            "不要为了交代背景而过度解释；保持口语、简短、有变化。"
         )
         return f"{self._get('broadcast_prompt', DEFAULT_PROMPT)}\n{instructions}\n" + "\n".join(lines)
 
