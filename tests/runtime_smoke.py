@@ -8,6 +8,7 @@ import importlib
 import importlib.metadata
 import importlib.util
 import inspect
+import json
 import re
 import subprocess
 import sys
@@ -168,10 +169,11 @@ async def verify_schedule_bridge_public_contract():
     assert isinstance(MessageChain().message("probe"), MessageChain)
 
     from datetime import datetime
+    from zoneinfo import ZoneInfo
     from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.fat_fish_bridge import FAT_FISH_NAME
     from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.schedule_broadcast import ScheduleBroadcastService
 
-    clock = datetime.now().replace(second=0, microsecond=0)
+    clock = datetime.now(ZoneInfo("Asia/Shanghai")).replace(second=0, microsecond=0)
     stamp = clock.strftime("%H:%M")
 
     class DailyScheduleService:
@@ -179,7 +181,7 @@ async def verify_schedule_bridge_public_contract():
             assert session == "qq:GroupMessage:runtime-broadcast" and trigger is False
             return "persona-hash"
         def get_snapshot_for_session(self, session, *, now):
-            return {"persona_hash":"persona-hash","snapshot_id":"snapshot","local_date":now.date().isoformat(),"timezone":"UTC","generated_at":"now","manually_edited":False}
+            return {"persona_hash":"persona-hash","snapshot_id":"snapshot","local_date":now.date().isoformat(),"timezone":"Asia/Shanghai","generated_at":"now","manually_edited":False}
     class DailyScheduleAdmin:
         def get_detail(self, *args, **kwargs):
             return {"slots":[{"slot_ref":"ref","start":stamp,"end":"23:59","name":"上午课程","state":"准备上课","origin":"ai","source_origin":"ai"}]}
@@ -237,7 +239,12 @@ async def verify_schedule_bridge_public_contract():
 
         async def llm_generate(self, *, chat_provider_id, prompt=None, tools=None, system_prompt=None, **kwargs):
             self.llm_calls.append((chat_provider_id, prompt, tools, system_prompt))
-            return types.SimpleNamespace(completion_text='{"E1":"我准备去学校上课"}')
+            event_ids = re.findall(r'"id":\s*"([^"]+)"', prompt or "")
+            return types.SimpleNamespace(completion_text=json.dumps(
+                {event_id: "上午还是去学校上课啦，虽然有点想翘课，但先去露个脸再说。"
+                 for event_id in event_ids},
+                ensure_ascii=False,
+            ))
 
         async def send_message(self, session, message_chain):
             assert isinstance(message_chain, MessageChain)
@@ -248,13 +255,71 @@ async def verify_schedule_bridge_public_contract():
     service = ScheduleBroadcastService(runtime_context, config, ".")
     service._save = lambda: None
     await service.refresh(now=clock)
-    assert len(runtime_context.llm_calls) == 1
+    assert len(runtime_context.llm_calls) == len(service.state["plans"]) == 2
     assert runtime_context.llm_calls[0][0] == "runtime-provider"
     assert runtime_context.llm_calls[0][2] is None
     assert runtime_context.llm_calls[0][3] == "runtime dict persona"
+    assert all(call[3] == "runtime dict persona" for call in runtime_context.llm_calls)
     await service.send_due(clock)
     assert len(runtime_context.sent) == 1
-    assert service.state["entries"][0]["sent"] is True
+    plan = service.plan_for_date(clock.date())
+    assert plan is not None and len(plan["entries"]) == 1
+    assert plan["entries"][0]["id"].endswith("-N01")
+    assert plan["entries"][0]["sent"] is True
+
+    await verify_schedule_broadcast_routes_by_real_platform_id()
+
+
+async def verify_schedule_broadcast_routes_by_real_platform_id() -> None:
+    """Exercise Xiaoman's send_due through AstrBot 4.28.2's real Context router."""
+    from datetime import datetime
+    from astrbot.core.star.context import Context as CoreContext
+    from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.schedule_broadcast import ScheduleBroadcastService
+
+    class RoutedPlatform:
+        def __init__(self, platform_id: str) -> None:
+            self._meta = types.SimpleNamespace(id=platform_id, name="aiocqhttp")
+            self.sent = []
+        def meta(self):
+            return self._meta
+        async def send_by_session(self, session, message_chain):
+            # Mirrors aiocqhttp's actual final group target extraction after the
+            # real AstrBot Context has routed to the adapter by platform ID.
+            group_id = session.session_id.split("_")[-1]
+            self.sent.append((session.platform_id, group_id, message_chain))
+
+    platforms = [RoutedPlatform("bot-a"), RoutedPlatform("bot-b")]
+    rows = [
+        types.SimpleNamespace(user_id="bot-a:GroupMessage:111_1153387215", platform_id="bot-a"),
+        types.SimpleNamespace(user_id="bot-a:GroupMessage:1153387215", platform_id="bot-a"),
+        types.SimpleNamespace(user_id="bot-b:GroupMessage:222_1153387215", platform_id="bot-b"),
+        types.SimpleNamespace(user_id="bot-b:GroupMessage:1153387215", platform_id="bot-b"),
+    ]
+    context = object.__new__(CoreContext)
+    context.platform_manager = types.SimpleNamespace(platform_insts=platforms)
+    context.astrbot_config_mgr = types.SimpleNamespace(get_conf=lambda umo: {})
+    context._config = {}
+    context.conversation_manager = types.SimpleNamespace(get_conversations=lambda: _async_result(rows))
+    now = datetime.now().astimezone()
+    service = ScheduleBroadcastService(context, {"schedule_broadcast": {}}, ".",
+                                       time_awareness=object(), fat_fish=object())
+    service._save = lambda: None
+    service.state = {"plans": {now.date().isoformat(): {
+        "timezone": str(now.tzinfo),
+        "entries": [{"id": "route-smoke", "trigger_at": now.isoformat(), "message": "route check",
+                     "sent": False, "expired": False, "delivered_umos": []}],
+    }}}
+    result = await service.send_due(now)
+    assert result["target_count"] == result["success_count"] == 2
+    assert result["failure_count"] == 0
+    assert {tuple(item[:2]) for platform in platforms for item in platform.sent} == {
+        ("bot-a", "1153387215"), ("bot-b", "1153387215")
+    }
+    assert all(len(platform.sent) == 1 for platform in platforms)
+
+
+async def _async_result(value):
+    return value
 
 
 class Context:

@@ -192,48 +192,48 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
     async def test_physical_qq_group_aliases_deduplicate_and_distinct_groups_remain(self):
         self._aiocqhttp("bot-a")
         self.conversation_rows=[
-            types.SimpleNamespace(user_id="default:GroupMessage:1153387215",platform_id="bot-a"),
-            types.SimpleNamespace(user_id="default:GroupMessage:979675497_1153387215",platform_id="bot-a"),
-            types.SimpleNamespace(user_id="default:GroupMessage:123456789_1153387215",platform_id="bot-a"),
-            types.SimpleNamespace(user_id="default:GroupMessage:1153387216",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="bot-a:GroupMessage:1153387215",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="bot-a:GroupMessage:979675497_1153387215",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="bot-a:GroupMessage:123456789_1153387215",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="bot-a:GroupMessage:1153387216",platform_id="bot-a"),
         ]
         targets=await self.service.targets()
-        self.assertEqual(targets,["default:GroupMessage:1153387215","default:GroupMessage:1153387216"])
+        self.assertEqual(targets,["bot-a:GroupMessage:1153387215","bot-a:GroupMessage:1153387216"])
 
     async def test_group_private_flags_and_alias_deny_allow(self):
         self._aiocqhttp("bot-a")
         self.conversation_rows=[
-            types.SimpleNamespace(user_id="default:GroupMessage:1153387215",platform_id="bot-a"),
-            types.SimpleNamespace(user_id="default:GroupMessage:979675497_1153387215",platform_id="bot-a"),
-            types.SimpleNamespace(user_id="default:FriendMessage:1153387215",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="bot-a:GroupMessage:1153387215",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="bot-a:GroupMessage:979675497_1153387215",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="bot-a:FriendMessage:1153387215",platform_id="bot-a"),
         ]
         self.service.cfg.update(send_groups=False,send_private=True)
-        self.assertEqual(await self.service.targets(),["default:FriendMessage:1153387215"])
+        self.assertEqual(await self.service.targets(),["bot-a:FriendMessage:1153387215"])
         self.service.cfg.update(send_groups=True,send_private=False,
-                                allowlist_umos=["default:GroupMessage:979675497_1153387215"],
-                                denylist_umos=["default:GroupMessage:1153387215"])
+                                allowlist_umos=["bot-a:GroupMessage:979675497_1153387215"],
+                                denylist_umos=["bot-a:GroupMessage:1153387215"])
         self.assertEqual(await self.service.targets(),[])
         self.service.cfg["denylist_umos"]=[]
-        self.assertEqual(await self.service.targets(),["default:GroupMessage:1153387215"])
+        self.assertEqual(await self.service.targets(),["bot-a:GroupMessage:1153387215"])
 
     async def test_other_platforms_and_bot_instances_are_not_merged(self):
         self._aiocqhttp("bot-a","bot-b")
         self.conversation_rows=[
-            types.SimpleNamespace(user_id="default:GroupMessage:1153387215",platform_id="bot-a"),
-            types.SimpleNamespace(user_id="default:GroupMessage:979675497_1153387215",platform_id="bot-a"),
-            types.SimpleNamespace(user_id="default:GroupMessage:1153387215",platform_id="bot-b"),
-            types.SimpleNamespace(user_id="other:GroupMessage:1153387215",platform_id="other-bot"),
+            types.SimpleNamespace(user_id="bot-a:GroupMessage:1153387215",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="bot-a:GroupMessage:979675497_1153387215",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="bot-b:GroupMessage:1153387215",platform_id="bot-b"),
+            types.SimpleNamespace(user_id="other-bot:GroupMessage:1153387215",platform_id="other-bot"),
         ]
         self.assertEqual(len(await self.service.targets()),3)
 
     async def test_invalid_umo_is_not_canonicalized(self):
         self._aiocqhttp("bot-a")
         self.conversation_rows=[
-            types.SimpleNamespace(user_id="default:GroupMessage:bad_1153387215_extra",platform_id="bot-a"),
-            types.SimpleNamespace(user_id="default:GroupMessage:1153387215",platform_id="bot-a"),
-            types.SimpleNamespace(user_id="default:GroupMessage:",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="bot-a:GroupMessage:bad_1153387215_extra",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="bot-a:GroupMessage:1153387215",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="bot-a:GroupMessage:",platform_id="bot-a"),
         ]
-        self.assertEqual(await self.service.targets(),["default:GroupMessage:1153387215","default:GroupMessage:bad_1153387215_extra"])
+        self.assertEqual(await self.service.targets(),["bot-a:GroupMessage:1153387215","bot-a:GroupMessage:bad_1153387215_extra"])
 
     async def test_simulated_event_sends_once_to_one_physical_qq_group(self):
         import astrbot.api.event
@@ -242,28 +242,28 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         astrbot.api.event.MessageChain=Chain
         self._aiocqhttp("bot-a")
         self.conversation_rows=[
-            types.SimpleNamespace(user_id="default:GroupMessage:1153387215",platform_id="bot-a"),
-            types.SimpleNamespace(user_id="default:GroupMessage:979675497_1153387215",platform_id="bot-a"),
-            types.SimpleNamespace(user_id="default:GroupMessage:123456789_1153387215",platform_id="bot-a"),
-            types.SimpleNamespace(user_id="default:GroupMessage:1153387216",platform_id="bot-a"),
-            types.SimpleNamespace(user_id="default:GroupMessage:987654321_1153387216",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="bot-a:GroupMessage:1153387215",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="bot-a:GroupMessage:979675497_1153387215",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="bot-a:GroupMessage:123456789_1153387215",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="bot-a:GroupMessage:1153387216",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="bot-a:GroupMessage:987654321_1153387216",platform_id="bot-a"),
         ]
         original=await self._prepare_simulation([{"start":"10:00","end":"10:05","name":"event","state":"x"}])
         result,error=await self.service.simulate_time("10:00")
         self.assertFalse(error)
         self.assertEqual((result["target_count"],result["success_count"],result["failure_count"]),(2,2,0))
-        self.assertEqual([umo for umo,_ in self.sent],["default:GroupMessage:1153387215","default:GroupMessage:1153387216"])
+        self.assertEqual([umo for umo,_ in self.sent],["bot-a:GroupMessage:1153387215","bot-a:GroupMessage:1153387216"])
         self.assertEqual(self.service.plan_for_date(self.now.date()),original)
 
     async def test_legacy_delivered_alias_suppresses_physical_group_resend(self):
         self._aiocqhttp("bot-a")
         self.conversation_rows=[
-            types.SimpleNamespace(user_id="default:GroupMessage:1153387215",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="bot-a:GroupMessage:1153387215",platform_id="bot-a"),
         ]
         self.slots=[{"start":"20:30","name":"x","state":"y"}]
         await self.service.refresh(now=self.now)
         entry=self.service.plan_for_date(self.now.date())["entries"][0]
-        entry["delivered_umos"]=["default:GroupMessage:979675497_1153387215"]
+        entry["delivered_umos"]=["bot-a:GroupMessage:979675497_1153387215"]
         result=await self.service.send_due(self.now.replace(hour=20,minute=30))
         self.assertEqual(result["success_count"],0)
         self.assertTrue(entry["sent"])
