@@ -37,7 +37,8 @@ def _zone(name):
 
 
 class ScheduleBroadcastService:
-    def __init__(self, context, config, data_dir, *, time_awareness=None, fat_fish=None):
+    def __init__(self, context, config, data_dir, *, time_awareness=None, fat_fish=None,
+                 rolling_day_bridge=None):
         self.context = context
         self.config = config or {}
         self.cfg = self.config.get("schedule_broadcast", {}) or {}
@@ -45,6 +46,7 @@ class ScheduleBroadcastService:
         self.state = {"plans": {}}
         self.day_adapter = time_awareness or TimeAwarenessAdapter(context)
         self.fat_fish = fat_fish or FatFishBridge(context, self.day_adapter)
+        self.rolling_day_bridge = rolling_day_bridge
         self._task = None
         self.last_schedules = {}
         self.last_error = ""
@@ -630,6 +632,69 @@ class ScheduleBroadcastService:
         targets = await self.targets()
         return await self._read_date(target_date, targets, now)
 
+    async def raw_cycle(self, now=None):
+        """Stitch TimeAwareness natural-day snapshots into Xiaoman's rolling 24h life day."""
+        now = self._now(now)
+        window = self.day_adapter.rolling_day_window(now)
+        start = window["start"]
+        end = window["end"]
+        targets = await self.targets()
+        dates = [start.date()]
+        if end.date() != start.date():
+            dates.append(end.date())
+
+        snapshots = []
+        slots = []
+        for target_date in dates:
+            schedule = await self._read_date(target_date, targets, now)
+            if schedule is None:
+                continue
+            snapshot_id = str(schedule.get("snapshot_id", "") or "")
+            if snapshot_id:
+                snapshots.append(snapshot_id)
+            timezone = str(schedule.get("timezone") or "Asia/Shanghai")
+            zone = _zone(timezone)
+            local_date = date.fromisoformat(str(schedule.get("local_date") or target_date.isoformat()))
+            for slot in schedule.get("slots", []):
+                if not isinstance(slot, dict):
+                    continue
+                slot_start, start_next_day = self._clock(slot.get("start"))
+                slot_end, end_next_day = self._clock(slot.get("end"))
+                if slot_start is None or slot_end is None:
+                    continue
+                absolute_start = datetime.combine(
+                    local_date + timedelta(days=int(start_next_day)),
+                    slot_start,
+                    tzinfo=zone,
+                )
+                absolute_end = datetime.combine(
+                    local_date + timedelta(days=int(end_next_day)),
+                    slot_end,
+                    tzinfo=zone,
+                )
+                if not end_next_day and absolute_end <= absolute_start:
+                    absolute_end += timedelta(days=1)
+                if absolute_start >= end or absolute_end <= start:
+                    continue
+                clipped_start = max(absolute_start, start.astimezone(zone))
+                clipped_end = min(absolute_end, end.astimezone(zone))
+                copied = dict(slot)
+                copied["start_at"] = clipped_start.isoformat(timespec="minutes")
+                copied["end_at"] = clipped_end.isoformat(timespec="minutes")
+                copied["calendar_date"] = local_date.isoformat()
+                slots.append(copied)
+
+        slots.sort(key=lambda item: item.get("start_at", ""))
+        return {
+            "generation_time": window.get("raw", ""),
+            "boundary_clock": window.get("clock", ""),
+            "window_start": start.isoformat(timespec="minutes"),
+            "window_end": end.isoformat(timespec="minutes"),
+            "snapshots": snapshots,
+            "complete": len(snapshots) == len(dates),
+            "slots": slots,
+        }
+
     async def build_date(self, target_date, now=None):
         now = self._now(now)
         targets = await self.targets()
@@ -787,6 +852,11 @@ class ScheduleBroadcastService:
         return result
 
     async def tick(self):
+        if (
+            self.rolling_day_bridge is not None
+            and self._get("rolling_day_bridge_enabled", True)
+        ):
+            self.rolling_day_bridge.ensure_installed()
         await self.refresh()
         await self.send_due()
 

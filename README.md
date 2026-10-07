@@ -31,13 +31,15 @@ send_xiaoman_photo()
 
 本版本不包含任何 TTS、语音提示、表演标签或 MiMo 逻辑。
 
-## 可选：TimeAwareness 日程广播（v0.5.0）
+## 可选：TimeAwareness 日程广播（v0.6.0）
 
-默认关闭。启用前请安装并启用官方 `time_awareness`。Xiaoman 仅经该插件的运行时服务注册指定会话 Persona（`trigger=False`）、读取已经存在的日程快照，并由 TimeAwareness 自己的详情 API 提供合并后的有效时间线；不读取其文件/数据库，不手动合并 AI、用户、静态与已执行层，也不会触发 TimeAwareness 日程生成。没有可用快照时不广播。
+默认关闭。启用前请安装并启用官方 `time_awareness`。广播层仍只读取已存在快照，并由 TimeAwareness 自己的详情 API 提供合并后的有效时间线；不读取其文件/数据库，不写入 AI、用户、静态或已执行层，也不会由广播循环主动触发日程生成。没有可用快照时不广播。
+
+v0.6.0 新增可选 `rolling_day_bridge_enabled`：启用时仅在内存中可逆包装 TimeAwareness 当前生成器的 Step1/Step2 prompt builder，动态读取其 `ai_daily.generation_time` 时刻作为林小满的生活日边界。例如 `-04:00` 会把规划语义解释为 `04:00 → 次日04:00`；TimeAwareness 的持久化格式仍保持官方 `00:00–24:00` 自然日协议。桥接不修改 TimeAwareness 源码、配置文件或快照数据，卸载时只恢复自己仍持有的 wrapper。
 
 快照变化后，Xiaoman 对未来且非空的时段进行一次批量消息生成，使用当前默认 Persona prompt；到点时只发送已保存消息，不调用 LLM。消息投递记录按 UMO 持久化，失败目标可在宽限期内重试，成功目标不重复发送。
 
-配置项：`enable`、`schedule_source_umo`（日程 Persona 所属的现存会话；留空使用第一个合格目标）、`send_groups`、`send_private`、`allowlist_umos`、`denylist_umos`、`provider_id`、`event_offset_minutes`、`poll_seconds`、`grace_seconds`、`max_message_chars`、`dry_run` 与 `broadcast_prompt`。仅使用 AstrBot 已有会话，不枚举 QQ 群/好友。
+配置项：`enable`、`rolling_day_bridge_enabled`、`schedule_source_umo`（日程 Persona 所属的现存会话；留空使用第一个合格目标）、`send_groups`、`send_private`、`allowlist_umos`、`denylist_umos`、`provider_id`、`event_offset_minutes`、`poll_seconds`、`grace_seconds`、`max_message_chars`、`dry_run` 与 `broadcast_prompt`。仅使用 AstrBot 已有会话，不枚举 QQ 群/好友。
 
 ### Fat Fish 策略兼容
 
@@ -51,11 +53,12 @@ Xiaoman 为官方 Fat Fish 1.1.1 提供自己的钱包策略接口，并仅对�
 
 ```text
 /xiaoman_broadcast status
+/xiaoman_broadcast raw cycle
 /xiaoman_broadcast refresh
 /xiaoman_broadcast test
 ```
 
-`status` 查看服务状态；`refresh` 立即重新读取日程（相同哈希不重复花费生成调用）；`test` 只在当前管理员会话预览或发送一条已经生成的待发送消息，且不会把正式日程标记为已发送。`dry_run` 模式下 `test` 只预览。
+`status` 查看服务状态与滚动生活日边界；`raw cycle` 将相邻两张自然日快照按当前 generation_time 拼成24小时生活日用于验收；`refresh` 立即重新读取日程（相同哈希不重复花费生成调用）；`test` 只在当前管理员会话预览或发送一条已经生成的待发送消息，且不会把正式日程标记为已发送。`dry_run` 模式下 `test` 只预览。
 
 解析支持形如 `08:55｜地点：学校｜事项：上午课程｜细节：今天第一节课有点困` 的中英文管道符格式；错误行会跳过。日程内容是事实来源，本插件不会向对话历史写入主动消息。
 

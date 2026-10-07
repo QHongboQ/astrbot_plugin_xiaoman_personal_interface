@@ -6,6 +6,7 @@ from pathlib import Path
 from test_photo_tool import MAIN_MODULE
 from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.time_awareness_adapter import TimeAwarenessAdapter
 from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.fat_fish_bridge import FatFishBridge
+from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.rolling_day_bridge import RollingDayBridge
 from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.schedule_broadcast import ScheduleBroadcastService
 
 TA, FF = "time_awareness", "astrbot_plugin_fat_fish_wallet"
@@ -52,6 +53,52 @@ class TimeAwarenessTests(unittest.IsolatedAsyncioTestCase):
         f=Fixture(); f.stars=[meta(TA,types.SimpleNamespace(time_context=types.SimpleNamespace(facts=types.SimpleNamespace(collect=lambda **kw: types.SimpleNamespace(workday=types.SimpleNamespace(kind="adjusted",available=True,value="调休上班"),now=kw["now"]))))) ]
         policy=TimeAwarenessAdapter(f).get_day_policy(datetime(2026,10,7))
         self.assertEqual(policy["kind"],"adjusted"); self.assertTrue(policy["available"])
+
+class RollingDayBridgeTests(unittest.TestCase):
+    def _fixture(self, generation_time="-04:00"):
+        config={"generation_time":generation_time}
+        class Generation:
+            def _build_prompt(_self, **kwargs): return "PLAN"
+            def _build_boundary_prompt(_self, **kwargs): return "BOUNDARY"
+        class Service:
+            def __init__(_self): _self.generation=Generation()
+            def _daily_config(_self): return config
+            @staticmethod
+            def _parse_generation_time(value):
+                raw=str(value or "00:05").strip()
+                offset=1 if raw.startswith("-") else 0
+                raw=raw[1:] if offset else raw
+                hour,minute=(int(part) for part in raw.split(":"))
+                return hour,minute,offset
+        plugin=types.SimpleNamespace(daily_schedule_service=Service())
+        ctx=Fixture(); ctx.stars=[meta(TA,plugin)]
+        return ctx,plugin,config
+
+    def test_prompt_bridge_reads_boundary_dynamically_and_restores(self):
+        ctx,plugin,config=self._fixture()
+        generation=plugin.daily_schedule_service.generation
+        original_plan=generation._build_prompt
+        original_boundary=generation._build_boundary_prompt
+        bridge=RollingDayBridge(ctx)
+        self.assertTrue(bridge.install())
+        plan=generation._build_prompt()
+        boundary=generation._build_boundary_prompt()
+        self.assertIn("generation_time=-04:00",plan)
+        self.assertIn("每天 04:00",plan)
+        self.assertIn("00:00-04:00",boundary)
+        self.assertIn("04:00-24:00",boundary)
+        config["generation_time"]="-03:30"
+        self.assertIn("每天 03:30",generation._build_prompt())
+        bridge.uninstall()
+        self.assertEqual(generation._build_prompt(),"PLAN")
+        self.assertEqual(generation._build_boundary_prompt(),"BOUNDARY")
+        self.assertEqual(original_plan(),"PLAN")
+        self.assertEqual(original_boundary(),"BOUNDARY")
+
+    def test_bridge_fail_open_when_timeawareness_missing(self):
+        bridge=RollingDayBridge(Fixture())
+        self.assertFalse(bridge.install())
+        self.assertFalse(bridge.status()["available"])
 
 class BridgeTests(unittest.TestCase):
     def setup_bridge(self, kind="holiday", override="auto", enabled=True):
@@ -103,6 +150,14 @@ class AdapterScheduleTests(unittest.IsolatedAsyncioTestCase):
         class Svc:
             async def register_session_async(_self,session,*,trigger=True): self.calls.append((session,trigger)); return "ph"
             def get_snapshot_for_session(_self,session,*,now): return {"persona_hash":"ph","snapshot_id":"snap","local_date":now.date().isoformat(),"timezone":"UTC","generated_at":"g","manually_edited":False}
+            def _daily_config(_self): return {"generation_time":"-04:00"}
+            @staticmethod
+            def _parse_generation_time(value):
+                raw=str(value or "00:05").strip()
+                offset=1 if raw.startswith("-") else 0
+                raw=raw[1:] if offset else raw
+                hour,minute=(int(part) for part in raw.split(":"))
+                return hour,minute,offset
         class Admin:
             def get_detail(_self,*args,**kwargs): return {"slots":[{"slot_ref":"ref","start":"20:00","end":"21:00","name":"x","state":"y","origin":"user","source_origin":"ai"}]}
         plugin=types.SimpleNamespace(daily_schedule_service=Svc(),daily_schedule_admin=Admin(),time_context=types.SimpleNamespace(now=lambda:datetime(2026,10,7)))
@@ -111,6 +166,24 @@ class AdapterScheduleTests(unittest.IsolatedAsyncioTestCase):
         result=await TimeAwarenessAdapter(self.ctx).get_daily_schedule("umo",at=datetime(2026,10,7),allow_generate=False)
         self.assertEqual(self.calls,[("umo",False)])
         self.assertEqual(result["source"],"time_awareness"); self.assertEqual(result["slots"][0]["source_origin"],"ai")
+    def test_generation_boundary_reads_timeawareness_config(self):
+        adapter=TimeAwarenessAdapter(self.ctx)
+        boundary=adapter.get_generation_boundary()
+        self.assertEqual((boundary["raw"],boundary["clock"],boundary["target_day_offset"]),("-04:00","04:00",1))
+
+    def test_rolling_day_window_uses_configured_clock_not_hardcoded(self):
+        from datetime import timezone, timedelta
+        adapter=TimeAwarenessAdapter(self.ctx)
+        at=datetime(2026,10,8,2,30,tzinfo=timezone(timedelta(hours=8)))
+        window=adapter.rolling_day_window(at)
+        self.assertEqual(window["start"].isoformat(),"2026-10-07T04:00:00+08:00")
+        self.assertEqual(window["end"].isoformat(),"2026-10-08T04:00:00+08:00")
+        plugin=self.ctx.stars[0].star_cls
+        plugin.daily_schedule_service._daily_config=lambda:{"generation_time":"-03:30"}
+        window=adapter.rolling_day_window(datetime(2026,10,8,6,0,tzinfo=at.tzinfo))
+        self.assertEqual(window["clock"],"03:30")
+        self.assertEqual(window["start"].isoformat(),"2026-10-08T03:30:00+08:00")
+
     async def test_explicit_generate_request_denied(self): self.assertIsNone(await TimeAwarenessAdapter(self.ctx).get_daily_schedule("umo",allow_generate=True))
     async def test_missing_snapshot_returns_unavailable_without_generation(self):
         plugin=self.ctx.stars[0].star_cls
@@ -124,14 +197,24 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         from datetime import timezone, timedelta
         self.now=datetime(2026,10,7,18,30,tzinfo=timezone(timedelta(hours=8)))
         self.slots=[]
+        self.slots_by_date={}
         self.calls=[]; self.reg_calls=[]; self.sent=[]; self.denied=set()
         self.available_dates={self.now.date()}; self.day_kinds={self.now.date():"holiday"}
         class ScheduleService:
             async def register_session_async(_s, session, *, trigger=True): self.reg_calls.append((session,trigger)); return "persona"
             def get_snapshot_for_session(_s, session, *, now):
                 return {"persona_hash":"persona","snapshot_id":"sid-"+now.date().isoformat(),"local_date":now.date().isoformat(),"timezone":"Asia/Shanghai","generated_at":"g","manually_edited":False} if now.date() in self.available_dates else None
+            def _daily_config(_s): return {"generation_time":"-04:00"}
+            @staticmethod
+            def _parse_generation_time(value):
+                raw=str(value or "00:05").strip()
+                offset=1 if raw.startswith("-") else 0
+                raw=raw[1:] if offset else raw
+                hour,minute=(int(part) for part in raw.split(":"))
+                return hour,minute,offset
         class Admin:
-            def get_detail(_s,*args,**kwargs): return {"slots":self.slots}
+            def get_detail(_s, persona_hash, local_date, timezone, **kwargs):
+                return {"slots":self.slots_by_date.get(local_date,self.slots)}
         def collect(*,scope,now): return types.SimpleNamespace(workday=types.SimpleNamespace(kind=self.day_kinds.get(now.date(),"unknown"),available=now.date() in self.day_kinds,value=""),now=now)
         ta=types.SimpleNamespace(daily_schedule_service=ScheduleService(),daily_schedule_admin=Admin(),time_context=types.SimpleNamespace(now=lambda:self.now,facts=types.SimpleNamespace(collect=collect)))
         class NativeFish:
@@ -174,6 +257,31 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.service=ScheduleBroadcastService(self.ctx,{"schedule_broadcast":{"enable":True,"provider_id":"provider"}},".",fat_fish=self.policy)
         self.saved=[]
         self.service._save=lambda:self.saved.append(json.loads(json.dumps(self.service.state)))
+
+    async def test_raw_cycle_stitches_two_natural_days_at_configured_boundary(self):
+        from datetime import timezone, timedelta
+        self.now=datetime(2026,10,7,6,0,tzinfo=timezone(timedelta(hours=8)))
+        next_day=self.now.date()+timedelta(days=1)
+        self.available_dates={self.now.date(),next_day}
+        self.slots_by_date={
+            self.now.date():[
+                {"start":"03:00","end":"05:00","name":"清晨","state":"跨过生活日边界"},
+                {"start":"23:00","end":"24:00","name":"夜生活","state":"还在外面玩"},
+            ],
+            next_day:[
+                {"start":"00:00","end":"02:00","name":"续摊","state":"继续宵夜聊天"},
+                {"start":"03:00","end":"05:00","name":"睡觉","state":"终于睡了"},
+            ],
+        }
+        cycle=await self.service.raw_cycle(now=self.now)
+        self.assertEqual(cycle["boundary_clock"],"04:00")
+        self.assertEqual(cycle["window_start"],"2026-10-07T04:00+08:00")
+        self.assertEqual(cycle["window_end"],"2026-10-08T04:00+08:00")
+        self.assertTrue(cycle["complete"])
+        self.assertEqual([item["name"] for item in cycle["slots"]],
+                         ["清晨","夜生活","续摊","睡觉"])
+        self.assertTrue(cycle["slots"][0]["start_at"].startswith("2026-10-07T04:00"))
+        self.assertTrue(cycle["slots"][-1]["end_at"].startswith("2026-10-08T04:00"))
 
     async def _prepare_simulation(self, slots):
         from datetime import timezone, timedelta
