@@ -121,16 +121,21 @@ class AdapterScheduleTests(unittest.IsolatedAsyncioTestCase):
 
 class BroadcastTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.now=datetime(2026,10,7,18,30,tzinfo=__import__("datetime").timezone.utc)
+        from datetime import timezone, timedelta
+        self.now=datetime(2026,10,7,18,30,tzinfo=timezone(timedelta(hours=8)))
         self.slots=[]
         self.calls=[]; self.reg_calls=[]; self.sent=[]; self.denied=set()
+        self.available_dates={self.now.date()}; self.day_kinds={self.now.date():"holiday"}
         class ScheduleService:
             async def register_session_async(_s, session, *, trigger=True): self.reg_calls.append((session,trigger)); return "persona"
-            def get_snapshot_for_session(_s, session, *, now): return {"persona_hash":"persona","snapshot_id":"sid","local_date":now.date().isoformat(),"timezone":"UTC","generated_at":"g","manually_edited":False}
+            def get_snapshot_for_session(_s, session, *, now):
+                return {"persona_hash":"persona","snapshot_id":"sid-"+now.date().isoformat(),"local_date":now.date().isoformat(),"timezone":"Asia/Shanghai","generated_at":"g","manually_edited":False} if now.date() in self.available_dates else None
         class Admin:
             def get_detail(_s,*args,**kwargs): return {"slots":self.slots}
-        ta=types.SimpleNamespace(daily_schedule_service=ScheduleService(),daily_schedule_admin=Admin(),time_context=types.SimpleNamespace(now=lambda:self.now))
+        def collect(*,scope,now): return types.SimpleNamespace(workday=types.SimpleNamespace(kind=self.day_kinds.get(now.date(),"unknown"),available=now.date() in self.day_kinds,value=""),now=now)
+        ta=types.SimpleNamespace(daily_schedule_service=ScheduleService(),daily_schedule_admin=Admin(),time_context=types.SimpleNamespace(now=lambda:self.now,facts=types.SimpleNamespace(collect=collect)))
         class NativeFish:
+            def _periods(_s): return [("09:00","12:00"),("14:00","18:00")]
             def get_wallet_policy(_s, *, at=None, provider_id=None):
                 at=at or self.now
                 return {"enabled":True,"allowed":at.strftime("%H:%M") not in self.denied,"state":"peak" if at.strftime("%H:%M") in self.denied else "offpeak","evaluated_at":at,"timezone":"UTC","manual_override":"auto","provider_affected":True,"day_kind":"holiday","day_label":"holiday"}
@@ -138,20 +143,29 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         async def conversations(): return [types.SimpleNamespace(user_id="qq:GroupMessage:g1"),types.SimpleNamespace(user_id="qq:FriendMessage:u1")]
         async def persona(): return {"prompt":"persona unchanged"}
         async def provider(umo): return "provider"
-        async def llm(**kwargs): self.calls.append(kwargs); return types.SimpleNamespace(completion_text=json.dumps({f"E{i}":f"message{i}" for i in range(1,10)}))
+        async def llm(**kwargs):
+            import re
+            self.calls.append(kwargs)
+            ids=re.findall(r'"id":\s*"([^"]+)"',kwargs["prompt"])
+            return types.SimpleNamespace(completion_text=json.dumps({key:f"message-{key}" for key in ids}))
         async def send(umo,chain): self.sent.append((umo,chain))
         self.ctx=types.SimpleNamespace(get_all_stars=lambda:[meta(TA,ta),meta(FF,self.fish)],
             conversation_manager=types.SimpleNamespace(get_conversations=conversations),
             persona_manager=types.SimpleNamespace(get_default_persona_v3=persona),
             get_current_chat_provider_id=provider,llm_generate=llm,send_message=send)
         class Policy:
+            def discover(_self): return self.fish
             def get_wallet_policy(_self, *, at=None, provider_id=None):
                 at=at or self.now
+                local=at
+                kind=self.day_kinds.get(local.date(),"unknown")
+                peak=kind in {"workday","adjusted"} and ((9 <= local.hour < 12) or (14 <= local.hour < 18))
                 return {"found":True,"enabled":True,"allowed":at.strftime("%H:%M") not in self.denied,
-                        "state":"peak" if at.strftime("%H:%M") in self.denied else "offpeak",
-                        "evaluated_at":at,"timezone":"UTC","manual_override":"auto",
-                        "provider_affected":True,"day_kind":"holiday","day_label":"holiday"}
-        self.service=ScheduleBroadcastService(self.ctx,{"schedule_broadcast":{"enable":True}},".",fat_fish=Policy())
+                        "state":"peak" if peak else "offpeak",
+                        "evaluated_at":at,"timezone":"Asia/Shanghai","manual_override":"auto",
+                        "provider_affected":True,"day_kind":kind,"day_label":kind}
+        self.policy=Policy()
+        self.service=ScheduleBroadcastService(self.ctx,{"schedule_broadcast":{"enable":True,"provider_id":"provider"}},".",fat_fish=self.policy)
         self.saved=[]
         self.service._save=lambda:self.saved.append(json.loads(json.dumps(self.service.state)))
 
@@ -163,7 +177,8 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         adapter=TimeAwarenessAdapter(self.ctx); self.assertIsNotNone(adapter.discover()); self.assertIsNotNone(await adapter.get_daily_schedule("qq:GroupMessage:g1",at=self.now))
         self.assertTrue(await self.service.refresh(now=self.now),self.service.last_error); self.assertEqual(len(self.calls),1)
         self.assertIn("persona unchanged",self.calls[0]["system_prompt"])
-        self.assertEqual(len(self.service.state["entries"]),1)
+        entries=self.service.plan_for_date(self.now.date())["entries"]
+        self.assertEqual(len(entries),1)
         self.assertFalse(await self.service.refresh(now=self.now)); self.assertEqual(len(self.calls),1)
         self.slots[0]["state"]="new"; self.calls.clear()
         self.assertTrue(await self.service.refresh(now=self.now)); self.assertEqual(len(self.calls),1)
@@ -184,11 +199,12 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.calls),1)
         await self.service.send_due(now)
         self.assertEqual(len(self.calls),1)
-        self.assertTrue(self.service.state["entries"][0]["sent"])
+        entries=self.service.plan_for_date(self.now.date())["entries"]
+        self.assertTrue(entries[0]["sent"])
         self.assertEqual(len(self.sent),2)
         reloaded=ScheduleBroadcastService(self.ctx,{"schedule_broadcast":{"enable":True}},".")
         reloaded.state=self.saved[-1]
-        self.assertEqual(reloaded.state["entries"][0]["delivered_umos"],["qq:FriendMessage:u1","qq:GroupMessage:g1"])
+        self.assertEqual(reloaded.state["plans"][self.now.date().isoformat()]["entries"][0]["delivered_umos"],["qq:FriendMessage:u1","qq:GroupMessage:g1"])
     async def test_partial_delivery_retries_only_failed_target(self):
         import astrbot.api.event
         class Chain:
@@ -203,7 +219,7 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
             self.sent.append((umo,chain))
         self.ctx.send_message=flaky
         await self.service.send_due(now)
-        entry=self.service.state["entries"][0]; self.assertFalse(entry["sent"]); self.assertEqual(entry["delivered_umos"],["qq:FriendMessage:u1"])
+        entry=self.service.plan_for_date(self.now.date())["entries"][0]; self.assertFalse(entry["sent"]); self.assertEqual(entry["delivered_umos"],["qq:FriendMessage:u1"])
         failed["on"]=False; await self.service.send_due(now)
         self.assertTrue(entry["sent"]); self.assertEqual(attempted[2:],["qq:GroupMessage:g1"])
     async def test_zero_targets_and_expiration_do_not_mark_sent_or_catch_up(self):
@@ -212,8 +228,74 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         async def no_targets(): return []
         self.ctx.conversation_manager.get_conversations=no_targets
         now=self.now.replace(hour=20,minute=30); await self.service.send_due(now)
-        entry=self.service.state["entries"][0]; self.assertFalse(entry["sent"])
+        entry=self.service.plan_for_date(self.now.date())["entries"][0]; self.assertFalse(entry["sent"])
         await self.service.send_due(now.replace(minute=32)); self.assertTrue(entry["expired"]); self.assertFalse(self.sent)
+
+    async def test_effective_peak_cover_plan_and_next_day_snapshot_at_0400(self):
+        from datetime import timezone, timedelta
+        now=datetime(2026,10,8,4,0,tzinfo=timezone(timedelta(hours=8)))
+        target=now.date()+timedelta(days=1)
+        self.now=now
+        self.available_dates={target}
+        self.day_kinds={target:"workday"}
+        self.slots=[
+            {"start":"08:30","end":"08:45","name":"早餐","state":"吃饭"},
+            {"start":"09:20","end":"09:40","name":"课程","state":"学习"},
+            {"start":"10:30","end":"10:45","name":"咖啡","state":"休息"},
+            {"start":"11:30","end":"11:45","name":"购物","state":"外出"},
+            {"start":"12:20","end":"12:50","name":"午餐","state":"吃饭"},
+            {"start":"13:30","end":"13:45","name":"散步","state":"外出"},
+            {"start":"14:20","end":"14:40","name":"拍摄","state":"工作"},
+            {"start":"15:30","end":"15:45","name":"茶歇","state":"休息"},
+            {"start":"17:30","end":"17:45","name":"收尾","state":"工作"},
+            {"start":"18:30","end":"19:00","name":"晚饭","state":"吃饭"},
+        ]
+        self.service.state["plans"][now.date().isoformat()]={"local_date":now.date().isoformat(),"entries":[{"id":"today-remains"}]}
+        self.assertTrue(await self.service.refresh(now=now),self.service.last_error)
+        plan=self.service.plan_for_date(target)
+        self.assertIsNotNone(plan)
+        self.assertEqual(self.service.plan_for_date(now.date())["entries"][0]["id"],"today-remains")
+        entries=plan["entries"]
+        starts=[e for e in entries if e["kind"]=="PEAK_START"]
+        ends=[e for e in entries if e["kind"]=="PEAK_END"]
+        normal=[e for e in entries if e["kind"]=="NORMAL"]
+        self.assertEqual((len(starts),len(ends)),(2,2))
+        self.assertTrue(all(datetime.fromisoformat(e["trigger_at"]).tzinfo is not None for e in entries))
+        start_times=[datetime.fromisoformat(e["trigger_at"]) for e in starts]
+        end_times=[datetime.fromisoformat(e["trigger_at"]) for e in ends]
+        self.assertTrue(all((t.hour,t.minute) in {(8,55),(8,56),(8,57),(8,58),(8,59),(9,0),(13,55),(13,56),(13,57),(13,58),(13,59),(14,0)} for t in start_times))
+        self.assertTrue(all((t.hour,t.minute) in {(12,0),(12,1),(12,2),(12,3),(12,4),(12,5),(18,0),(18,1),(18,2),(18,3),(18,4),(18,5)} for t in end_times))
+        normal_names={e["name"] for e in normal}
+        self.assertEqual(normal_names,{"早餐","午餐","散步","晚饭"})
+        self.assertEqual(len(self.calls),1)
+        self.assertTrue(plan["plan_complete"])
+        self.assertTrue(all(e["message"] for e in entries))
+        raw=self.service.last_schedules[target.isoformat()]
+        regenerated=self.service._effective_entries(raw,target,"Asia/Shanghai","workday","provider",now)
+        self.assertEqual([(e["kind"],e["trigger_at"]) for e in entries],
+                         [(e["kind"],e["trigger_at"]) for e in regenerated])
+        self.assertEqual(len(self.reg_calls),2)
+        self.assertTrue(all(trigger is False for _,trigger in self.reg_calls))
+
+    async def test_holiday_weekend_suppress_no_raw_events_and_adjusted_uses_peaks(self):
+        from datetime import timedelta
+        target=self.now.date()+timedelta(days=1)
+        self.available_dates={target}
+        self.slots=[{"start":"09:30","end":"10:00","name":"peak slot","state":"busy"},
+                    {"start":"13:00","end":"13:20","name":"outside","state":"free"}]
+        for kind, expected_peak_entries in (("holiday",0),("weekend",0),("adjusted",4)):
+            with self.subTest(kind=kind):
+                self.day_kinds={target:kind}
+                self.service.state={"plans":{}}
+                self.calls.clear()
+                result,message=await self.service.build_date(target,now=self.now)
+                self.assertTrue(result,message)
+                plan=self.service.plan_for_date(target)
+                peak=[e for e in plan["entries"] if e["kind"].startswith("PEAK_")]
+                self.assertEqual(len(peak),expected_peak_entries)
+                normal=[e for e in plan["entries"] if e["kind"]=="NORMAL"]
+                self.assertEqual({e["name"] for e in normal},{"peak slot","outside"} if not expected_peak_entries else {"outside"})
+                self.assertEqual(len(self.calls),1)
     async def test_dry_run_and_live_policy_block_prevent_sends(self):
         import astrbot.api.event
         class Chain:
@@ -224,7 +306,7 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.service.cfg["dry_run"]=True
         await self.service.send_due(self.now.replace(hour=20,minute=30)); self.assertFalse(self.sent)
         self.service.cfg["dry_run"]=False
-        self.service.state["entries"][0]["dry_run_logged"]=False
+        self.service.plan_for_date(self.now.date())["entries"][0]["dry_run_logged"]=False
         self.denied.add("20:30"); await self.service.send_due(self.now.replace(hour=20,minute=30)); self.assertFalse(self.sent)
     async def test_missing_timeawareness_prevents_generation(self):
         self.ctx.get_all_stars=lambda:[meta(FF,self.fish)]

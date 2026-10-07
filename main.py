@@ -1,5 +1,7 @@
 """Plugin entry point for 林小满个人接口."""
 
+from datetime import timedelta
+
 from astrbot.api import logger
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star, StarTools
@@ -60,36 +62,78 @@ class Main(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("xiaoman_broadcast")
-    async def xiaoman_broadcast(self, event, action: str = "status"):
-        """Admin-only inspection and one-session test for scheduled broadcasts."""
+    async def xiaoman_broadcast(self, event, action: str = "status", argument: str = ""):
+        """Admin-only inspection and management for date-scoped broadcast plans."""
         service = self._schedule_broadcast
         if service is None:
             yield event.plain_result("林小满日程广播未启用")
             return
+        now = service._now()
+        command_date = now.date() if argument == "today" else now.date() + timedelta(days=1)
+        if action == "status":
+            state = service.status(now)
+            today_snapshot = state["today_snapshot"] or {}
+            tomorrow_snapshot = state["tomorrow_snapshot"] or {}
+            yield event.plain_result(
+                "日程广播：enabled={enabled}, dry_run={dry_run}; TimeAwareness={time_awareness_found}, "
+                "Fat Fish={fat_fish_found}, day={day_kind}; "
+                "today snapshot={today_id}/{today_count}, plan={today_plan}; "
+                "tomorrow snapshot={tomorrow_id}/{tomorrow_count}, plan={tomorrow_plan}; "
+                "next={next}, error={last_error}".format(
+                    **state,
+                    today_id=today_snapshot.get("snapshot_id", "missing"),
+                    today_count=len(today_snapshot.get("slots", [])),
+                    tomorrow_id=tomorrow_snapshot.get("snapshot_id", "missing"),
+                    tomorrow_count=len(tomorrow_snapshot.get("slots", [])),
+                    today_plan=state["today_plan_status"],
+                    tomorrow_plan=state["tomorrow_plan_status"],
+                )
+            )
+            return
         if action == "refresh":
             changed = await service.refresh(force=True)
-            yield event.plain_result("日程已刷新" if changed else "日程未变化或当前暂缓生成")
+            yield event.plain_result("已有快照已刷新" if changed else service.last_error or "没有需要刷新的快照")
+            return
+        if argument not in {"today", "tomorrow"} and action != "test":
+            yield event.plain_result("用法：/xiaoman_broadcast raw|plan|build|reset today|tomorrow")
+            return
+        if action == "raw":
+            snapshot = await service.raw_schedule(command_date)
+            if snapshot is None:
+                yield event.plain_result("No existing TimeAwareness snapshot.")
+                return
+            rows = [f"{slot.get('start','?')}-{slot.get('end','?')} {slot.get('name','')} {slot.get('state','')}".strip()
+                    for slot in snapshot.get("slots", [])]
+            yield event.plain_result(
+                f"RAW {snapshot.get('local_date','')} snapshot={snapshot.get('snapshot_id','')} slots={len(rows)}\n"
+                + "\n".join(rows)
+            )
+            return
+        if action == "plan":
+            plan = service.plan_for_date(command_date)
+            if not plan:
+                yield event.plain_result("没有已建立的 Xiaoman effective plan。")
+                return
+            rows = [f"{entry.get('kind')} {entry.get('trigger_at')} {entry.get('name','')} {entry.get('state','')} {entry.get('message','')}"
+                    for entry in plan.get("entries", [])]
+            yield event.plain_result(
+                f"EFFECTIVE {plan.get('local_date')} snapshot={plan.get('snapshot_id')} "
+                f"day={plan.get('day_kind')} entries={len(rows)}\n" + "\n".join(rows)
+            )
+            return
+        if action == "build":
+            _built, result = await service.build_date(command_date)
+            yield event.plain_result(result)
+            return
+        if action == "reset":
+            removed = service.reset_date(command_date)
+            yield event.plain_result("已删除 Xiaoman 的该日期计划。" if removed else "该日期没有 Xiaoman 计划。")
             return
         if action == "test":
-            entry = next((e for e in service.state.get("entries", []) if e.get("message") and not e.get("sent") and not e.get("expired")), None)
-            if not entry:
-                yield event.plain_result("没有已生成的待测广播")
-                return
-            if service.cfg.get("dry_run", False):
-                yield event.plain_result(f"预览：{entry['message']}")
-            else:
-                from astrbot.api.event import MessageChain
-                await self.context.send_message(event.unified_msg_origin, MessageChain().message(entry["message"]))
-                yield event.plain_result(f"已向当前会话发送预览（不会标记日程已发送）：{entry['message']}")
+            success, result = await service.test_entry(argument, event.unified_msg_origin)
+            yield event.plain_result(result)
             return
-        state = service.status()
-        next_item = state["next"]
-        yield event.plain_result(
-            "日程广播：enabled={enabled}, dry_run={dry_run}; TimeAwareness found={time_awareness_found}, "
-            "snapshot={snapshot_id}, date={local_date}, slots={slot_count}; Fat Fish found={fat_fish_found}, "
-            "wallet={wallet_state}/{wallet_allowed}, day={day_kind}; next={next}, error={last_error}".format(
-                **{**state, "next": next_item})
-        )
+        yield event.plain_result("支持：status、raw、plan、build、reset、test")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("xiaoman_test")

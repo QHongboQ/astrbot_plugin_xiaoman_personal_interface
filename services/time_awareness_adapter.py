@@ -17,6 +17,17 @@ class TimeAwarenessAdapter:
         except Exception:
             return None
 
+    def current_time(self) -> datetime:
+        plugin = self.discover()
+        if plugin is not None:
+            try:
+                now = plugin.time_context.now()
+                if isinstance(now, datetime):
+                    return now
+            except Exception:
+                pass
+        return datetime.now().astimezone()
+
     def get_day_policy(self, at: datetime | None = None) -> dict:
         plugin = self.discover()
         if plugin is None:
