@@ -15,7 +15,11 @@ import types
 import urllib.request
 from pathlib import Path
 
-from astrbot.api.star import Star
+from astrbot.api.star import Context as AstrBotContext, Star
+from astrbot.api.event import MessageChain
+from astrbot.core.conversation_mgr import ConversationManager
+from astrbot.core.persona_mgr import PersonaManager
+from astrbot.core.star.star import StarMetadata
 from astrbot.core.agent.message import TextPart
 from astrbot.core.agent.tool import FunctionTool, ToolSet
 from astrbot.core.pipeline.context_utils import call_event_hook
@@ -147,6 +151,79 @@ def verify_astrbot_plugin_filter_contract():
     assert "plugin.name not in plugins_name" in registry_source
 
 
+async def verify_life_broadcast_public_contract():
+    """Exercise the adapter against AstrBot 4.28.2 public API types/signatures."""
+    assert hasattr(AstrBotContext, "get_all_stars")
+    assert "chat_provider_id" in inspect.signature(AstrBotContext.llm_generate).parameters
+    assert "message_chain" in inspect.signature(AstrBotContext.send_message).parameters
+    assert "umo" in inspect.signature(AstrBotContext.get_current_chat_provider_id).parameters
+    assert inspect.iscoroutinefunction(ConversationManager.get_conversations)
+    assert "star_cls" in StarMetadata.__annotations__
+    assert "activated" in StarMetadata.__annotations__
+    assert hasattr(PersonaManager, "get_default_persona_v3")
+    assert isinstance(MessageChain().message("probe"), MessageChain)
+
+    from datetime import datetime
+    from tempfile import TemporaryDirectory
+    from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.life_broadcast import LifeBroadcastService
+
+    clock = datetime.now().replace(second=0, microsecond=0)
+    stamp = clock.strftime("%H:%M")
+
+    class LifeScheduler:
+        async def get_life_context(self, *, allow_generate):
+            assert allow_generate is False
+            return f"{stamp}｜地点：学校｜事项：上午课程｜细节：准备上课"
+
+    class PublicContextFixture:
+        def __init__(self):
+            self.get_all_stars_called = 0
+            self.llm_calls = []
+            self.sent = []
+            self.persona_manager = types.SimpleNamespace(
+                get_default_persona_v3=self.get_persona
+            )
+            self.conversation_manager = types.SimpleNamespace(
+                get_conversations=self.get_conversations
+            )
+
+        def get_all_stars(self):
+            self.get_all_stars_called += 1
+            return [StarMetadata(name="astrbot_plugin_life_scheduler", activated=True, star_cls=LifeScheduler())]
+
+        async def get_conversations(self):
+            return [types.SimpleNamespace(user_id="qq:GroupMessage:runtime-broadcast")]
+
+        async def get_current_chat_provider_id(self, umo):
+            assert umo == "qq:GroupMessage:runtime-broadcast"
+            return "runtime-provider"
+
+        async def get_persona(self):
+            return types.SimpleNamespace(prompt="runtime persona")
+
+        async def llm_generate(self, *, chat_provider_id, prompt=None, tools=None, system_prompt=None, **kwargs):
+            self.llm_calls.append((chat_provider_id, prompt, tools, system_prompt))
+            return types.SimpleNamespace(completion_text='{"E1":"我准备去学校上课"}')
+
+        async def send_message(self, session, message_chain):
+            assert isinstance(message_chain, MessageChain)
+            self.sent.append((session, message_chain))
+
+    runtime_context = PublicContextFixture()
+    config = {"life_broadcast": {"enable": True, "blocked_windows": []}}
+    with TemporaryDirectory() as data_dir:
+        service = LifeBroadcastService(runtime_context, config, data_dir)
+        service.blocked = lambda *_args: False
+        await service.refresh()
+        assert len(runtime_context.llm_calls) == 1
+        assert runtime_context.llm_calls[0][0] == "runtime-provider"
+        assert runtime_context.llm_calls[0][2] is None
+        assert runtime_context.llm_calls[0][3] == "runtime persona"
+        await service.send_due(clock)
+        assert len(runtime_context.sent) == 1
+        assert service.state["entries"][0]["sent"] is True
+
+
 class Context:
     def __init__(self) -> None:
         self.tools = []
@@ -186,6 +263,7 @@ async def run(official_airi_root: Path | None = None) -> None:
     assert importlib.metadata.version("AstrBot") == "4.28.2"
     verify_astrbot_plugin_filter_contract()
     main = load_main()
+    await verify_life_broadcast_public_contract()
     context = Context()
     plugin = main.Main(context)
     assert isinstance(plugin, Star)
@@ -336,4 +414,4 @@ async def run(official_airi_root: Path | None = None) -> None:
 if __name__ == "__main__":
     root = Path(sys.argv[1]).resolve() if len(sys.argv) == 2 else None
     asyncio.run(run(root))
-    print("AstrBot 4.28.2 photo-tool, admin-bypass, AngelHeart, and Airi smoke passed")
+    print("AstrBot 4.28.2 photo-tool, life-broadcast, admin-bypass, AngelHeart, and Airi smoke passed")

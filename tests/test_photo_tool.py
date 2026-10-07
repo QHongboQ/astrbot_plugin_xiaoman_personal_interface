@@ -70,6 +70,7 @@ def _install_astrbot_stubs() -> None:
         exception=lambda *_args, **_kwargs: None,
         warning=lambda *_args, **_kwargs: None,
         debug=lambda *_args, **_kwargs: None,
+        info=lambda *_args, **_kwargs: None,
     )
     api_event = types.ModuleType("astrbot.api.event")
     api_event.filter = FilterStub
@@ -78,6 +79,7 @@ def _install_astrbot_stubs() -> None:
     api_star = types.ModuleType("astrbot.api.star")
     api_star.Context = object
     api_star.Star = StarStub
+    api_star.StarTools = types.SimpleNamespace(get_data_dir=lambda name: str(PLUGIN_ROOT / ".test-data" / name))
     core = types.ModuleType("astrbot.core")
     agent = types.ModuleType("astrbot.core.agent")
     tool = types.ModuleType("astrbot.core.agent.tool")
