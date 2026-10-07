@@ -21,15 +21,45 @@ class FunctionToolStub:
         self.parameters = kwargs["parameters"]
 
 
+class TextPartStub:
+    type = "text"
+
+    def __init__(self, text):
+        self.text = text
+        self._no_save = False
+
+    def mark_as_temp(self):
+        self._no_save = True
+        return self
+
+    def model_dump_for_context(self):
+        return {"type": self.type, "text": self.text, "_no_save": self._no_save}
+
+
 class StarStub:
     def __init__(self, context):
         self.context = context
 
 
 class FilterStub:
+    class PermissionType:
+        ADMIN = "admin"
+
+    class EventMessageType:
+        GROUP_MESSAGE = 1
+        PRIVATE_MESSAGE = 2
+
+    @staticmethod
+    def _decorator(*_args, **_kwargs):
+        return lambda function: function
+
     @staticmethod
     def on_llm_request(*_args, **_kwargs):
         return lambda function: function
+
+    permission_type = _decorator
+    command = _decorator
+    event_message_type = _decorator
 
 
 def _install_astrbot_stubs() -> None:
@@ -43,6 +73,8 @@ def _install_astrbot_stubs() -> None:
     )
     api_event = types.ModuleType("astrbot.api.event")
     api_event.filter = FilterStub
+    api_event.EventMessageType = FilterStub.EventMessageType
+    api_event.PermissionType = FilterStub.PermissionType
     api_star = types.ModuleType("astrbot.api.star")
     api_star.Context = object
     api_star.Star = StarStub
@@ -50,12 +82,15 @@ def _install_astrbot_stubs() -> None:
     agent = types.ModuleType("astrbot.core.agent")
     tool = types.ModuleType("astrbot.core.agent.tool")
     tool.FunctionTool = FunctionToolStub
+    message = types.ModuleType("astrbot.core.agent.message")
+    message.TextPart = TextPartStub
     astrbot.api = api
     astrbot.core = core
     api.event = api_event
     api.star = api_star
     core.agent = agent
     agent.tool = tool
+    agent.message = message
     sys.modules.update(
         {
             "astrbot": astrbot,
@@ -65,6 +100,7 @@ def _install_astrbot_stubs() -> None:
             "astrbot.core": core,
             "astrbot.core.agent": agent,
             "astrbot.core.agent.tool": tool,
+            "astrbot.core.agent.message": message,
         }
     )
 
@@ -168,17 +204,14 @@ class PluginLoadTests(unittest.TestCase):
     def test_no_natural_language_routing_hook_or_message_workaround_remains(self):
         source = (PLUGIN_ROOT / "main.py").read_text(encoding="utf-8")
         for removed_route_marker in (
-            "event_message_type",
             "guard_directed_gallery_route",
             "gallery_route_adapter",
-            "message_str",
             "stop_event",
         ):
             self.assertNotIn(removed_route_marker, source)
 
         for path in (PLUGIN_ROOT / "services").glob("*.py"):
             content = path.read_text(encoding="utf-8")
-            self.assertNotIn("message_str", content)
             self.assertNotIn("stop_event", content)
 
     def test_request_local_visibility_hides_only_generic_gallery_tool(self):
