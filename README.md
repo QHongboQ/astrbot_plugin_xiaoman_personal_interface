@@ -31,6 +31,36 @@ send_xiaoman_photo()
 
 本版本不包含任何 TTS、语音提示、表演标签或 MiMo 逻辑。
 
+## 可选：Life Scheduler 日程广播（v0.3.0）
+
+此功能默认关闭。启用后，插件只通过 AstrBot 已加载插件元数据查找名称精确为 `astrbot_plugin_life_scheduler`、已激活且实例可用的 Life Scheduler，并调用其公开的 `get_life_context(allow_generate=False)`。它只读取已经生成的日程，不导入或读写 Life Scheduler 的文件，也不触发日程生成。日程文本发生变化（包括重写）时，插件解析有效节点并对整份计划进行一次批量消息生成；发送时不调用 LLM。消息使用 AstrBot 默认人格的 `prompt`，再附加 gear 中可编辑的广播指令。
+
+在插件配置齿轮的“林小满日程广播”组中设置：
+
+- `enable`：开启服务（默认关闭）。
+- `target_mode`：`all_conversations` 只表示 AstrBot 已存在的群/私聊会话；`allowlist` 仅使用允许列表。
+- `send_groups` / `send_private`：分别控制群聊与私聊；拒绝列表始终优先。
+- `provider_id`：指定生成提供商；留空时从首个目标会话解析。
+- `event_offset_minutes`：事件触发时间偏移，可用 `-5` 提前五分钟。
+- `blocked_windows`：默认禁止生成和发送的窗口为 `09:00-12:00`、`14:00-18:00`。
+- `poll_seconds`、`grace_seconds`、`max_message_chars`：轮询、过期宽限期与消息长度上限。
+- `dry_run`：解析并生成计划、记录到日志，但绝不广播。
+- `broadcast_prompt`：只填写广播风格补充，不覆盖 Xiaoman 的默认人格。
+
+计划仅保存在本插件数据目录的 `life_broadcast_state.json`，使用原子替换写入。重启后相同日程复用已生成消息；已发送项目不会重复发送，过期项目不补发。广播只投递至 AstrBot 已有会话，不读取 QQ 好友/群列表，也不写入聊天历史。
+
+管理员命令：
+
+```text
+/xiaoman_broadcast status
+/xiaoman_broadcast refresh
+/xiaoman_broadcast test
+```
+
+`status` 查看服务状态；`refresh` 立即重新读取日程（相同哈希不重复花费生成调用）；`test` 只在当前管理员会话预览或发送一条已经生成的待发送消息，且不会把正式日程标记为已发送。`dry_run` 模式下 `test` 只预览。
+
+解析支持形如 `08:55｜地点：学校｜事项：上午课程｜细节：今天第一节课有点困` 的中英文管道符格式；错误行会跳过。日程内容是事实来源，本插件不会向对话历史写入主动消息。
+
 ## 管理员测试模式
 
 仅 AstrBot 管理员 UID `979675497` 可使用 `/xiaoman_test on|off|status`。模式按 UMO 会话隔离、仅保存在内存中，插件重启后关闭；启用期间只对当前管理员会话提供测试放行 guidance，并在该事件中隔离 AngelHeart。
@@ -42,4 +72,5 @@ send_xiaoman_photo()
 ```powershell
 python -m compileall -q main.py services tools tests
 python -m unittest discover -s tests -v
+python tests/runtime_smoke.py
 ```
