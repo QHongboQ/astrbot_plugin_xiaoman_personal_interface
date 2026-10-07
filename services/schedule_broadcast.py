@@ -37,7 +37,8 @@ def _zone(name):
 
 
 class ScheduleBroadcastService:
-    def __init__(self, context, config, data_dir, *, time_awareness=None, fat_fish=None):
+    def __init__(self, context, config, data_dir, *, time_awareness=None, fat_fish=None,
+                 rolling_day_bridge=None):
         self.context = context
         self.config = config or {}
         self.cfg = self.config.get("schedule_broadcast", {}) or {}
@@ -45,6 +46,7 @@ class ScheduleBroadcastService:
         self.state = {"plans": {}}
         self.day_adapter = time_awareness or TimeAwarenessAdapter(context)
         self.fat_fish = fat_fish or FatFishBridge(context, self.day_adapter)
+        self.rolling_day_bridge = rolling_day_bridge
         self._task = None
         self.last_schedules = {}
         self.last_error = ""
@@ -850,6 +852,11 @@ class ScheduleBroadcastService:
         return result
 
     async def tick(self):
+        if (
+            self.rolling_day_bridge is not None
+            and self._get("rolling_day_bridge_enabled", True)
+        ):
+            self.rolling_day_bridge.ensure_installed()
         await self.refresh()
         await self.send_due()
 
