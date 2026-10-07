@@ -9,7 +9,9 @@ from .services.test_bypass import (
     inject_test_guidance,
     update_test_mode,
 )
-from .services.life_broadcast import LifeBroadcastService
+from .services.schedule_broadcast import ScheduleBroadcastService
+from .services.fat_fish_bridge import FatFishBridge
+from .services.time_awareness_adapter import TimeAwarenessAdapter
 from .services.tool_visibility_adapter import hide_gallery_tool_for_xiaoman_request
 from .tools.photo_tool import XiaomanPhotoTool
 
@@ -21,28 +23,49 @@ class Main(Star):
         super().__init__(context)
         self._test_mode_umos: set[str] = set()
         self._config = config or {}
-        self._life_broadcast = None
+        self._schedule_broadcast = None
+        self._time_awareness = None
+        self._fat_fish_bridge = None
         self.context.add_llm_tools(XiaomanPhotoTool(context))
 
     async def initialize(self) -> None:
         """Start optional schedule broadcast after AstrBot initializes the plugin."""
-        if not self._config.get("life_broadcast", {}).get("enable", False):
+        self._time_awareness = TimeAwarenessAdapter(self.context)
+        self._fat_fish_bridge = FatFishBridge(self.context, self._time_awareness)
+        self._fat_fish_bridge.install()
+        cfg = self._config.get("schedule_broadcast", self._config.get("life_broadcast", {}))
+        if not cfg.get("enable", False):
             return
         data_dir = getattr(self, "data_dir", None)
         if data_dir is None:
             data_dir = StarTools.get_data_dir("astrbot_plugin_xiaoman_personal_interface")
-        self._life_broadcast = LifeBroadcastService(self.context, self._config, data_dir)
-        self._life_broadcast.start()
+        self._schedule_broadcast = ScheduleBroadcastService(
+            self.context, self._config, data_dir,
+            time_awareness=self._time_awareness, fat_fish=self._fat_fish_bridge)
+        self._schedule_broadcast.start()
 
     async def terminate(self) -> None:
-        if self._life_broadcast is not None:
-            await self._life_broadcast.stop()
+        if self._schedule_broadcast is not None:
+            await self._schedule_broadcast.stop()
+        elif self._fat_fish_bridge is not None:
+            self._fat_fish_bridge.uninstall()
+
+    def get_wallet_policy(self, *, at=None, provider_id=None) -> dict:
+        if self._schedule_broadcast is None:
+            if self._fat_fish_bridge is not None:
+                return self._fat_fish_bridge.get_wallet_policy(at=at, provider_id=provider_id)
+            return FatFishBridge(self.context, TimeAwarenessAdapter(self.context)).get_wallet_policy(at=at, provider_id=provider_id)
+        return self._schedule_broadcast.fat_fish.get_wallet_policy(at=at, provider_id=provider_id)
+
+    async def get_xiaoman_schedule(self, session: str, *, at=None, allow_generate=False):
+        adapter = self._time_awareness or TimeAwarenessAdapter(self.context)
+        return await adapter.get_daily_schedule(session, at=at, allow_generate=allow_generate)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("xiaoman_broadcast")
     async def xiaoman_broadcast(self, event, action: str = "status"):
         """Admin-only inspection and one-session test for scheduled broadcasts."""
-        service = self._life_broadcast
+        service = self._schedule_broadcast
         if service is None:
             yield event.plain_result("林小满日程广播未启用")
             return
@@ -65,20 +88,18 @@ class Main(Star):
         state = service.status()
         next_item = state["next"]
         fish = state["fat_fish"]
-        fish_text = (
-            "Fat Fish found={found}, enabled={enabled}, timezone={timezone}, manual_override={manual_override}, "
-            "peak_periods={periods}, peak_weekdays={weekdays}, holiday={holiday} ({holiday_name}), "
-            "wallet state={wallet_state}, provider affected={provider_affected}, allowed={allowed}"
-        ).format(
-            found=fish.get("found", False), enabled=fish.get("enabled", False), timezone=fish.get("timezone", "Asia/Shanghai"),
-            manual_override=fish.get("manual_override", "auto"), periods=fish.get("peak_periods", ""), weekdays=fish.get("peak_weekdays", ""),
-            holiday=fish.get("holiday", False), holiday_name=fish.get("holiday_name", ""),
-            wallet_state=fish.get("state", "missing"), provider_affected=fish.get("provider_affected", False), allowed=fish.get("allowed", False),
-        )
+        fish_text = ("FatFish found={found} v{version}, policy_mode={mode}, enabled={enabled}, "
+                     "underlying_manual_override={manual}, effective_state={state}, allowed={allowed}, "
+                     "day_kind={day_kind}, day_label={day_label}, provider_affected={affected}").format(
+            found=fish.get("found", False), version=state.get("fat_fish_version", "unknown"),
+            mode=fish.get("policy_mode", "compat"), enabled=fish.get("enabled", False),
+            manual=fish.get("manual_override", "unknown"), state=fish.get("state", "unknown"),
+            allowed=fish.get("allowed", False), day_kind=fish.get("day_kind", "unknown"),
+            day_label=fish.get("day_label", ""), affected=fish.get("provider_affected", False))
         yield event.plain_result(
-            "日程广播状态：enabled={enabled}, dry_run={dry_run}, Life Scheduler={life_scheduler_found}, "
-            "hash={hash}, nodes={node_count}, eligible={eligible_count}, sent={sent_count}, targets={target_count}, "
-            "next={next}; {fat_fish}".format(**{**state, "next": next_item, "fat_fish": fish_text})
+            "日程广播：enabled={enabled}, dry_run={dry_run}; TimeAwareness found={time_awareness_found}, "
+            "source={schedule_source}, TimeAwareness v{time_awareness_version}, snapshot={snapshot_id}, date={local_date}, slots={slot_count}; "
+            "generated={generated}, sent={sent}, targets={targets}, next={next}, error={last_error}; {fat_fish}".format(**{**state, "next": next_item, "fat_fish": fish_text})
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)

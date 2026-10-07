@@ -1,13 +1,13 @@
 name: astrbot_plugin_xiaoman_personal_interface
 display_name: 林小满个人接口
-short_desc: 提供照片工具与可选的 Life Scheduler 日程广播。
+short_desc: 提供照片工具与可选的 TimeAwareness 日程广播。
 desc: |
   注册无参数 Function Tool `send_xiaoman_photo()`。
   仅在上层 LLM 已根据人格和上下文决定向当前聊天对象发送林小满的一张照片时调用。
   自然语言路由由正常 LLM 处理；显式图库浏览命令由 Airi Gallery 处理。
-  可选广播适配器只读取 Life Scheduler 已生成的日程，不负责生成或修改日程。
+  可选广播适配器只读取 TimeAwareness 已存在的日程快照，不负责生成或修改日程。
   本插件不负责 TTS、人格、记忆、好感度或图片生成。
-version: 0.3.1
+version: 0.4.0
 author: QHongboQ
 repo: https://github.com/QHongboQ/astrbot_plugin_xiaoman_personal_interface
 astrbot_version: ">=4.28.2"

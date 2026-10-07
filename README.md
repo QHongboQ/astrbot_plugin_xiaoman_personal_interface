@@ -31,24 +31,21 @@ send_xiaoman_photo()
 
 本版本不包含任何 TTS、语音提示、表演标签或 MiMo 逻辑。
 
-## 可选：Life Scheduler 日程广播（v0.3.1）
+## 可选：TimeAwareness 日程广播（v0.4.0）
 
-此功能默认关闭。启用后，插件只通过 AstrBot 已加载插件元数据查找名称精确为 `astrbot_plugin_life_scheduler`、已激活且实例可用的 Life Scheduler，并调用其公开的 `get_life_context(allow_generate=False)`。它只读取已经生成的日程，不导入或读写 Life Scheduler 的文件，也不触发日程生成。日程文本发生变化（包括重写）时，插件解析有效节点并对整份计划进行一次批量消息生成；发送时不调用 LLM。消息使用 AstrBot 默认人格的 `prompt`，再附加 gear 中可编辑的广播指令。
+默认关闭。启用前请安装并启用官方 `time_awareness`。Xiaoman 仅经该插件的运行时服务注册指定会话 Persona（`trigger=False`）、读取已经存在的日程快照，并由 TimeAwareness 自己的详情 API 提供合并后的有效时间线；不读取其文件/数据库，不手动合并 AI、用户、静态与已执行层，也不会触发 TimeAwareness 日程生成。没有可用快照时不广播。
 
-在插件配置齿轮的“林小满日程广播”组中设置：
+快照变化后，Xiaoman 对未来且非空的时段进行一次批量消息生成，使用当前默认 Persona prompt；到点时只发送已保存消息，不调用 LLM。消息投递记录按 UMO 持久化，失败目标可在宽限期内重试，成功目标不重复发送。
 
-- `enable`：开启服务（默认关闭）。
-- `target_mode`：`all_conversations` 只表示 AstrBot 已存在的群/私聊会话；`allowlist` 仅使用允许列表。
-- `send_groups` / `send_private`：分别控制群聊与私聊；拒绝列表始终优先。
-- `provider_id`：指定生成提供商；留空时从首个目标会话解析。
-- `event_offset_minutes`：事件触发时间偏移，可用 `-5` 提前五分钟。
-- `poll_seconds`、`grace_seconds`、`max_message_chars`：轮询、过期宽限期与消息长度上限。
-- `dry_run`：解析并生成计划、记录到日志，但绝不广播。
-- `broadcast_prompt`：只填写广播风格补充，不覆盖 Xiaoman 的默认人格。
+配置项：`enable`、`schedule_source_umo`（日程 Persona 所属的现存会话；留空使用第一个合格目标）、`send_groups`、`send_private`、`allowlist_umos`、`denylist_umos`、`provider_id`、`event_offset_minutes`、`poll_seconds`、`grace_seconds`、`max_message_chars`、`dry_run` 与 `broadcast_prompt`。仅使用 AstrBot 已有会话，不枚举 QQ 群/好友。
 
-计划仅保存在本插件数据目录的 `life_broadcast_state.json`，使用原子替换写入。重启后相同日程复用已生成消息；已发送项目不会重复发送，过期项目不补发。广播只投递至 AstrBot 已有会话，不读取 QQ 好友/群列表，也不写入聊天历史。
+### Fat Fish 策略兼容
 
-高峰期策略完全由已启用的 Fat Fish Wallet (`astrbot_plugin_fat_fish_wallet`) 控制。Xiaoman 只通过 AstrBot 插件元数据发现实例并调用其公开的 `get_wallet_policy()`；不读取插件配置副本、不解析时段/星期，也不重复节假日或强制覆盖逻辑。必须安装并启用带有该公开策略接口的 Fat Fish 版本，否则不会生成或发送主动广播。Fat Fish 返回的当前策略用于生成前保护、每个未来事件过滤、JSON 修复前检查及实际发送前复查。中国法定节假日由 Fat Fish 在自动模式中按非高峰处理。插件状态命令直接显示 Fat Fish 返回的启用状态、时区、覆盖模式、节假日及名称、当前策略、提供商适用性和允许结果。
+已启用的 `astrbot_plugin_fat_fish_wallet` 若提供原生 `get_wallet_policy()`，Xiaoman 直接调用；否则为官方 Fat Fish 1.1.1 安装可逆的运行时兼容桥，复用其实例的配置/辅助方法。TimeAwareness 是工作日/假日唯一来源：假日和周末在自动模式视为非高峰；调休工作日继续走 Fat Fish 原有高峰规则；TimeAwareness 不可用/未知时不臆造节假日。`always_block` 和 `always_allow` 优先级不变。
+
+兼容桥仅在内存中包装活动实例 `_cfg("manual_override")` 的读取，不改 Fat Fish 配置文件或已保存的 `manual_override`，卸载时仅在 wrapper 仍由 Xiaoman 持有时恢复。Fat Fish 官方文件与 TimeAwareness 官方文件均不修改。
+
+管理员命令：`/xiaoman_broadcast status` 查看运行诊断，`refresh` 读取快照并按变化生成，`test` 预览已生成消息。状态不会显示密钥或插件配置全文。
 
 管理员命令：
 
