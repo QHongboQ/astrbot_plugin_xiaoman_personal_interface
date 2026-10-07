@@ -182,6 +182,86 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.service.refresh(now=self.now),self.service.last_error)
         return copy.deepcopy(self.service.plan_for_date(self.now.date()))
 
+    def test_prompt_carries_concrete_normal_activity_and_natural_voice_constraints(self):
+        entries=[
+            {"id":"class","kind":"NORMAL","trigger_at":"08:55","slot_start":"08:55","slot_end":"12:00","name":"上午课程","state":"上课，虽然有点想翘课但还是去露个脸"},
+            {"id":"exhibition","kind":"NORMAL","trigger_at":"14:00","slot_start":"14:00","slot_end":"16:00","name":"外出看展","state":"逛展厅"},
+            {"id":"movie","kind":"NORMAL","trigger_at":"16:30","slot_start":"16:30","slot_end":"18:30","name":"看电影","state":"放松一下"},
+            {"id":"chores","kind":"NORMAL","trigger_at":"19:00","slot_start":"19:00","slot_end":"19:30","name":"打扫家务","state":"收拾房间"},
+            {"id":"meal","kind":"NORMAL","trigger_at":"19:30","slot_start":"19:30","slot_end":"20:00","name":"吃饭","state":"晚饭"},
+            {"id":"walk","kind":"NORMAL","trigger_at":"20:00","slot_start":"20:00","slot_end":"20:30","name":"散步","state":"出去走走"},
+        ]
+        prompt=self.service._prompt_lines(entries,{"local_date":"2026-10-07"},"workday")
+        for value in ("上午课程","想翘课","外出看展","看电影","打扫家务","吃饭","散步","time_segment"):
+            self.assertIn(value,prompt)
+        self.assertIn("独立可懂",prompt)
+        self.assertIn("保留默认 Persona",prompt)
+        self.assertIn("不得补造地点、人物、原因、结果",prompt)
+
+    async def test_batch_generated_messages_remain_specific_for_everyday_activities(self):
+        messages={
+            "2026-10-07-N01":"上午还是去学校上课啦，虽然有点想翘课，但先去露个脸再说。",
+            "2026-10-07-N02":"刚从展厅出来，今天看展走得我腿都酸啦。",
+            "2026-10-07-N03":"电影散场啦，这场看得我心情好多了。",
+            "2026-10-07-N04":"房间总算收拾干净了，打扫家务比想象中累欸。",
+            "2026-10-07-N05":"先去吃晚饭啦，饿得我已经开始惦记下一口了。",
+            "2026-10-07-N06":"饭后出来散散步，吹会儿风再回去。",
+        }
+        async def natural_batch(**kwargs):
+            prompt=kwargs["prompt"]
+            for fact in ("上午课程","外出看展","看电影","打扫家务","吃饭","散步","想翘课"):
+                self.assertIn(fact,prompt)
+            return types.SimpleNamespace(completion_text=json.dumps(messages,ensure_ascii=False))
+        self.ctx.llm_generate=natural_batch
+        await self._prepare_simulation([
+            {"start":"08:00","end":"08:50","name":"上午课程","state":"上课，心里有点想翘课但决定去露个脸"},
+            {"start":"09:00","end":"09:50","name":"外出看展","state":"看展"},
+            {"start":"10:00","end":"10:50","name":"看电影","state":"休息"},
+            {"start":"11:00","end":"11:30","name":"打扫家务","state":"收拾房间"},
+            {"start":"12:00","end":"12:30","name":"吃饭","state":"午饭"},
+            {"start":"13:00","end":"13:30","name":"散步","state":"出去走走"},
+        ])
+        plan=self.service.plan_for_date(self.now.date())
+        self.assertTrue(plan["plan_complete"])
+        self.assertEqual({entry["id"]:entry["message"] for entry in plan["entries"]},messages)
+
+    def test_peak_primary_activity_comes_from_overlapping_slot_and_unknown_is_not_guessed(self):
+        date=self.now.date()
+        peak_start=self.now.replace(hour=9,minute=0)
+        peak_end=self.now.replace(hour=12,minute=0)
+        activity=self.service._primary_peak_activity({"slots":[
+            {"start":"09:10","end":"11:30","name":"上午课程","state":"上课，差点想翘课"},
+            {"start":"11:35","end":"11:55","name":"买饮料","state":"课间休息"},
+        ]},date,"Asia/Shanghai",peak_start,peak_end)
+        self.assertEqual(activity["name"],"上午课程")
+        unknown=self.service._primary_peak_activity({"slots":[{"start":"08:00","end":"08:30","name":"早餐","state":"吃饭"}]},date,"Asia/Shanghai",peak_start,peak_end)
+        self.assertIsNone(unknown)
+        pair=[
+            {"id":"start","kind":"PEAK_START","activity_id":"P1","trigger_at":"08:55","activity_context":{"activity_id":"P1","primary_activity":activity}},
+            {"id":"end","kind":"PEAK_END","activity_id":"P1","trigger_at":"12:05","activity_context":{"activity_id":"P1","primary_activity":activity}},
+        ]
+        prompt=self.service._prompt_lines(pair,{"local_date":"2026-10-07"},"workday")
+        self.assertEqual(prompt.count('"name": "上午课程"'),2)
+        self.assertEqual(prompt.count('"activity_id": "P1"'),2)
+        unknown_pair=[dict(entry,activity_context={"activity_id":"P2","primary_activity":None}) for entry in pair]
+        unknown_prompt=self.service._prompt_lines(unknown_pair,{"local_date":"2026-10-07"},"workday")
+        self.assertIn('"primary_activity": null',unknown_prompt)
+        self.assertIn("不得猜测或虚构",unknown_prompt)
+
+    async def test_prompt_rebuild_preserves_successfully_delivered_old_event(self):
+        old={"id":"old-event","trigger_at":self.now.isoformat(),"message":"已发送的旧文案","sent":True,
+             "expired":False,"delivered_umos":["qq:GroupMessage:g1"]}
+        rebuilt={"id":"old-event","trigger_at":self.now.isoformat(),"message":"","sent":False,
+                 "expired":False,"delivered_umos":[]}
+        preserved=self.service._preserve_delivery({"entries":[old]},[rebuilt])[0]
+        self.assertEqual(preserved["message"],"已发送的旧文案")
+        self.assertTrue(preserved["sent"])
+        self.assertEqual(preserved["delivered_umos"],["qq:GroupMessage:g1"])
+        self.service.state["plans"][self.now.date().isoformat()]={"timezone":"Asia/Shanghai","entries":[preserved]}
+        result=await self.service.send_due(self.now)
+        self.assertEqual(result["success_count"],0)
+        self.assertEqual(self.sent,[])
+
     async def test_simulate_due_event_sends_only_due_and_preserves_formal_plan(self):
         import astrbot.api.event
         class Chain:
@@ -396,6 +476,11 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         ends=[e for e in entries if e["kind"]=="PEAK_END"]
         normal=[e for e in entries if e["kind"]=="NORMAL"]
         self.assertEqual((len(starts),len(ends)),(2,2))
+        for start_entry in starts:
+            end_entry=next(entry for entry in ends if entry["activity_id"]==start_entry["activity_id"])
+            self.assertEqual(start_entry["activity_context"],end_entry["activity_context"])
+            self.assertIsNotNone(start_entry["activity_context"]["primary_activity"])
+            self.assertIn(start_entry["activity_context"]["primary_activity"]["name"],{"课程","拍摄"})
         self.assertTrue(all(datetime.fromisoformat(e["trigger_at"]).tzinfo is not None for e in entries))
         start_times=[datetime.fromisoformat(e["trigger_at"]) for e in starts]
         end_times=[datetime.fromisoformat(e["trigger_at"]) for e in ends]
