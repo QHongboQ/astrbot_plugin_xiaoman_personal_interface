@@ -199,7 +199,7 @@ async def verify_life_broadcast_public_contract():
             return "runtime-provider"
 
         async def get_persona(self):
-            return types.SimpleNamespace(prompt="runtime persona")
+            return {"name": "runtime", "prompt": "runtime dict persona"}
 
         async def llm_generate(self, *, chat_provider_id, prompt=None, tools=None, system_prompt=None, **kwargs):
             self.llm_calls.append((chat_provider_id, prompt, tools, system_prompt))
@@ -218,7 +218,7 @@ async def verify_life_broadcast_public_contract():
         assert len(runtime_context.llm_calls) == 1
         assert runtime_context.llm_calls[0][0] == "runtime-provider"
         assert runtime_context.llm_calls[0][2] is None
-        assert runtime_context.llm_calls[0][3] == "runtime persona"
+        assert runtime_context.llm_calls[0][3] == "runtime dict persona"
         await service.send_due(clock)
         assert len(runtime_context.sent) == 1
         assert service.state["entries"][0]["sent"] is True

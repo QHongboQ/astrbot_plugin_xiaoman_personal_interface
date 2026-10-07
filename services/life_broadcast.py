@@ -23,20 +23,35 @@ def parse_schedule(text: str) -> list[dict[str, str]]:
     rows = []
     for line in (text or "").splitlines():
         fields = [part.strip() for part in re.split(r"[|｜]", line)]
-        if len(fields) < 4:
+        if len(fields) < 3:
             continue
-        data: dict[str, str] = {"time": "", "location": "", "activity": "", "detail": "", "raw": line.strip()}
-        for field in fields:
-            match = re.match(r"^(时间|地点|事项|细节)\s*[:：]\s*(.*)$", field)
-            if match:
-                data[{"时间": "time", "地点": "location", "事项": "activity", "细节": "detail"}[match.group(1)]] = match.group(2).strip()
-            elif re.fullmatch(r"\d{1,2}:\d{2}", field):
-                data["time"] = field
-        # Canonical contract also permits an unlabelled four-field pipe row.
-        bare = [f for f in fields if not re.match(r"^(时间|地点|事项|细节)\s*[:：]", f) and not re.fullmatch(r"\d{1,2}:\d{2}", f)]
-        if not data["location"] and len(bare) >= 3:
-            data["location"], data["activity"], data["detail"] = bare[-3:]
-        if not re.fullmatch(r"(?:[01]?\d|2[0-3]):[0-5]\d", data["time"]):
+        time_match = re.fullmatch(
+            r"(?P<start>(?:[01]?\d|2[0-3]):[0-5]\d)(?:\s*[-–]\s*(?:[01]?\d|2[0-3]):[0-5]\d)?",
+            fields[0],
+        )
+        data: dict[str, str] = {
+            "time": time_match.group("start") if time_match else "",
+            "location": "",
+            "activity": "",
+            "detail": "",
+            "raw": line.strip(),
+        }
+        if len(fields) >= 4:
+            for field in fields[1:]:
+                match = re.match(r"^(时间|地点|事项|细节)\s*[:：]\s*(.*)$", field)
+                if match:
+                    data[{"时间": "time", "地点": "location", "事项": "activity", "细节": "detail"}[match.group(1)]] = match.group(2).strip()
+            if not data["location"]:
+                bare = [f for f in fields[1:] if not re.match(r"^(时间|地点|事项|细节)\s*[:：]", f)]
+                if len(bare) >= 3:
+                    data["location"], data["activity"], data["detail"] = bare[-3:]
+        elif len(fields) == 3:
+            legacy = re.match(r"^(.+?)\s*[:：]\s*(.+)$", fields[1])
+            if legacy:
+                data["location"] = legacy.group(1).strip()
+                data["activity"] = legacy.group(2).strip()
+                data["detail"] = fields[2]
+        if not data["time"]:
             logger.debug("Skipping malformed Life Scheduler row: %s", line)
             continue
         if not (data["activity"] or data["detail"]):
@@ -149,10 +164,23 @@ class LifeBroadcastService:
         shifted = (datetime(2000, 1, 1, h, m) + timedelta(minutes=offset)).time()
         return shifted.strftime("%H:%M")
 
-    async def _generate(self, rows, targets):
+    async def _generate(self, rows, targets, now: datetime | None = None):
         self.last_error = ""
-        if not rows or not targets:
+        if not rows:
+            return []
+        if not targets:
             return None
+        offset = int(self._get("event_offset_minutes", 0))
+        generation_now = now or datetime.now()
+        eligible = []
+        for index, row in enumerate(rows, 1):
+            trigger_dt = self._trigger_datetime(row["time"], offset, generation_now)
+            if self.blocked(trigger_dt) or self._expired_at(trigger_dt, generation_now):
+                continue
+            entry_id = f"E{index}"
+            eligible.append((entry_id, row, trigger_dt))
+        if not eligible:
+            return []
         provider = self._get("provider_id", "")
         if not provider:
             try:
@@ -164,17 +192,15 @@ class LifeBroadcastService:
             logger.warning("Xiaoman broadcast pending: no chat provider")
             return None
         persona = await self.context.persona_manager.get_default_persona_v3()
-        persona_prompt = getattr(persona, "prompt", "") or ""
-        offset = int(self._get("event_offset_minutes", 0))
+        if isinstance(persona, dict):
+            persona_prompt = str(persona.get("prompt", "") or "")
+        else:
+            persona_prompt = str(getattr(persona, "prompt", "") or "")
         inputs = []
         entries = []
-        for index, row in enumerate(rows, 1):
-            trigger = self._event_time(row["time"], offset)
-            if self._time_blocked(trigger):
-                continue
-            entry_id = f"E{index}"
+        for entry_id, row, trigger_dt in eligible:
             inputs.append(f"{entry_id} | {row['time']} | {row['location']} | {row['activity']} | {row['detail']}")
-            entries.append({"id": entry_id, "time": row["time"], "trigger_time": trigger, "location": row["location"], "activity": row["activity"], "detail": row["detail"], "message": "", "sent": False})
+            entries.append({"id": entry_id, "time": row["time"], "trigger_time": trigger_dt.strftime("%H:%M"), "location": row["location"], "activity": row["activity"], "detail": row["detail"], "message": "", "sent": False, "delivered_umos": []})
         if not entries:
             return []
         user_prompt = f"{self._get('broadcast_prompt', DEFAULT_PROMPT)}\n事件 offset={offset} 分钟。每项生成 15-60 字消息（最长 {self._get('max_message_chars', 80)} 字），只输出 JSON 对象，键为事件 ID。\n" + "\n".join(inputs)
@@ -213,7 +239,15 @@ class LifeBroadcastService:
         except ValueError:
             return True
 
-    async def refresh(self, force=False):
+    @staticmethod
+    def _trigger_datetime(hhmm: str, offset: int, now: datetime) -> datetime:
+        event_time = time.fromisoformat(hhmm)
+        return datetime.combine(now.date(), event_time) + timedelta(minutes=offset)
+
+    def _expired_at(self, trigger: datetime, now: datetime) -> bool:
+        return now > trigger + timedelta(seconds=int(self._get("grace_seconds", 60)))
+
+    async def refresh(self, force=False, now: datetime | None = None):
         text = await self.read_schedule()
         if text is None:
             return False
@@ -226,7 +260,8 @@ class LifeBroadcastService:
             pending = self.state.get("pending_hash") == digest
             if not incomplete and not pending:
                 return False
-        if self.blocked():
+        refresh_now = now or datetime.now()
+        if self.blocked(refresh_now):
             self.state["pending_hash"] = digest
             self.state["pending_text"] = text
             return False
@@ -237,7 +272,7 @@ class LifeBroadcastService:
             return False
         rows = parse_schedule(text)
         try:
-            entries = await self._generate(rows, targets)
+            entries = await self._generate(rows, targets, now=refresh_now)
         except Exception as exc:
             self.last_error = f"generation failed: {exc}"
             entries = None
@@ -273,7 +308,7 @@ class LifeBroadcastService:
                 entry["expired"] = True
                 self._save()
                 continue
-            if now > trigger + timedelta(seconds=int(self._get("grace_seconds", 60))):
+            if self._expired_at(trigger, now):
                 entry["expired"] = True
                 self._save()
                 continue
@@ -286,18 +321,25 @@ class LifeBroadcastService:
                     self._save()
                 continue
             from astrbot.api.event import MessageChain
-            successes = failures = 0
+            delivered = set(entry.get("delivered_umos", []))
+            entry["delivered_umos"] = sorted(delivered)
+            if not targets:
+                continue
+            failures = 0
             for umo in targets:
+                if umo in delivered:
+                    continue
                 try:
                     await self.context.send_message(umo, MessageChain().message(entry["message"]))
-                    successes += 1
+                    delivered.add(umo)
+                    entry["delivered_umos"] = sorted(delivered)
+                    self._save()
                 except Exception:
                     failures += 1
                     logger.warning("Xiaoman broadcast send failed for %s", umo, exc_info=True)
-            entry["sent"] = True
-            entry["sent_count"] = successes
+            entry["sent"] = bool(targets) and all(umo in delivered for umo in targets)
             self._save()
-            logger.info("Xiaoman broadcast sent: success=%s failure=%s", successes, failures)
+            logger.info("Xiaoman broadcast delivery: delivered=%s failure=%s", len(delivered), failures)
 
     async def tick(self):
         await self.refresh()
