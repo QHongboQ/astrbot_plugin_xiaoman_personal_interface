@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, tempfile, types, unittest
+import copy, json, tempfile, types, unittest
 from datetime import datetime
 from pathlib import Path
 
@@ -171,6 +171,139 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.service=ScheduleBroadcastService(self.ctx,{"schedule_broadcast":{"enable":True,"provider_id":"provider"}},".",fat_fish=self.policy)
         self.saved=[]
         self.service._save=lambda:self.saved.append(json.loads(json.dumps(self.service.state)))
+
+    async def _prepare_simulation(self, slots):
+        from datetime import timezone, timedelta
+        self.now=datetime(2026,10,7,4,0,tzinfo=timezone(timedelta(hours=8)))
+        self.available_dates={self.now.date()}
+        self.day_kinds={self.now.date():"holiday"}
+        self.slots=slots
+        self.service.cfg["dry_run"]=False
+        self.assertTrue(await self.service.refresh(now=self.now),self.service.last_error)
+        return copy.deepcopy(self.service.plan_for_date(self.now.date()))
+
+    async def test_simulate_due_event_sends_only_due_and_preserves_formal_plan(self):
+        import astrbot.api.event
+        class Chain:
+            def message(self,value): return self
+        astrbot.api.event.MessageChain=Chain
+        original=await self._prepare_simulation([
+            {"start":"10:00","end":"10:10","name":"due","state":"x"},
+            {"start":"10:30","end":"10:40","name":"future","state":"y"},
+        ])
+        result,error=await self.service.simulate_time("10:00")
+        self.assertFalse(error)
+        self.assertEqual(result["hit_event_ids"],[original["entries"][0]["id"]])
+        self.assertEqual((result["target_count"],result["success_count"],result["failure_count"]),(2,2,0))
+        self.assertEqual(len(self.sent),2)
+        self.assertEqual(self.service.plan_for_date(self.now.date()),original)
+
+    async def test_simulate_early_time_does_not_send(self):
+        original=await self._prepare_simulation([
+            {"start":"10:00","end":"10:10","name":"future","state":"x"},
+        ])
+        result,error=await self.service.simulate_time("09:59")
+        self.assertFalse(error)
+        self.assertEqual(result["hit_event_ids"],[])
+        self.assertEqual(result["success_count"],0)
+        self.assertEqual(len(self.sent),0)
+        self.assertEqual(self.service.plan_for_date(self.now.date()),original)
+
+    async def test_simulate_expired_time_does_not_send_or_expire_formal_entry(self):
+        original=await self._prepare_simulation([
+            {"start":"10:00","end":"10:10","name":"expired","state":"x"},
+        ])
+        result,error=await self.service.simulate_time("10:02")
+        self.assertFalse(error)
+        self.assertEqual(result["hit_event_ids"],[])
+        self.assertEqual(result["expired_event_ids"],[original["entries"][0]["id"]])
+        self.assertIn("超过宽限期",result["reason"])
+        self.assertEqual(len(self.sent),0)
+        self.assertEqual(self.service.plan_for_date(self.now.date()),original)
+
+    async def test_simulate_with_no_targets_reports_reason_without_mutation(self):
+        original=await self._prepare_simulation([
+            {"start":"10:00","end":"10:10","name":"due","state":"x"},
+        ])
+        async def no_targets(): return []
+        self.ctx.conversation_manager.get_conversations=no_targets
+        result,error=await self.service.simulate_time("10:00")
+        self.assertFalse(error)
+        self.assertEqual(result["target_count"],0)
+        self.assertEqual((result["success_count"],result["failure_count"]),(0,0))
+        self.assertIn("没有符合",result["reason"])
+        self.assertEqual(len(self.sent),0)
+        self.assertEqual(self.service.plan_for_date(self.now.date()),original)
+
+    async def test_simulate_obeys_chat_type_allowlist_and_denylist(self):
+        import astrbot.api.event
+        class Chain:
+            def message(self,value): return self
+        astrbot.api.event.MessageChain=Chain
+        original=await self._prepare_simulation([
+            {"start":"10:00","end":"10:10","name":"due","state":"x"},
+        ])
+        self.service.cfg.update({
+            "send_groups":True, "send_private":False,
+            "allowlist_umos":["qq:GroupMessage:g1","qq:FriendMessage:u1"],
+            "denylist_umos":["qq:FriendMessage:u1"],
+        })
+        result,error=await self.service.simulate_time("10:00")
+        self.assertFalse(error)
+        self.assertEqual((result["target_count"],result["success_count"],result["failure_count"]),(1,1,0))
+        self.assertEqual([umo for umo,_ in self.sent],["qq:GroupMessage:g1"])
+        self.assertEqual(self.service.plan_for_date(self.now.date()),original)
+
+    async def test_simulate_partial_send_failure_reports_target_and_reason(self):
+        import astrbot.api.event
+        class Chain:
+            def message(self,value): return self
+        astrbot.api.event.MessageChain=Chain
+        original=await self._prepare_simulation([
+            {"start":"10:00","end":"10:10","name":"due","state":"x"},
+        ])
+        async def flaky(umo,chain):
+            if umo.endswith(":g1"):
+                raise RuntimeError("group temporarily unavailable")
+            self.sent.append((umo,chain))
+        self.ctx.send_message=flaky
+        result,error=await self.service.simulate_time("10:00")
+        self.assertFalse(error)
+        self.assertEqual((result["success_count"],result["failure_count"]),(1,1))
+        self.assertEqual(result["failures"][0]["umo"],"qq:GroupMessage:g1")
+        self.assertIn("temporarily unavailable",result["failures"][0]["reason"])
+        self.assertEqual(self.service.plan_for_date(self.now.date()),original)
+
+    async def test_simulate_can_send_under_persisted_dry_run_without_changing_it(self):
+        import astrbot.api.event
+        class Chain:
+            def message(self,value): return self
+        astrbot.api.event.MessageChain=Chain
+        original=await self._prepare_simulation([
+            {"start":"10:00","end":"10:10","name":"due","state":"x"},
+        ])
+        self.service.cfg["dry_run"]=True
+        result,error=await self.service.simulate_time("10:00")
+        self.assertFalse(error)
+        self.assertEqual(result["success_count"],2)
+        self.assertTrue(self.service.cfg["dry_run"])
+        self.assertEqual(len(self.sent),2)
+        self.assertEqual(self.service.plan_for_date(self.now.date()),original)
+
+    async def test_repeated_simulation_uses_fresh_isolated_state(self):
+        import astrbot.api.event
+        class Chain:
+            def message(self,value): return self
+        astrbot.api.event.MessageChain=Chain
+        original=await self._prepare_simulation([
+            {"start":"10:00","end":"10:10","name":"due","state":"x"},
+        ])
+        first,error=await self.service.simulate_time("10:00")
+        second,error2=await self.service.simulate_time("10:00")
+        self.assertFalse(error); self.assertFalse(error2)
+        self.assertEqual(first["hit_event_ids"],second["hit_event_ids"])
+        self.assertEqual(len(self.sent),4)
+        self.assertEqual(self.service.plan_for_date(self.now.date()),original)
 
     async def test_config_schema_has_no_block_windows(self):
         schema=json.loads((Path(__file__).parents[1]/"_conf_schema.json").read_text(encoding="utf-8")); self.assertIn("schedule_source_umo",schema["schedule_broadcast"]["items"]); self.assertNotIn("blocked_windows",str(schema))

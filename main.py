@@ -94,8 +94,25 @@ class Main(Star):
             changed = await service.refresh(force=True)
             yield event.plain_result("已有快照已刷新" if changed else service.last_error or "没有需要刷新的快照")
             return
+        if action == "simulate":
+            result, error = await service.simulate_time(argument)
+            if error:
+                yield event.plain_result(f"模拟投递未执行：{error}")
+                return
+            failures = "；".join(
+                f"{item['entry_id']} → {item['umo']}: {item['reason']}"
+                for item in result["failures"]
+            ) or "无"
+            yield event.plain_result(
+                f"模拟投递时间：{result['simulated_at']}\n"
+                f"命中事件：{', '.join(result['hit_event_ids']) or '无'}\n"
+                f"目标数：{result['target_count']}；成功数：{result['success_count']}；"
+                f"失败数：{result['failure_count']}\n"
+                f"原因：{result.get('reason', '全部成功')}\n失败明细：{failures}"
+            )
+            return
         if argument not in {"today", "tomorrow"} and action != "test":
-            yield event.plain_result("用法：/xiaoman_broadcast raw|plan|build|reset today|tomorrow")
+            yield event.plain_result("用法：/xiaoman_broadcast simulate HH:MM；或 raw|plan|build|reset today|tomorrow")
             return
         if action == "raw":
             snapshot = await service.raw_schedule(command_date)
@@ -133,7 +150,7 @@ class Main(Star):
             success, result = await service.test_entry(argument, event.unified_msg_origin)
             yield event.plain_result(result)
             return
-        yield event.plain_result("支持：status、raw、plan、build、reset、test")
+        yield event.plain_result("支持：status、raw、plan、build、reset、test、simulate")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("xiaoman_test")

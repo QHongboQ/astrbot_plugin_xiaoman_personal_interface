@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 from datetime import date, datetime, time, timedelta, timezone as datetime_timezone
@@ -478,12 +479,46 @@ class ScheduleBroadcastService:
             logger.warning("Schedule broadcast admin test send failed", exc_info=True)
             return False, "测试操作失败，消息未确认发送。"
 
-    async def send_due(self, now=None):
+    async def simulate_time(self, hhmm, now=None):
+        """Run the normal due-send path against an isolated copy of today's plan."""
+        current = self._now(now)
+        if (not isinstance(hhmm, str) or len(hhmm) != 5 or hhmm[2] != ":"
+                or not hhmm[:2].isdigit() or not hhmm[3:].isdigit()):
+            return None, "时间格式应为 HH:MM。"
+        try:
+            simulated_clock = time.fromisoformat(hhmm)
+        except ValueError:
+            return None, "无效的模拟时间。"
+        plan = self.plan_for_date(current.date())
+        if not plan:
+            return None, "当天没有已生成的 EFFECTIVE 日程。"
+        timezone = str(plan.get("timezone") or "Asia/Shanghai")
+        simulated_now = datetime.combine(current.date(), simulated_clock, tzinfo=_zone(timezone))
+        isolated_plan = copy.deepcopy(plan)
+        result = await self.send_due(simulated_now, plans=[isolated_plan], force_send=True)
+        result["simulated_at"] = simulated_now.isoformat()
+        if not result["hit_event_ids"] and not result["expired_event_ids"]:
+            result["reason"] = "该时间没有到期事件。"
+        elif not result["hit_event_ids"] and result["expired_event_ids"]:
+            result["reason"] = "事件已超过宽限期，未发送。"
+        elif not result["target_count"]:
+            result["reason"] = "没有符合群聊/私聊、允许名单和拒绝名单配置的投递目标。"
+        elif result["failures"]:
+            result["reason"] = "部分目标发送失败；详见失败明细。"
+        return result, ""
+
+    async def send_due(self, now=None, *, plans=None, force_send=False):
+        persist = plans is None
         targets = await self.targets()
         now = self._now(now)
+        active_plans = self._plans().values() if persist else plans
+        result = {
+            "hit_event_ids": [], "expired_event_ids": [], "target_count": len(targets),
+            "success_count": 0, "failures": [],
+        }
         if targets:
             from astrbot.api.event import MessageChain
-        for plan in self._plans().values():
+        for plan in active_plans:
             timezone = str(plan.get("timezone") or "Asia/Shanghai")
             try:
                 local_now = now.astimezone(_zone(timezone))
@@ -495,21 +530,27 @@ class ScheduleBroadcastService:
                 trigger = self._parse_absolute(entry.get("trigger_at"), timezone)
                 if trigger is None:
                     entry["expired"] = True
-                    self._save()
+                    result["expired_event_ids"].append(entry.get("id", ""))
+                    if persist:
+                        self._save()
                     continue
                 if local_now > trigger + timedelta(seconds=int(self._get("grace_seconds", 60))):
                     entry["expired"] = True
-                    self._save()
+                    result["expired_event_ids"].append(entry.get("id", ""))
+                    if persist:
+                        self._save()
                     continue
                 if local_now < trigger:
                     continue
+                result["hit_event_ids"].append(entry.get("id", ""))
                 if not targets:
                     continue
-                if self._get("dry_run", False):
+                if self._get("dry_run", False) and not force_send:
                     if not entry.get("dry_run_logged"):
                         logger.info("Schedule broadcast dry-run %s: %s", entry["id"], entry["message"])
                         entry["dry_run_logged"] = True
-                        self._save()
+                        if persist:
+                            self._save()
                     continue
                 delivered = set(entry.get("delivered_umos", []))
                 for umo in targets:
@@ -517,13 +558,22 @@ class ScheduleBroadcastService:
                         continue
                     try:
                         await self.context.send_message(umo, MessageChain().message(entry["message"]))
+                        result["success_count"] += 1
                         delivered.add(umo)
                         entry["delivered_umos"] = sorted(delivered)
-                        self._save()
-                    except Exception:
+                        if persist:
+                            self._save()
+                    except Exception as exc:
+                        result["failures"].append({
+                            "entry_id": entry.get("id", ""), "umo": umo,
+                            "reason": str(exc) or type(exc).__name__,
+                        })
                         logger.warning("Schedule broadcast send failed", exc_info=True)
                 entry["sent"] = bool(targets) and all(umo in delivered for umo in targets)
-                self._save()
+                if persist:
+                    self._save()
+        result["failure_count"] = len(result["failures"])
+        return result
 
     async def tick(self):
         await self.refresh()
