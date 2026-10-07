@@ -5,7 +5,7 @@ desc: |
   注册无参数 Function Tool `send_xiaoman_photo()`。
   仅在上层 LLM 已根据人格和上下文决定向当前聊天对象发送林小满的一张照片时调用。
   自然语言路由由正常 LLM 处理；显式图库浏览命令由 Airi Gallery 处理。
-  可选广播适配器只读取 TimeAwareness 已存在的日程快照，不负责生成或修改日程。
+  日程广播读取 TimeAwareness 已存在快照；可选滚动生活日桥只在运行时补充生成提示，不修改第三方源码、配置或快照。
   本插件不负责 TTS、人格、记忆、好感度或图片生成。
 version: 0.6.0
 author: QHongboQ
