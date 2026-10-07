@@ -257,6 +257,76 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("结束说这件事做完了",prompt)
         self.assertIn("duration_minutes 必须与 peak_duration_minutes 相称",prompt)
 
+    def test_peak_outline_keeps_a_multi_stop_outing_without_inventing_a_long_event(self):
+        date = self.now.date()
+        peak_start = self.now.replace(hour=14, minute=0)
+        peak_end = self.now.replace(hour=18, minute=0)
+        schedule = {"slots": [
+            {"start":"13:00","end":"15:30","name":"看展","state":"展厅里逛逛拍拍"},
+            {"start":"15:30","end":"16:40","name":"咖啡歇脚","state":"喝杯冰饮，翻照片"},
+            {"start":"16:40","end":"18:20","name":"文创小店","state":"随缘淘两样东西"},
+            {"start":"20:00","end":"21:00","name":"吃晚饭","state":"去探店"},
+        ]}
+        self.assertIsNone(self.service._primary_peak_activity(
+            schedule, date, "Asia/Shanghai", peak_start, peak_end
+        ))
+        outline = self.service._peak_activity_outline(
+            schedule, date, "Asia/Shanghai", peak_start, peak_end
+        )
+        self.assertEqual([activity["name"] for activity in outline],
+                         ["看展", "咖啡歇脚", "文创小店"])
+        self.assertEqual([activity["overlap_minutes"] for activity in outline],
+                         [90, 70, 80])
+        context = {"activity_id": "P2", "primary_activity": None,
+                   "peak_duration_minutes": 240, "activity_outline": outline}
+        entries = [
+            {"id":"peak-start", "kind":"PEAK_START", "trigger_at":"13:57",
+             "activity_context":context},
+            {"id":"peak-end", "kind":"PEAK_END", "trigger_at":"18:02",
+             "activity_context":context},
+        ]
+        prompt = self.service._prompt_lines(entries, {"local_date":str(date)}, "workday")
+        self.assertEqual(prompt.count('"name": "看展"'), 2)
+        self.assertEqual(prompt.count('"name": "文创小店"'), 2)
+        self.assertNotIn('"name": "吃晚饭"', prompt)
+        self.assertIn("按 outline 的真实时间顺序", prompt)
+        self.assertIn("不能假装它们是一项持续数小时的活动", prompt)
+        self.assertIn("1–3件最能解释这段时间为何不在线的实质活动", prompt)
+        self.assertIn("不要把刷手机、发呆、普通吃饭这类短暂过渡", prompt)
+
+    def test_peak_outline_skips_nonoverlapping_and_caps_context(self):
+        date = self.now.date()
+        peak_start = self.now.replace(hour=9, minute=0)
+        peak_end = self.now.replace(hour=12, minute=0)
+        slots = [
+            {"start":"08:30","end":"09:00","name":"早饭","state":"吃东西"},
+            *({"start":f"09:{n:02d}","end":f"09:{n+5:02d}",
+               "name":f"活动{n}","state":"短时间活动"} for n in range(0,40,5)),
+            {"start":"12:00","end":"12:30","name":"午饭","state":"吃东西"},
+        ]
+        outline = self.service._peak_activity_outline(
+            {"slots":slots}, date, "Asia/Shanghai", peak_start, peak_end
+        )
+        self.assertEqual(len(outline), 6)
+        self.assertEqual([item["name"] for item in outline],
+                         ["活动0", "活动5", "活动10", "活动15", "活动20", "活动25"])
+        self.assertTrue(all(item["overlap_minutes"] == 5 for item in outline))
+
+    async def test_nightlife_slots_are_broadcast_as_fact_not_added_by_xiaoman(self):
+        plan_before = await self._prepare_simulation([
+            {"start":"21:30","end":"22:30","name":"去看演出","state":"和朋友听音乐"},
+            {"start":"23:15","end":"24:00","name":"深夜宵夜","state":"边吃边聊"},
+        ])
+        entries = self.service.plan_for_date(self.now.date())["entries"]
+        self.assertEqual([entry["name"] for entry in entries],
+                         ["去看演出", "深夜宵夜"])
+        self.assertEqual([entry["kind"] for entry in entries], ["NORMAL", "NORMAL"])
+        self.assertEqual(self.service.plan_for_date(self.now.date()), plan_before)
+        prompt = self.service._prompt_lines(entries, {"local_date":str(self.now.date())},
+                                            "holiday")
+        self.assertIn("不要默认23点就必须睡觉", prompt)
+        self.assertIn("绝不能为制造夜生活而补造日程中没有的活动", prompt)
+
     async def test_prompt_rebuild_preserves_successfully_delivered_old_event(self):
         old={"id":"old-event","trigger_at":self.now.isoformat(),"message":"已发送的旧文案","sent":True,
              "expired":False,"delivered_umos":["qq:GroupMessage:g1"]}
