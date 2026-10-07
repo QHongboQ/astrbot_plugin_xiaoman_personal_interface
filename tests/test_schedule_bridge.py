@@ -45,16 +45,12 @@ class TimeAwarenessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(policy["kind"],"adjusted"); self.assertTrue(policy["available"])
 
 class BridgeTests(unittest.TestCase):
-    def setup_bridge(self, kind="holiday", override="auto", native=None, enabled=True):
+    def setup_bridge(self, kind="holiday", override="auto", enabled=True):
         f=Fixture(kind, Fish(override, enabled));
-        if native is not None: f.fish.get_wallet_policy=native
         f.stars=[meta(FF,f.fish),meta(TA,types.SimpleNamespace())]
         bridge=FatFishBridge(f,f.day); bridge.install(); return f,bridge
     def test_fatfish_exact_discovery(self):
         f,b=self.setup_bridge(); f.stars.insert(0,meta(FF+"_copy",object())); self.assertIs(b.discover(),f.fish)
-    def test_native_policy_direct_no_patch(self):
-        native=lambda **kw:{"allowed":True,"state":"native"}
-        f,b=self.setup_bridge(native=native); self.assertIs(f.fish.get_wallet_policy,native); self.assertTrue(b.get_wallet_policy()["native_policy"])
     def test_holiday_policy_and_virtual_allow_persisted_auto(self):
         from datetime import timezone, timedelta
         at=datetime(2026,10,7,14,55,tzinfo=timezone(timedelta(hours=8)))
@@ -62,7 +58,8 @@ class BridgeTests(unittest.TestCase):
     def test_weekend_virtual_allow(self):
         f,b=self.setup_bridge("weekend"); self.assertTrue(b.get_wallet_policy()["allowed"]); self.assertEqual(f.fish._cfg("manual_override"),"always_allow")
     def test_adjusted_workday_uses_peak(self):
-        f,b=self.setup_bridge("adjusted"); p=b.get_wallet_policy(at=datetime(2026,10,7,14,55)); self.assertFalse(p["allowed"]); self.assertEqual(f.fish._cfg("manual_override"),"auto")
+        from datetime import timezone, timedelta
+        f,b=self.setup_bridge("adjusted"); at=datetime(2026,10,7,14,55,tzinfo=timezone(timedelta(hours=8))); p=b.get_wallet_policy(at=at); self.assertFalse(p["allowed"]); self.assertEqual(f.fish._cfg("manual_override"),"auto")
     def test_manual_block_wins_holiday(self):
         f,b=self.setup_bridge("holiday","always_block"); self.assertFalse(b.get_wallet_policy()["allowed"]); self.assertEqual(f.fish._cfg("manual_override"),"always_block")
     def test_manual_allow_wins(self): self.assertTrue(self.setup_bridge("adjusted","always_allow")[1].get_wallet_policy()["allowed"])
@@ -73,11 +70,9 @@ class BridgeTests(unittest.TestCase):
     def test_only_manual_override_intercepted(self):
         f,b=self.setup_bridge(); self.assertEqual(f.fish._cfg("anything","x"),"x")
     def test_double_install_and_restore(self):
-        f,b=self.setup_bridge(); wrapper=f.fish._cfg; b.install(); self.assertIs(f.fish._cfg,wrapper); b.uninstall(); self.assertEqual(f.fish._cfg("manual_override"),"auto"); self.assertFalse(hasattr(f.fish,"get_wallet_policy"))
+        f,b=self.setup_bridge(); wrapper=f.fish._cfg; b.install(); self.assertIs(f.fish._cfg,wrapper); b.uninstall(); self.assertEqual(f.fish._cfg("manual_override"),"auto")
     def test_later_patch_not_overwritten(self):
         f,b=self.setup_bridge(); replacement=lambda key,default=None:"later"; f.fish._cfg=replacement; b.uninstall(); self.assertIs(f.fish._cfg,replacement)
-    def test_added_policy_cleanup(self):
-        f,b=self.setup_bridge(); self.assertTrue(callable(f.fish.get_wallet_policy)); b.uninstall(); self.assertFalse(hasattr(f.fish,"get_wallet_policy"))
 
 class AdapterScheduleTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -94,13 +89,12 @@ class AdapterScheduleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls,[("umo",False)])
         self.assertEqual(result["source"],"time_awareness"); self.assertEqual(result["slots"][0]["source_origin"],"ai")
     async def test_explicit_generate_request_denied(self): self.assertIsNone(await TimeAwarenessAdapter(self.ctx).get_daily_schedule("umo",allow_generate=True))
-    async def test_static_fallback_uses_timeawareness_summary_api(self):
+    async def test_missing_snapshot_returns_unavailable_without_generation(self):
         plugin=self.ctx.stars[0].star_cls
         plugin.daily_schedule_service.register_session_async=lambda *a,**k: __import__("asyncio").sleep(0,result="")
         plugin.daily_schedule_service.today_schedule_summary=lambda session,*,now:"08:00-09:00 早读 | 10:00-11:00 上课"
         result=await TimeAwarenessAdapter(self.ctx).get_daily_schedule("umo",at=datetime(2026,10,7),allow_generate=False)
-        self.assertEqual([s["name"] for s in result["slots"]],["早读","上课"])
-        self.assertEqual(result["slots"][0]["origin"],"static")
+        self.assertIsNone(result)
 
 class BroadcastTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -127,11 +121,18 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
             conversation_manager=types.SimpleNamespace(get_conversations=conversations),
             persona_manager=types.SimpleNamespace(get_default_persona_v3=persona),
             get_current_chat_provider_id=provider,llm_generate=llm,send_message=send)
-        self.service=ScheduleBroadcastService(self.ctx,{"schedule_broadcast":{"enable":True}},".")
+        class Policy:
+            def get_wallet_policy(_self, *, at=None, provider_id=None):
+                at=at or self.now
+                return {"found":True,"enabled":True,"allowed":at.strftime("%H:%M") not in self.denied,
+                        "state":"peak" if at.strftime("%H:%M") in self.denied else "offpeak",
+                        "evaluated_at":at,"timezone":"UTC","manual_override":"auto",
+                        "provider_affected":True,"day_kind":"holiday","day_label":"holiday"}
+        self.service=ScheduleBroadcastService(self.ctx,{"schedule_broadcast":{"enable":True}},".",fat_fish=Policy())
         self.saved=[]
         self.service._save=lambda:self.saved.append(json.loads(json.dumps(self.service.state)))
 
-    async def test_config_fallback_and_schema_no_block_windows(self):
+    async def test_config_schema_has_no_block_windows(self):
         schema=json.loads((Path(__file__).parents[1]/"_conf_schema.json").read_text(encoding="utf-8")); self.assertIn("schedule_source_umo",schema["schedule_broadcast"]["items"]); self.assertNotIn("blocked_windows",str(schema))
     async def test_schedule_change_digest_and_empty_slots_skipped(self):
         from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.time_awareness_adapter import TimeAwarenessAdapter

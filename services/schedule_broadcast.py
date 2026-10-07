@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import inspect
 import json
 from datetime import datetime, time, timedelta
 from pathlib import Path
@@ -19,7 +18,7 @@ class ScheduleBroadcastService:
     def __init__(self, context, config, data_dir, *, time_awareness=None, fat_fish=None):
         self.context = context
         self.config = config or {}
-        self.cfg = self.config.get("schedule_broadcast", self.config.get("life_broadcast", {})) or {}
+        self.cfg = self.config.get("schedule_broadcast", {}) or {}
         self.path = Path(data_dir) / "schedule_broadcast_state.json"
         self.state = {"schedule_hash": "", "entries": [], "generated_at": ""}
         self.day_adapter = time_awareness or TimeAwarenessAdapter(context)
@@ -27,8 +26,6 @@ class ScheduleBroadcastService:
         self._task = None
         self.last_schedule = None
         self.last_error = ""
-        self.last_targets = []
-        self.last_source = ""
         self._load()
 
     def _get(self, key, default=None): return self.cfg.get(key, default)
@@ -47,7 +44,7 @@ class ScheduleBroadcastService:
     async def targets(self):
         try:
             rows = self.context.conversation_manager.get_conversations()
-            if inspect.isawaitable(rows): rows = await rows
+            rows = await rows
         except Exception: return []
         allow, deny = set(self._get("allowlist_umos", [])), set(self._get("denylist_umos", []))
         result = set()
@@ -61,7 +58,6 @@ class ScheduleBroadcastService:
     async def read_schedule(self, targets, *, at=None):
         configured = str(self._get("schedule_source_umo", "") or "").strip()
         session = configured or (targets[0] if targets else "")
-        self.last_source = session
         if not session: return None
         return await self.day_adapter.get_daily_schedule(session, at=at, allow_generate=False)
 
@@ -82,7 +78,7 @@ class ScheduleBroadcastService:
         return datetime.combine(local_now.date(), start, tzinfo=local_now.tzinfo) + timedelta(minutes=int(self._get("event_offset_minutes", 0)))
 
     async def refresh(self, force=False, now=None):
-        targets = await self.targets(); self.last_targets = targets
+        targets = await self.targets()
         schedule = await self.read_schedule(targets, at=now)
         self.last_schedule = schedule
         if schedule is None:
@@ -131,7 +127,7 @@ class ScheduleBroadcastService:
         self._save(); self.last_error = ""; return True
 
     async def send_due(self, now=None):
-        targets = await self.targets(); self.last_targets = targets
+        targets = await self.targets()
         provider = await self._provider(targets)
         policy = self.fat_fish.get_wallet_policy(at=now, provider_id=provider)
         local_now = policy.get("evaluated_at") or now
@@ -179,9 +175,9 @@ class ScheduleBroadcastService:
         fish = self.fat_fish.get_wallet_policy(provider_id=self._get("provider_id", ""))
         pending = next((e for e in self.state.get("entries", []) if not e.get("sent") and not e.get("expired")), None)
         return {"enabled": bool(self._get("enable", False)), "dry_run": bool(self._get("dry_run", False)),
-                "time_awareness_found": self.day_adapter.discover() is not None, "schedule_source": self.last_source,
-                "time_awareness_version": self.day_adapter.version(), "fat_fish_version": self.fat_fish.version(),
-                "snapshot_id": schedule.get("snapshot_id", self.state.get("snapshot_id", "")), "local_date": schedule.get("local_date", ""),
-                "slot_count": len(schedule.get("slots", [])), "generated": bool(self.state.get("generated_at")),
-                "sent": sum(bool(e.get("sent")) for e in self.state.get("entries", [])), "targets": len(self.last_targets),
-                "next": pending, "last_error": self.last_error, "fat_fish": fish}
+                "time_awareness_found": self.day_adapter.discover() is not None,
+                "snapshot_id": schedule.get("snapshot_id", self.state.get("snapshot_id", "")),
+                "local_date": schedule.get("local_date", ""), "slot_count": len(schedule.get("slots", [])),
+                "fat_fish_found": fish.get("found", False), "wallet_state": fish.get("state", "unknown"),
+                "wallet_allowed": fish.get("allowed", False), "day_kind": fish.get("day_kind", "unknown"),
+                "next": pending, "last_error": self.last_error}

@@ -41,7 +41,7 @@ send_xiaoman_photo()
 
 ### Fat Fish 策略兼容
 
-已启用的 `astrbot_plugin_fat_fish_wallet` 若提供原生 `get_wallet_policy()`，Xiaoman 直接调用；否则为官方 Fat Fish 1.1.1 安装可逆的运行时兼容桥，复用其实例的配置/辅助方法。TimeAwareness 是工作日/假日唯一来源：假日和周末在自动模式视为非高峰；调休工作日继续走 Fat Fish 原有高峰规则；TimeAwareness 不可用/未知时不臆造节假日。`always_block` 和 `always_allow` 优先级不变。
+Xiaoman 为官方 Fat Fish 1.1.1 提供自己的钱包策略接口，并仅对活动实例安装可逆的运行时 `_cfg("manual_override")` 包装。TimeAwareness 是工作日/假日唯一来源：假日和周末在自动模式视为非高峰；调休工作日继续走 Fat Fish 原有高峰规则；TimeAwareness 不可用/未知时不臆造节假日。`always_block` 和 `always_allow` 优先级不变。
 
 兼容桥仅在内存中包装活动实例 `_cfg("manual_override")` 的读取，不改 Fat Fish 配置文件或已保存的 `manual_override`，卸载时仅在 wrapper 仍由 Xiaoman 持有时恢复。Fat Fish 官方文件与 TimeAwareness 官方文件均不修改。
 

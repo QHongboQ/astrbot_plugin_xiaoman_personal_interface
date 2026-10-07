@@ -186,18 +186,21 @@ async def verify_schedule_bridge_public_contract():
     class TimeAwareness:
         daily_schedule_service = DailyScheduleService()
         daily_schedule_admin = DailyScheduleAdmin()
-        time_context = types.SimpleNamespace(now=lambda: clock)
+        time_context = types.SimpleNamespace(
+            now=lambda: clock,
+            facts=types.SimpleNamespace(collect=lambda **kwargs: types.SimpleNamespace(
+                workday=types.SimpleNamespace(kind="unknown", available=False, value=""),
+                now=kwargs["now"])),
+        )
 
-    class PublicFatFishPolicy:
-        def get_wallet_policy(self, *, at=None, provider_id=None):
-            assert provider_id == "runtime-provider"
-            return {
-                "enabled": True, "allowed": True, "state": "offpeak",
-                "timezone": "Asia/Shanghai", "manual_override": "auto",
-                "provider_affected": True, "holiday": False, "holiday_name": "",
-                "peak_periods": "09:00-12:00", "peak_weekdays": "0,1,2,3,4,5,6",
-                "evaluated_at": at or clock,
-            }
+    class FatFish111:
+        config = {"enabled": True, "manual_override": "auto", "timezone": "Asia/Shanghai"}
+        def _cfg(self, key, default=None): return self.config.get(key, default)
+        def _periods(self): return [("09:00", "12:00")]
+        def _weekdays(self): return list(range(7))
+        def _provider_affected(self, provider_id): return provider_id == "runtime-provider"
+        @staticmethod
+        def _is_peak(local, periods, weekdays): return False
 
     class PublicContextFixture:
         def __init__(self):
@@ -215,7 +218,7 @@ async def verify_schedule_bridge_public_contract():
             self.get_all_stars_called += 1
             return [
                 StarMetadata(name="time_awareness", activated=True, star_cls=TimeAwareness()),
-                StarMetadata(name=FAT_FISH_NAME, activated=True, config={}, star_cls=PublicFatFishPolicy()),
+                StarMetadata(name=FAT_FISH_NAME, activated=True, config={}, star_cls=FatFish111()),
             ]
 
         async def get_conversations(self):

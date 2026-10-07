@@ -33,7 +33,7 @@ class Main(Star):
         self._time_awareness = TimeAwarenessAdapter(self.context)
         self._fat_fish_bridge = FatFishBridge(self.context, self._time_awareness)
         self._fat_fish_bridge.install()
-        cfg = self._config.get("schedule_broadcast", self._config.get("life_broadcast", {}))
+        cfg = self._config.get("schedule_broadcast", {})
         if not cfg.get("enable", False):
             return
         data_dir = getattr(self, "data_dir", None)
@@ -51,11 +51,8 @@ class Main(Star):
             self._fat_fish_bridge.uninstall()
 
     def get_wallet_policy(self, *, at=None, provider_id=None) -> dict:
-        if self._schedule_broadcast is None:
-            if self._fat_fish_bridge is not None:
-                return self._fat_fish_bridge.get_wallet_policy(at=at, provider_id=provider_id)
-            return FatFishBridge(self.context, TimeAwarenessAdapter(self.context)).get_wallet_policy(at=at, provider_id=provider_id)
-        return self._schedule_broadcast.fat_fish.get_wallet_policy(at=at, provider_id=provider_id)
+        bridge = self._fat_fish_bridge or FatFishBridge(self.context, TimeAwarenessAdapter(self.context))
+        return bridge.get_wallet_policy(at=at, provider_id=provider_id)
 
     async def get_xiaoman_schedule(self, session: str, *, at=None, allow_generate=False):
         adapter = self._time_awareness or TimeAwarenessAdapter(self.context)
@@ -87,19 +84,11 @@ class Main(Star):
             return
         state = service.status()
         next_item = state["next"]
-        fish = state["fat_fish"]
-        fish_text = ("FatFish found={found} v{version}, policy_mode={mode}, enabled={enabled}, "
-                     "underlying_manual_override={manual}, effective_state={state}, allowed={allowed}, "
-                     "day_kind={day_kind}, day_label={day_label}, provider_affected={affected}").format(
-            found=fish.get("found", False), version=state.get("fat_fish_version", "unknown"),
-            mode=fish.get("policy_mode", "compat"), enabled=fish.get("enabled", False),
-            manual=fish.get("manual_override", "unknown"), state=fish.get("state", "unknown"),
-            allowed=fish.get("allowed", False), day_kind=fish.get("day_kind", "unknown"),
-            day_label=fish.get("day_label", ""), affected=fish.get("provider_affected", False))
         yield event.plain_result(
             "日程广播：enabled={enabled}, dry_run={dry_run}; TimeAwareness found={time_awareness_found}, "
-            "source={schedule_source}, TimeAwareness v{time_awareness_version}, snapshot={snapshot_id}, date={local_date}, slots={slot_count}; "
-            "generated={generated}, sent={sent}, targets={targets}, next={next}, error={last_error}; {fat_fish}".format(**{**state, "next": next_item, "fat_fish": fish_text})
+            "snapshot={snapshot_id}, date={local_date}, slots={slot_count}; Fat Fish found={fat_fish_found}, "
+            "wallet={wallet_state}/{wallet_allowed}, day={day_kind}; next={next}, error={last_error}".format(
+                **{**state, "next": next_item})
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
