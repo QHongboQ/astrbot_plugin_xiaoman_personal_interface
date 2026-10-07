@@ -19,17 +19,26 @@ class Day:
 class Fish:
     def __init__(self, override="auto", enabled=True):
         self.config = {"manual_override": override, "enabled": enabled}
+        self.provider_calls = []
+        self.unknown_provider_affected = True
     def _cfg(self, key, default=None): return self.config.get(key, default)
     def _periods(self): return [("09:00", "18:00")]
     def _weekdays(self): return list(range(7))
-    def _provider_affected(self, provider_id): return True
+    def _provider_affected(self, provider_id, prov):
+        self.provider_calls.append((provider_id, prov))
+        return self.unknown_provider_affected if prov is None else True
     @staticmethod
     def _is_peak(local, periods, weekdays): return local.hour >= 9 and local.hour < 18
 
 class Fixture:
     def __init__(self, kind="holiday", fish=None):
         self.day = Day(kind); self.fish = fish or Fish(); self.stars = []
+        self.providers = {}; self.provider_lookups = []; self.provider_lookup_error = False
     def get_all_stars(self): return self.stars
+    def get_provider_by_id(self, provider_id):
+        self.provider_lookups.append(provider_id)
+        if self.provider_lookup_error: raise RuntimeError("provider lookup unavailable")
+        return self.providers.get(provider_id)
 
 def meta(name, instance, active=True, version="v2.3.0"):
     return types.SimpleNamespace(name=name, star_cls=instance, activated=active, version=version, config={})
@@ -69,6 +78,20 @@ class BridgeTests(unittest.TestCase):
         f,b=self.setup_bridge("unknown"); p=b.get_wallet_policy(at=datetime(2026,10,7,14,55)); self.assertFalse(p["allowed"]); self.assertEqual(f.fish._cfg("manual_override"),"auto")
     def test_only_manual_override_intercepted(self):
         f,b=self.setup_bridge(); self.assertEqual(f.fish._cfg("anything","x"),"x")
+    def test_provider_object_is_resolved_and_passed_to_fatfish(self):
+        f,b=self.setup_bridge("workday"); provider=object(); f.providers["deepseek"]=provider
+        p=b.get_wallet_policy(at=datetime(2026,10,7,12,30),provider_id="deepseek")
+        self.assertEqual(f.provider_lookups,["deepseek"])
+        self.assertEqual(f.fish.provider_calls[-1],("deepseek",provider))
+        self.assertTrue(p["provider_affected"])
+    def test_missing_or_failed_provider_lookup_passes_none_to_fatfish(self):
+        for lookup_error in (False,True):
+            with self.subTest(lookup_error=lookup_error):
+                f,b=self.setup_bridge("workday"); f.provider_lookup_error=lookup_error
+                f.fish.unknown_provider_affected=False
+                p=b.get_wallet_policy(at=datetime(2026,10,7,12,30),provider_id="deepseek")
+                self.assertEqual(f.fish.provider_calls[-1],("deepseek",None))
+                self.assertFalse(p["provider_affected"])
     def test_double_install_and_restore(self):
         f,b=self.setup_bridge(); wrapper=f.fish._cfg; b.install(); self.assertIs(f.fish._cfg,wrapper); b.uninstall(); self.assertEqual(f.fish._cfg("manual_override"),"auto")
     def test_later_patch_not_overwritten(self):

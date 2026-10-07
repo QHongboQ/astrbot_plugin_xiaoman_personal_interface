@@ -198,7 +198,7 @@ async def verify_schedule_bridge_public_contract():
         def _cfg(self, key, default=None): return self.config.get(key, default)
         def _periods(self): return [("09:00", "12:00")]
         def _weekdays(self): return list(range(7))
-        def _provider_affected(self, provider_id): return provider_id == "runtime-provider"
+        def _provider_affected(self, provider_id, prov): return provider_id == "runtime-provider"
         @staticmethod
         def _is_peak(local, periods, weekdays): return False
 
@@ -227,6 +227,10 @@ async def verify_schedule_bridge_public_contract():
         async def get_current_chat_provider_id(self, umo):
             assert umo == "qq:GroupMessage:runtime-broadcast"
             return "runtime-provider"
+
+        def get_provider_by_id(self, provider_id):
+            assert provider_id == "runtime-provider"
+            return object()
 
         async def get_persona(self):
             return {"name": "runtime", "prompt": "runtime dict persona"}

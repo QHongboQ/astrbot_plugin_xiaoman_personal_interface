@@ -74,7 +74,13 @@ class FatFishBridge:
         affected = True
         matcher = getattr(fish, "_provider_affected", None)
         if callable(matcher):
-            affected = bool(matcher(provider_id))
+            prov = None
+            if provider_id:
+                try:
+                    prov = self.context.get_provider_by_id(provider_id)
+                except Exception:
+                    prov = None
+            affected = bool(matcher(provider_id, prov))
 
         if not enabled:
             allowed, state = True, "disabled"
