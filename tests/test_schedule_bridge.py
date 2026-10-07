@@ -22,7 +22,7 @@ class Fish:
         self.provider_calls = []
         self.unknown_provider_affected = True
     def _cfg(self, key, default=None): return self.config.get(key, default)
-    def _periods(self): return [("09:00", "18:00")]
+    def _periods(self): return [types.SimpleNamespace(start=9 * 3600, end=18 * 3600)]
     def _weekdays(self): return list(range(7))
     def _provider_affected(self, provider_id, prov):
         self.provider_calls.append((provider_id, prov))
@@ -135,14 +135,15 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         def collect(*,scope,now): return types.SimpleNamespace(workday=types.SimpleNamespace(kind=self.day_kinds.get(now.date(),"unknown"),available=now.date() in self.day_kinds,value=""),now=now)
         ta=types.SimpleNamespace(daily_schedule_service=ScheduleService(),daily_schedule_admin=Admin(),time_context=types.SimpleNamespace(now=lambda:self.now,facts=types.SimpleNamespace(collect=collect)))
         class NativeFish:
-            def _periods(_s): return [("09:00","12:00"),("14:00","18:00")]
+            def _periods(_s): return [types.SimpleNamespace(start=9*3600,end=12*3600),types.SimpleNamespace(start=14*3600,end=18*3600)]
             def get_wallet_policy(_s, *, at=None, provider_id=None):
                 at=at or self.now
                 return {"enabled":True,"allowed":at.strftime("%H:%M") not in self.denied,"state":"peak" if at.strftime("%H:%M") in self.denied else "offpeak","evaluated_at":at,"timezone":"UTC","manual_override":"auto","provider_affected":True,"day_kind":"holiday","day_label":"holiday"}
         self.fish=NativeFish()
         async def conversations(): return [types.SimpleNamespace(user_id="qq:GroupMessage:g1"),types.SimpleNamespace(user_id="qq:FriendMessage:u1")]
         async def persona(): return {"prompt":"persona unchanged"}
-        async def provider(umo): return "provider"
+        self.provider_lookups=[]
+        async def provider(umo): self.provider_lookups.append(umo); return "provider"
         async def llm(**kwargs):
             import re
             self.calls.append(kwargs)
@@ -154,8 +155,10 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
             persona_manager=types.SimpleNamespace(get_default_persona_v3=persona),
             get_current_chat_provider_id=provider,llm_generate=llm,send_message=send)
         class Policy:
+            def __init__(_self): _self.calls=[]
             def discover(_self): return self.fish
             def get_wallet_policy(_self, *, at=None, provider_id=None):
+                _self.calls.append((at,provider_id))
                 at=at or self.now
                 local=at
                 kind=self.day_kinds.get(local.date(),"unknown")
@@ -263,7 +266,7 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(datetime.fromisoformat(e["trigger_at"]).tzinfo is not None for e in entries))
         start_times=[datetime.fromisoformat(e["trigger_at"]) for e in starts]
         end_times=[datetime.fromisoformat(e["trigger_at"]) for e in ends]
-        self.assertTrue(all((t.hour,t.minute) in {(8,55),(8,56),(8,57),(8,58),(8,59),(9,0),(13,55),(13,56),(13,57),(13,58),(13,59),(14,0)} for t in start_times))
+        self.assertTrue(all((t.hour,t.minute) in {(8,55),(8,56),(8,57),(8,58),(8,59),(13,55),(13,56),(13,57),(13,58),(13,59)} for t in start_times))
         self.assertTrue(all((t.hour,t.minute) in {(12,0),(12,1),(12,2),(12,3),(12,4),(12,5),(18,0),(18,1),(18,2),(18,3),(18,4),(18,5)} for t in end_times))
         normal_names={e["name"] for e in normal}
         self.assertEqual(normal_names,{"早餐","午餐","散步","晚饭"})
@@ -276,6 +279,10 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
                          [(e["kind"],e["trigger_at"]) for e in regenerated])
         self.assertEqual(len(self.reg_calls),2)
         self.assertTrue(all(trigger is False for _,trigger in self.reg_calls))
+        periods=self.fish._periods()
+        self.assertTrue(all(not isinstance(period,(tuple,list)) for period in periods))
+        windows=self.service._peak_windows(target,"Asia/Shanghai","workday","provider")
+        self.assertEqual(len(windows),2)
 
     async def test_holiday_weekend_suppress_no_raw_events_and_adjusted_uses_peaks(self):
         from datetime import timedelta
@@ -296,18 +303,27 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
                 normal=[e for e in plan["entries"] if e["kind"]=="NORMAL"]
                 self.assertEqual({e["name"] for e in normal},{"peak slot","outside"} if not expected_peak_entries else {"outside"})
                 self.assertEqual(len(self.calls),1)
-    async def test_dry_run_and_live_policy_block_prevent_sends(self):
+    async def test_saved_message_sends_without_send_time_fatfish_or_llm_calls(self):
         import astrbot.api.event
         class Chain:
             def message(self,value): return self
         astrbot.api.event.MessageChain=Chain
         self.slots=[{"start":"20:30","name":"x","state":"y"}]
+        self.service.cfg["provider_id"]=""
         await self.service.refresh(now=self.now)
+        self.assertEqual(len(self.calls),1)
+        self.assertEqual(len(self.provider_lookups),1)
         self.service.cfg["dry_run"]=True
+        policy_calls=len(self.policy.calls)
         await self.service.send_due(self.now.replace(hour=20,minute=30)); self.assertFalse(self.sent)
+        self.assertEqual(len(self.policy.calls),policy_calls)
         self.service.cfg["dry_run"]=False
-        self.service.plan_for_date(self.now.date())["entries"][0]["dry_run_logged"]=False
-        self.denied.add("20:30"); await self.service.send_due(self.now.replace(hour=20,minute=30)); self.assertFalse(self.sent)
+        self.denied.add("20:30")
+        await self.service.send_due(self.now.replace(hour=20,minute=30))
+        self.assertEqual(len(self.sent),2)
+        self.assertEqual(len(self.policy.calls),policy_calls)
+        self.assertEqual(len(self.calls),1)
+        self.assertEqual(len(self.provider_lookups),1)
     async def test_missing_timeawareness_prevents_generation(self):
         self.ctx.get_all_stars=lambda:[meta(FF,self.fish)]
         self.slots=[{"start":"20:30","name":"x","state":"y"}]

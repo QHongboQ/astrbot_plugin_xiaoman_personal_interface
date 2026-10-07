@@ -155,7 +155,7 @@ class ScheduleBroadcastService:
     def _stable_jitter(local_date, period, snapshot_id):
         seed = f"{local_date}|{period}|{snapshot_id}".encode("utf-8")
         digest = hashlib.sha256(seed).digest()
-        return digest[0] % 6, digest[1] % 6
+        return 1 + digest[0] % 5, digest[1] % 6
 
     @staticmethod
     def _is_peak_state(policy):
@@ -179,23 +179,23 @@ class ScheduleBroadcastService:
             return []
         windows = []
         for index, period in enumerate(periods or [], 1):
-            if not isinstance(period, (tuple, list)) or len(period) < 2:
+            try:
+                seconds_start = int(period.start)
+                seconds_end = int(period.end)
+            except (AttributeError, TypeError, ValueError):
                 continue
-            start, start_next_day = self._clock(period[0])
-            end, end_next_day = self._clock(period[1])
-            if start is None or end is None:
+            if seconds_start < 0 or seconds_end <= seconds_start:
                 continue
             zone = _zone(timezone)
-            peak_start = datetime.combine(local_date, start, tzinfo=zone)
-            peak_end = datetime.combine(local_date + timedelta(days=int(end_next_day)), end, tzinfo=zone)
-            if not end_next_day and peak_end <= peak_start:
-                peak_end += timedelta(days=1)
+            midnight = datetime.combine(local_date, time.min, tzinfo=zone)
+            peak_start = midnight + timedelta(seconds=seconds_start)
+            peak_end = midnight + timedelta(seconds=seconds_end)
             midpoint = peak_start + (peak_end - peak_start) / 2
             policy = self.fat_fish.get_wallet_policy(at=midpoint, provider_id=provider_id)
             if not self._is_peak_state(policy):
                 continue
             start_jitter, end_jitter = self._stable_jitter(
-                local_date.isoformat(), f"{period[0]}-{period[1]}",
+                local_date.isoformat(), f"{seconds_start}-{seconds_end}",
                 str(getattr(self, "_building_snapshot_id", "")),
             )
             windows.append({
@@ -480,7 +480,6 @@ class ScheduleBroadcastService:
 
     async def send_due(self, now=None):
         targets = await self.targets()
-        provider = await self._provider(targets)
         now = self._now(now)
         if targets:
             from astrbot.api.event import MessageChain
@@ -506,9 +505,6 @@ class ScheduleBroadcastService:
                     continue
                 if not targets:
                     continue
-                live = self.fat_fish.get_wallet_policy(at=now, provider_id=provider)
-                if not live.get("found") or not live.get("allowed"):
-                    continue
                 if self._get("dry_run", False):
                     if not entry.get("dry_run_logged"):
                         logger.info("Schedule broadcast dry-run %s: %s", entry["id"], entry["message"])
@@ -519,9 +515,6 @@ class ScheduleBroadcastService:
                 for umo in targets:
                     if umo in delivered:
                         continue
-                    live = self.fat_fish.get_wallet_policy(at=now, provider_id=provider)
-                    if not live.get("found") or not live.get("allowed"):
-                        break
                     try:
                         await self.context.send_message(umo, MessageChain().message(entry["message"]))
                         delivered.add(umo)
