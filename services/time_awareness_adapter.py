@@ -1,7 +1,7 @@
 """Read-only adapter for active TimeAwareness v2.3.0 runtime APIs."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 TIME_AWARENESS_NAME = "time_awareness"
 
@@ -27,6 +27,73 @@ class TimeAwarenessAdapter:
             except Exception:
                 pass
         return datetime.now().astimezone()
+
+    def get_generation_boundary(self) -> dict:
+        """Read TimeAwareness ai_daily.generation_time without mutating its config."""
+        plugin = self.discover()
+        if plugin is None:
+            return {
+                "available": False,
+                "raw": "",
+                "hour": 0,
+                "minute": 5,
+                "clock": "00:05",
+                "target_day_offset": 0,
+            }
+        try:
+            service = plugin.daily_schedule_service
+            getter = getattr(service, "_daily_config", None)
+            config = getter() if callable(getter) else {}
+            if not isinstance(config, dict):
+                config = {}
+            raw = str(config.get("generation_time", "00:05") or "00:05").strip()
+            parser = getattr(service, "_parse_generation_time", None)
+            if callable(parser):
+                hour, minute, target_day_offset = parser(raw)
+            else:
+                normalized = raw[1:].strip() if raw.startswith("-") else raw
+                parsed = datetime.strptime(normalized, "%H:%M")
+                hour, minute = parsed.hour, parsed.minute
+                target_day_offset = 1 if raw.startswith("-") else 0
+            return {
+                "available": True,
+                "raw": raw,
+                "hour": int(hour),
+                "minute": int(minute),
+                "clock": f"{int(hour):02d}:{int(minute):02d}",
+                "target_day_offset": int(target_day_offset),
+            }
+        except Exception:
+            return {
+                "available": False,
+                "raw": "",
+                "hour": 0,
+                "minute": 5,
+                "clock": "00:05",
+                "target_day_offset": 0,
+            }
+
+    def rolling_day_window(self, at: datetime | None = None) -> dict:
+        """Return Xiaoman's 24h life-day window using TimeAwareness's configured clock."""
+        now = at or self.current_time()
+        if not isinstance(now, datetime):
+            now = self.current_time()
+        if now.tzinfo is None:
+            now = now.astimezone()
+        boundary = self.get_generation_boundary()
+        start = now.replace(
+            hour=int(boundary["hour"]),
+            minute=int(boundary["minute"]),
+            second=0,
+            microsecond=0,
+        )
+        if now < start:
+            start -= timedelta(days=1)
+        return {
+            **boundary,
+            "start": start,
+            "end": start + timedelta(days=1),
+        }
 
     def get_day_policy(self, at: datetime | None = None) -> dict:
         plugin = self.discover()
