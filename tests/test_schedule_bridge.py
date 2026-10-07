@@ -291,6 +291,8 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('"name": "吃晚饭"', prompt)
         self.assertIn("按 outline 的真实时间顺序", prompt)
         self.assertIn("不能假装它们是一项持续数小时的活动", prompt)
+        self.assertIn("1–3件最能解释这段时间为何不在线的实质活动", prompt)
+        self.assertIn("不要把刷手机、发呆、普通吃饭这类短暂过渡", prompt)
 
     def test_peak_outline_skips_nonoverlapping_and_caps_context(self):
         date = self.now.date()
