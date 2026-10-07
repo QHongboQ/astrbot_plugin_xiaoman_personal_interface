@@ -83,10 +83,14 @@ def load_angelheart_sources(angelheart_root: Path | None):
         source = (angelheart_root / "main.py").read_text(encoding="utf-8")
     else:
         base = f"https://raw.githubusercontent.com/kawayiYokami/astrbot_plugin_angel_heart/{ANGELHEART_COMMIT}"
-        with urllib.request.urlopen(f"{base}/metadata.yaml", timeout=20) as response:
-            metadata = response.read().decode("utf-8")
-        with urllib.request.urlopen(f"{base}/main.py", timeout=20) as response:
-            source = response.read().decode("utf-8")
+        try:
+            with urllib.request.urlopen(f"{base}/metadata.yaml", timeout=20) as response:
+                metadata = response.read().decode("utf-8")
+            with urllib.request.urlopen(f"{base}/main.py", timeout=20) as response:
+                source = response.read().decode("utf-8")
+        except urllib.error.URLError:
+            print("AngelHeart pinned-source audit skipped: GitHub network unavailable")
+            return None
 
     assert re.search(r"^version:\s*2\.2\.8\s*$", metadata, re.MULTILINE)
     tree = ast.parse(source)
@@ -151,7 +155,7 @@ def verify_astrbot_plugin_filter_contract():
     assert "plugin.name not in plugins_name" in registry_source
 
 
-async def verify_life_broadcast_public_contract():
+async def verify_schedule_bridge_public_contract():
     """Exercise the adapter against AstrBot 4.28.2 public API types/signatures."""
     assert hasattr(AstrBotContext, "get_all_stars")
     assert "chat_provider_id" in inspect.signature(AstrBotContext.llm_generate).parameters
@@ -164,16 +168,39 @@ async def verify_life_broadcast_public_contract():
     assert isinstance(MessageChain().message("probe"), MessageChain)
 
     from datetime import datetime
-    from tempfile import TemporaryDirectory
-    from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.life_broadcast import LifeBroadcastService
+    from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.fat_fish_bridge import FAT_FISH_NAME
+    from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.schedule_broadcast import ScheduleBroadcastService
 
     clock = datetime.now().replace(second=0, microsecond=0)
     stamp = clock.strftime("%H:%M")
 
-    class LifeScheduler:
-        async def get_life_context(self, *, allow_generate):
-            assert allow_generate is False
-            return f"{stamp}｜地点：学校｜事项：上午课程｜细节：准备上课"
+    class DailyScheduleService:
+        async def register_session_async(self, session, *, trigger=True):
+            assert session == "qq:GroupMessage:runtime-broadcast" and trigger is False
+            return "persona-hash"
+        def get_snapshot_for_session(self, session, *, now):
+            return {"persona_hash":"persona-hash","snapshot_id":"snapshot","local_date":now.date().isoformat(),"timezone":"UTC","generated_at":"now","manually_edited":False}
+    class DailyScheduleAdmin:
+        def get_detail(self, *args, **kwargs):
+            return {"slots":[{"slot_ref":"ref","start":stamp,"end":"23:59","name":"上午课程","state":"准备上课","origin":"ai","source_origin":"ai"}]}
+    class TimeAwareness:
+        daily_schedule_service = DailyScheduleService()
+        daily_schedule_admin = DailyScheduleAdmin()
+        time_context = types.SimpleNamespace(
+            now=lambda: clock,
+            facts=types.SimpleNamespace(collect=lambda **kwargs: types.SimpleNamespace(
+                workday=types.SimpleNamespace(kind="unknown", available=False, value=""),
+                now=kwargs["now"])),
+        )
+
+    class FatFish111:
+        config = {"enabled": True, "manual_override": "auto", "timezone": "Asia/Shanghai"}
+        def _cfg(self, key, default=None): return self.config.get(key, default)
+        def _periods(self): return [("09:00", "12:00")]
+        def _weekdays(self): return list(range(7))
+        def _provider_affected(self, provider_id, prov): return provider_id == "runtime-provider"
+        @staticmethod
+        def _is_peak(local, periods, weekdays): return False
 
     class PublicContextFixture:
         def __init__(self):
@@ -189,7 +216,10 @@ async def verify_life_broadcast_public_contract():
 
         def get_all_stars(self):
             self.get_all_stars_called += 1
-            return [StarMetadata(name="astrbot_plugin_life_scheduler", activated=True, star_cls=LifeScheduler())]
+            return [
+                StarMetadata(name="time_awareness", activated=True, star_cls=TimeAwareness()),
+                StarMetadata(name=FAT_FISH_NAME, activated=True, config={}, star_cls=FatFish111()),
+            ]
 
         async def get_conversations(self):
             return [types.SimpleNamespace(user_id="qq:GroupMessage:runtime-broadcast")]
@@ -197,6 +227,10 @@ async def verify_life_broadcast_public_contract():
         async def get_current_chat_provider_id(self, umo):
             assert umo == "qq:GroupMessage:runtime-broadcast"
             return "runtime-provider"
+
+        def get_provider_by_id(self, provider_id):
+            assert provider_id == "runtime-provider"
+            return object()
 
         async def get_persona(self):
             return {"name": "runtime", "prompt": "runtime dict persona"}
@@ -210,18 +244,17 @@ async def verify_life_broadcast_public_contract():
             self.sent.append((session, message_chain))
 
     runtime_context = PublicContextFixture()
-    config = {"life_broadcast": {"enable": True, "blocked_windows": []}}
-    with TemporaryDirectory() as data_dir:
-        service = LifeBroadcastService(runtime_context, config, data_dir)
-        service.blocked = lambda *_args: False
-        await service.refresh()
-        assert len(runtime_context.llm_calls) == 1
-        assert runtime_context.llm_calls[0][0] == "runtime-provider"
-        assert runtime_context.llm_calls[0][2] is None
-        assert runtime_context.llm_calls[0][3] == "runtime dict persona"
-        await service.send_due(clock)
-        assert len(runtime_context.sent) == 1
-        assert service.state["entries"][0]["sent"] is True
+    config = {"schedule_broadcast": {"enable": True}}
+    service = ScheduleBroadcastService(runtime_context, config, ".")
+    service._save = lambda: None
+    await service.refresh(now=clock)
+    assert len(runtime_context.llm_calls) == 1
+    assert runtime_context.llm_calls[0][0] == "runtime-provider"
+    assert runtime_context.llm_calls[0][2] is None
+    assert runtime_context.llm_calls[0][3] == "runtime dict persona"
+    await service.send_due(clock)
+    assert len(runtime_context.sent) == 1
+    assert service.state["entries"][0]["sent"] is True
 
 
 class Context:
@@ -263,7 +296,7 @@ async def run(official_airi_root: Path | None = None) -> None:
     assert importlib.metadata.version("AstrBot") == "4.28.2"
     verify_astrbot_plugin_filter_contract()
     main = load_main()
-    await verify_life_broadcast_public_contract()
+    await verify_schedule_bridge_public_contract()
     context = Context()
     plugin = main.Main(context)
     assert isinstance(plugin, Star)
@@ -414,4 +447,4 @@ async def run(official_airi_root: Path | None = None) -> None:
 if __name__ == "__main__":
     root = Path(sys.argv[1]).resolve() if len(sys.argv) == 2 else None
     asyncio.run(run(root))
-    print("AstrBot 4.28.2 photo-tool, life-broadcast, admin-bypass, AngelHeart, and Airi smoke passed")
+    print("AstrBot 4.28.2 photo-tool, schedule-bridge, admin-bypass, AngelHeart, and Airi smoke passed")

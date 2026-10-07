@@ -1,23 +1,22 @@
 {
-  "life_broadcast": {
+  "schedule_broadcast": {
     "type": "object",
-    "description": "林小满日程广播（可选）",
-    "hint": "只读取 Life Scheduler 已生成的日程；不会生成或修改日程。默认关闭。",
+    "description": "林小满日程广播（TimeAwareness）",
+    "hint": "仅读取 TimeAwareness 已存在的日程快照，不触发日程生成。默认关闭。",
     "items": {
       "enable": {"type": "bool", "description": "启用日程广播", "default": false},
-      "target_mode": {"type": "string", "description": "目标范围", "default": "all_conversations", "options": ["all_conversations", "allowlist"]},
+      "schedule_source_umo": {"type": "string", "description": "定义日程人格的已存在会话 UMO；留空使用首个目标", "default": ""},
       "send_groups": {"type": "bool", "description": "发送到群聊", "default": true},
       "send_private": {"type": "bool", "description": "发送到私聊", "default": true},
-      "allowlist_umos": {"type": "list", "description": "允许的 UMO", "default": []},
+      "allowlist_umos": {"type": "list", "description": "目标 UMO 允许列表（为空不额外限制）", "default": []},
       "denylist_umos": {"type": "list", "description": "拒绝的 UMO（始终优先）", "default": []},
       "provider_id": {"type": "string", "description": "模型提供商（留空则从首个会话解析）", "_special": "select_provider", "default": ""},
       "event_offset_minutes": {"type": "int", "description": "广播时间偏移（分钟）", "default": 0},
-      "blocked_windows": {"type": "list", "description": "禁止生成和发送的时间窗", "default": ["09:00-12:00", "14:00-18:00"]},
       "poll_seconds": {"type": "int", "description": "日程检查间隔（秒）", "default": 15},
       "grace_seconds": {"type": "int", "description": "发送宽限期（秒）", "default": 60},
       "max_message_chars": {"type": "int", "description": "消息最大字符数", "default": 80},
       "dry_run": {"type": "bool", "description": "仅预览，不发送", "default": false},
-      "broadcast_prompt": {"type": "text", "description": "广播补充指令（不替代默认人格）", "default": "请按每个日程生成一句自然的第一人称 QQ 聊天消息，只输出 JSON。忠于事项，不编造地点或同伴，不提日程、系统、AI，不用表情、Markdown、括号或省略号。"}
+      "broadcast_prompt": {"type": "text", "description": "广播补充指令（不替代默认人格）", "default": "请按每个日程生成一句自然的第一人称聊天消息，只输出 JSON。忠于事项，不编造地点或同伴，不提日程、系统、AI。"}
     }
   }
 }
