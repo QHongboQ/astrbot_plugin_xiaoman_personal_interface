@@ -165,7 +165,7 @@ async def verify_life_broadcast_public_contract():
 
     from datetime import datetime
     from tempfile import TemporaryDirectory
-    from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.life_broadcast import LifeBroadcastService
+    from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.life_broadcast import FAT_FISH_NAME, LifeBroadcastService
 
     clock = datetime.now().replace(second=0, microsecond=0)
     stamp = clock.strftime("%H:%M")
@@ -189,7 +189,14 @@ async def verify_life_broadcast_public_contract():
 
         def get_all_stars(self):
             self.get_all_stars_called += 1
-            return [StarMetadata(name="astrbot_plugin_life_scheduler", activated=True, star_cls=LifeScheduler())]
+            return [
+                StarMetadata(name="astrbot_plugin_life_scheduler", activated=True, star_cls=LifeScheduler()),
+                StarMetadata(name=FAT_FISH_NAME, activated=True, config={
+                    "enabled": True, "timezone": "Asia/Shanghai", "peak_periods": "",
+                    "peak_weekdays": [], "manual_override": "always_allow",
+                    "affected_providers": ["*"], "gate_when_provider_unknown": True,
+                }),
+            ]
 
         async def get_conversations(self):
             return [types.SimpleNamespace(user_id="qq:GroupMessage:runtime-broadcast")]
@@ -210,11 +217,10 @@ async def verify_life_broadcast_public_contract():
             self.sent.append((session, message_chain))
 
     runtime_context = PublicContextFixture()
-    config = {"life_broadcast": {"enable": True, "blocked_windows": []}}
+    config = {"life_broadcast": {"enable": True}}
     with TemporaryDirectory() as data_dir:
         service = LifeBroadcastService(runtime_context, config, data_dir)
-        service.blocked = lambda *_args: False
-        await service.refresh()
+        await service.refresh(now=clock)
         assert len(runtime_context.llm_calls) == 1
         assert runtime_context.llm_calls[0][0] == "runtime-provider"
         assert runtime_context.llm_calls[0][2] is None

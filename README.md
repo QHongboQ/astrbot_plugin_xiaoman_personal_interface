@@ -31,7 +31,7 @@ send_xiaoman_photo()
 
 本版本不包含任何 TTS、语音提示、表演标签或 MiMo 逻辑。
 
-## 可选：Life Scheduler 日程广播（v0.3.0）
+## 可选：Life Scheduler 日程广播（v0.3.1）
 
 此功能默认关闭。启用后，插件只通过 AstrBot 已加载插件元数据查找名称精确为 `astrbot_plugin_life_scheduler`、已激活且实例可用的 Life Scheduler，并调用其公开的 `get_life_context(allow_generate=False)`。它只读取已经生成的日程，不导入或读写 Life Scheduler 的文件，也不触发日程生成。日程文本发生变化（包括重写）时，插件解析有效节点并对整份计划进行一次批量消息生成；发送时不调用 LLM。消息使用 AstrBot 默认人格的 `prompt`，再附加 gear 中可编辑的广播指令。
 
@@ -42,12 +42,13 @@ send_xiaoman_photo()
 - `send_groups` / `send_private`：分别控制群聊与私聊；拒绝列表始终优先。
 - `provider_id`：指定生成提供商；留空时从首个目标会话解析。
 - `event_offset_minutes`：事件触发时间偏移，可用 `-5` 提前五分钟。
-- `blocked_windows`：默认禁止生成和发送的窗口为 `09:00-12:00`、`14:00-18:00`。
 - `poll_seconds`、`grace_seconds`、`max_message_chars`：轮询、过期宽限期与消息长度上限。
 - `dry_run`：解析并生成计划、记录到日志，但绝不广播。
 - `broadcast_prompt`：只填写广播风格补充，不覆盖 Xiaoman 的默认人格。
 
 计划仅保存在本插件数据目录的 `life_broadcast_state.json`，使用原子替换写入。重启后相同日程复用已生成消息；已发送项目不会重复发送，过期项目不补发。广播只投递至 AstrBot 已有会话，不读取 QQ 好友/群列表，也不写入聊天历史。
+
+高峰期策略完全由已启用的 Fat Fish Wallet (`astrbot_plugin_fat_fish_wallet`) 控制。每次轮询读取其 AstrBot 插件元数据 `config`，不读取其私有文件或调用其内部方法。必须安装并启用 Fat Fish Wallet，否则不会生成或发送主动广播。`enabled`、`timezone`、`peak_periods`、`peak_weekdays`、`manual_override`、`affected_providers` 与 `gate_when_provider_unknown` 均以 Fat Fish 当前配置为准；修改后最迟下个轮询周期生效。所有事件按 Fat Fish 时区逐个判断，生成时仅将未来且非高峰的节点放入单次批量 LLM 请求；发送前也会再检查一次当前策略。中国法定节假日使用 `holidays.CN()`，自动模式按非高峰处理。插件状态命令会显示 Fat Fish 启用状态、时区、覆盖模式、时段/星期、今日节假日判定、当前状态及提供商是否受影响。
 
 管理员命令：
 

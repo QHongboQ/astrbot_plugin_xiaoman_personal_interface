@@ -64,10 +64,20 @@ class Main(Star):
             return
         state = service.status()
         next_item = state["next"]
+        fish = state["fat_fish"]
+        fish_text = (
+            "Fat Fish found={found}, enabled={enabled}, timezone={timezone}, manual_override={manual_override}, "
+            "peak_periods={periods}, peak_weekdays={weekdays}, holiday today={holiday_today}, "
+            "current wallet state={wallet_state}, provider affected={provider_affected}"
+        ).format(
+            found=fish.get("found", False), enabled=fish.get("enabled", False), timezone=fish.get("timezone", "Asia/Shanghai"),
+            manual_override=fish.get("manual_override", "auto"), periods=fish.get("periods", []), weekdays=fish.get("weekdays", []),
+            holiday_today=fish.get("holiday_today", False), wallet_state=fish.get("state", "missing"), provider_affected=fish.get("provider_affected", False),
+        )
         yield event.plain_result(
             "日程广播状态：enabled={enabled}, dry_run={dry_run}, Life Scheduler={life_scheduler_found}, "
             "hash={hash}, nodes={node_count}, eligible={eligible_count}, sent={sent_count}, targets={target_count}, "
-            "next={next}, blocked={blocked_windows}".format(**{**state, "next": next_item})
+            "next={next}; {fat_fish}".format(**{**state, "next": next_item, "fat_fish": fish_text})
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)

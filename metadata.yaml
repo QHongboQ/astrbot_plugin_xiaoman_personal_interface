@@ -7,7 +7,7 @@ desc: |
   自然语言路由由正常 LLM 处理；显式图库浏览命令由 Airi Gallery 处理。
   可选广播适配器只读取 Life Scheduler 已生成的日程，不负责生成或修改日程。
   本插件不负责 TTS、人格、记忆、好感度或图片生成。
-version: 0.3.0
+version: 0.3.1
 author: QHongboQ
 repo: https://github.com/QHongboQ/astrbot_plugin_xiaoman_personal_interface
 astrbot_version: ">=4.28.2"

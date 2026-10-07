@@ -12,7 +12,6 @@
       "denylist_umos": {"type": "list", "description": "拒绝的 UMO（始终优先）", "default": []},
       "provider_id": {"type": "string", "description": "模型提供商（留空则从首个会话解析）", "_special": "select_provider", "default": ""},
       "event_offset_minutes": {"type": "int", "description": "广播时间偏移（分钟）", "default": 0},
-      "blocked_windows": {"type": "list", "description": "禁止生成和发送的时间窗", "default": ["09:00-12:00", "14:00-18:00"]},
       "poll_seconds": {"type": "int", "description": "日程检查间隔（秒）", "default": 15},
       "grace_seconds": {"type": "int", "description": "发送宽限期（秒）", "default": 60},
       "max_message_chars": {"type": "int", "description": "消息最大字符数", "default": 80},

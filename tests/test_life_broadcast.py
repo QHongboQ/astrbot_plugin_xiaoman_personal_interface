@@ -8,10 +8,12 @@ import types
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from test_photo_tool import MAIN_MODULE  # installs the lightweight public API stubs/package path
 from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.life_broadcast import (
     LIFE_SCHEDULER_NAME,
+    FAT_FISH_NAME,
     LifeBroadcastService,
     parse_schedule,
 )
@@ -26,7 +28,14 @@ class FakeContext:
     def __init__(self, schedule=f"{ROW}\n{ROW2}", targets=None, outputs=None):
         self.schedule = schedule
         self.targets_list = targets if targets is not None else ["qq:GroupMessage:1", "qq:FriendMessage:2"]
-        self.stars = [types.SimpleNamespace(name=LIFE_SCHEDULER_NAME, activated=True, star_cls=Life(self))]
+        self.fat_fish_config = {
+            "enabled": True, "timezone": "Asia/Shanghai", "peak_periods": "", "peak_weekdays": [],
+            "manual_override": "always_allow", "affected_providers": ["*"], "gate_when_provider_unknown": True,
+        }
+        self.stars = [
+            types.SimpleNamespace(name=LIFE_SCHEDULER_NAME, activated=True, star_cls=Life(self)),
+            types.SimpleNamespace(name=FAT_FISH_NAME, activated=True, config=self.fat_fish_config),
+        ]
         async def get_conversations():
             return [types.SimpleNamespace(user_id=x) for x in self.targets_list]
         self.conversation_manager = types.SimpleNamespace(get_conversations=get_conversations)
@@ -153,23 +162,107 @@ class LifeBroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.ctx.targets_list.clear()
         self.assertEqual(await self.svc.targets(), [])
 
-    def test_blocked_windows(self):
-        from datetime import datetime
-        self.assertTrue(self.svc.blocked(datetime(2025, 1, 1, 10, 0)))
+    def test_fat_fish_discovery_exact_name_active_and_config(self):
+        self.assertIs(self.svc.fat_fish_config(), self.ctx.fat_fish_config)
+        self.ctx.stars[1].name = "astrbot_plugin_fat_fish_wallet_copy"
+        self.assertIsNone(self.svc.fat_fish_config())
+        self.ctx.stars[1].name = FAT_FISH_NAME
+        self.ctx.stars[1].activated = False
+        self.assertIsNone(self.svc.fat_fish_config())
+        self.ctx.stars[1].activated = True
+        self.ctx.stars[1].config = None
+        self.assertIsNone(self.svc.fat_fish_config())
 
-    def test_outside_blocked_windows(self):
-        from datetime import datetime
-        self.assertFalse(self.svc.blocked(datetime(2025, 1, 1, 13, 0)))
+    def test_reads_only_public_metadata_config_without_fat_fish_import(self):
+        self.assertIs(self.svc.fat_fish_config(), self.ctx.fat_fish_config)
+        import inspect
+        source = inspect.getsource(type(self.svc))
+        self.assertNotIn("astrbot_plugin_fat_fish_wallet.scheduler", source)
+        self.assertNotIn("._periods(", source)
+
+    def test_manual_override_modes(self):
+        now = datetime(2025, 1, 6, 10, 0)
+        self.ctx.fat_fish_config.update(peak_periods="09:00-12:00", peak_weekdays=[0], manual_override="always_allow")
+        self.assertTrue(self.svc.fat_fish_policy(now, "provider")["allowed"])
+        self.assertEqual(self.svc.fat_fish_policy(now, "provider")["state"], "forced allow")
+        self.ctx.fat_fish_config["manual_override"] = "always_block"
+        self.assertFalse(self.svc.fat_fish_policy(now, "provider")["allowed"])
+        self.assertEqual(self.svc.fat_fish_policy(now, "provider")["state"], "forced block")
+        self.ctx.fat_fish_config["manual_override"] = "auto"
+        self.assertFalse(self.svc.fat_fish_policy(now, "provider")["allowed"])
+
+    def test_live_fat_fish_config_change_is_read_without_restart(self):
+        now = datetime(2025, 1, 6, 10, 0)
+        self.ctx.fat_fish_config.update(manual_override="auto", peak_periods="09:00-12:00", peak_weekdays=[0])
+        self.assertFalse(self.svc.fat_fish_policy(now, "provider")["allowed"])
+        self.ctx.fat_fish_config["peak_periods"] = "11:00-12:00"
+        self.assertTrue(self.svc.fat_fish_policy(now, "provider")["allowed"])
+
+    def test_peak_interval_start_inclusive_end_exclusive(self):
+        self.ctx.fat_fish_config.update(manual_override="auto", peak_periods="09:00-12:00", peak_weekdays=[])
+        self.assertFalse(self.svc.fat_fish_policy(datetime(2025, 1, 6, 9, 0), "provider")["allowed"])
+        self.assertTrue(self.svc.fat_fish_policy(datetime(2025, 1, 6, 12, 0), "provider")["allowed"])
+
+    def test_weekdays_and_empty_weekdays(self):
+        self.ctx.fat_fish_config.update(manual_override="auto", peak_periods="09:00-12:00", peak_weekdays=[0])
+        self.assertFalse(self.svc.fat_fish_policy(datetime(2025, 1, 6, 10, 0), "provider")["allowed"])
+        self.assertTrue(self.svc.fat_fish_policy(datetime(2025, 1, 7, 10, 0), "provider")["allowed"])
+        self.ctx.fat_fish_config["peak_weekdays"] = []
+        self.assertFalse(self.svc.fat_fish_policy(datetime(2025, 1, 7, 10, 0), "provider")["allowed"])
+
+    def test_timezone_and_provider_awareness(self):
+        self.ctx.fat_fish_config.update(timezone="Asia/Shanghai", manual_override="auto", peak_periods="09:00-12:00", peak_weekdays=[], affected_providers=["deepseek"])
+        policy = self.svc.fat_fish_policy(datetime(2025, 1, 6, 10, 0), "deepseek/deepseek-flash")
+        self.assertFalse(policy["allowed"])
+        self.assertEqual(policy["timezone"], "Asia/Shanghai")
+        self.assertFalse(self.svc.fat_fish_policy(datetime(2025, 1, 6, 10, 0), "openai/gpt")["provider_affected"])
+
+    def test_empty_affected_providers_disables_gate(self):
+        self.ctx.fat_fish_config.update(manual_override="always_block", affected_providers=[])
+        policy = self.svc.fat_fish_policy(datetime(2025, 1, 6, 10, 0), "provider")
+        self.assertFalse(policy["provider_affected"])
+        self.assertTrue(policy["allowed"])
+
+    def test_unknown_provider_gate_setting(self):
+        self.ctx.fat_fish_config.update(manual_override="always_block", affected_providers=["deepseek"], gate_when_provider_unknown=True)
+        self.assertFalse(self.svc.fat_fish_policy(datetime(2025, 1, 6, 10, 0), None)["allowed"])
+        self.ctx.fat_fish_config["gate_when_provider_unknown"] = False
+        self.assertTrue(self.svc.fat_fish_policy(datetime(2025, 1, 6, 10, 0), None)["allowed"])
+
+    def test_holiday_suppresses_normal_weekday_peak(self):
+        class Calendar:
+            def __contains__(self, day):
+                return day == datetime(2025, 1, 29).date()
+        fake_holidays = types.SimpleNamespace(CN=lambda: Calendar())
+        self.ctx.fat_fish_config.update(manual_override="auto", peak_periods="14:00-18:00", peak_weekdays=[2])
+        with patch.dict("sys.modules", {"holidays": fake_holidays}):
+            policy = self.svc.fat_fish_policy(datetime(2025, 1, 29, 14, 55), "provider")
+        self.assertTrue(policy["holiday_today"])
+        self.assertTrue(policy["allowed"])
+        self.assertEqual(policy["state"], "offpeak")
+
+    def test_missing_holidays_dependency_falls_back_to_fat_fish_periods(self):
+        self.ctx.fat_fish_config.update(manual_override="auto", peak_periods="14:00-18:00", peak_weekdays=[])
+        with patch.dict("sys.modules", {"holidays": None}):
+            policy = self.svc.fat_fish_policy(datetime(2025, 1, 6, 14, 55), "provider")
+        self.assertFalse(policy["allowed"])
+        self.assertEqual(policy["state"], "peak")
+
+    async def test_missing_fat_fish_fails_closed_for_generation_and_send(self):
+        self.ctx.stars = self.ctx.stars[:1]
+        await self.refresh()
+        self.assertEqual(self.ctx.llm_calls, [])
+        self.svc.state["entries"] = [{"trigger_time": "00:00", "message": "x", "sent": False}]
+        await self.svc.send_due(datetime(2025, 2, 3, 4, 0))
+        self.assertEqual(self.ctx.sent, [])
 
     async def test_new_hash_generates_one_batch(self):
-        self.svc.blocked = lambda *_: False
         await self.refresh()
         self.assertEqual(len(self.ctx.llm_calls), 1)
         self.assertIn("E2", self.ctx.llm_calls[0]["prompt"])
 
     async def test_past_entries_are_filtered_before_batch_llm(self):
         from datetime import datetime
-        self.svc.cfg["blocked_windows"] = []
         self.ctx.schedule = "\n".join(
             [
                 "07:30｜地点：家｜事项：早餐｜细节：吃饭",
@@ -189,6 +282,7 @@ class LifeBroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([entry["time"] for entry in self.svc.state["entries"]], ["20:30"])
 
     async def test_blocked_node_is_filtered_before_batch_llm(self):
+        self.ctx.fat_fish_config.update(manual_override="auto", peak_periods="09:00-12:00", peak_weekdays=[])
         self.ctx.schedule = "\n".join(
             [
                 "08:30｜地点：家｜事项：早餐｜细节：吃饭",
@@ -197,20 +291,24 @@ class LifeBroadcastTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
         self.ctx.outputs = [json.dumps({"E1": "早餐", "E3": "休息"}, ensure_ascii=False)]
-        await self.refresh()
+        await self.svc.refresh(now=datetime(2025, 1, 6, 3, 40))
         prompt = self.ctx.llm_calls[0]["prompt"]
         self.assertIn("E1 | 08:30", prompt)
         self.assertNotIn("10:00", prompt)
         self.assertIn("E3 | 20:30", prompt)
 
+    async def test_current_peak_prevents_batch_llm_call(self):
+        self.ctx.fat_fish_config.update(manual_override="auto", peak_periods="09:00-12:00", peak_weekdays=[])
+        await self.svc.refresh(now=datetime(2025, 1, 6, 10, 0))
+        self.assertEqual(self.ctx.llm_calls, [])
+        self.assertIn("pending_hash", self.svc.state)
+
     async def test_same_hash_does_not_regenerate(self):
-        self.svc.blocked = lambda *_: False
         await self.refresh()
         await self.refresh()
         self.assertEqual(len(self.ctx.llm_calls), 1)
 
     async def test_changed_schedule_hash_regenerates(self):
-        self.svc.blocked = lambda *_: False
         await self.refresh()
         self.ctx.schedule += "\n18:20｜地点：东门｜事项：散步｜细节：透气"
         self.ctx.outputs.append(json.dumps({"E1": "a", "E2": "b", "E3": "c"}))
@@ -218,14 +316,11 @@ class LifeBroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.ctx.llm_calls), 2)
 
     async def test_blocked_detection_keeps_pending_then_generates(self):
-        state = {"calls": 0}
-        def blocking(*_):
-            state["calls"] += 1
-            return state["calls"] == 1
-        self.svc.blocked = blocking
-        await self.refresh()
+        self.ctx.fat_fish_config.update(manual_override="auto", peak_periods="09:00-12:00", peak_weekdays=[])
+        await self.svc.refresh(now=datetime(2025, 1, 6, 10, 0))
         self.assertEqual(self.ctx.llm_calls, [])
-        await self.refresh()
+        self.ctx.fat_fish_config["manual_override"] = "always_allow"
+        await self.svc.refresh(now=datetime(2025, 1, 6, 10, 0))
         self.assertEqual(len(self.ctx.llm_calls), 1)
 
     async def test_no_target_no_llm_cost(self):
@@ -234,52 +329,44 @@ class LifeBroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.ctx.llm_calls, [])
 
     async def test_provider_resolution_uses_first_target(self):
-        self.svc.blocked = lambda *_: False
         await self.refresh()
         self.assertEqual(self.ctx.provider_calls, ["qq:FriendMessage:2", "qq:FriendMessage:2"][:1])
 
     async def test_configured_provider_skips_dynamic_resolution(self):
         self.svc.cfg["provider_id"] = "fixed"
-        self.svc.blocked = lambda *_: False
         await self.refresh()
         self.assertEqual(self.ctx.provider_calls, [])
         self.assertEqual(self.ctx.llm_calls[0]["chat_provider_id"], "fixed")
 
     async def test_persona_prompt_passed_unchanged(self):
-        self.svc.blocked = lambda *_: False
         await self.refresh()
         self.assertEqual(self.ctx.llm_calls[0]["system_prompt"], "persona-dict-original")
 
     async def test_dict_persona_prompt_reaches_llm_system_prompt(self):
         persona = await self.ctx.persona()
         self.assertIsInstance(persona, dict)
-        self.svc.blocked = lambda *_: False
         await self.refresh()
         self.assertEqual(self.ctx.llm_calls[0]["system_prompt"], persona["prompt"])
 
     async def test_no_provider_fails_without_crash(self):
         self.ctx.get_current_chat_provider_id = lambda *_: asyncio.sleep(0, result=None)
-        self.svc.blocked = lambda *_: False
         await self.refresh()
         self.assertEqual(self.ctx.llm_calls, [])
 
     async def test_newline_and_length_sanitization(self):
         self.ctx.outputs = [json.dumps({"E1": "  我准备\n去学校 " + "很" * 100, "E2": "午饭"}, ensure_ascii=False)]
         self.svc.cfg["max_message_chars"] = 12
-        self.svc.blocked = lambda *_: False
         await self.refresh()
         message = self.svc.state["entries"][0]["message"]
         self.assertEqual(len(message), 12)
         self.assertNotIn("\n", message)
 
     async def test_state_persisted_atomically_and_reloaded(self):
-        self.svc.blocked = lambda *_: False
         await self.refresh()
         reloaded = LifeBroadcastService(self.ctx, {"life_broadcast": {}}, self.tmp.name)
         self.assertEqual(reloaded.state["schedule_hash"], self.svc.state["schedule_hash"])
 
     async def test_reload_same_hash_no_generation(self):
-        self.svc.blocked = lambda *_: False
         await self.refresh()
         again = LifeBroadcastService(self.ctx, {"life_broadcast": {}}, self.tmp.name)
         await again.refresh(now=self.FIXED_NOW)
@@ -287,9 +374,29 @@ class LifeBroadcastTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_sending_does_not_call_llm(self):
         self.svc.state["entries"] = [{"id": "E1", "time": "08:55", "trigger_time": "08:55", "message": "准备上课", "sent": False}]
-        self.svc.blocked = lambda *_: False
         await self.svc.send_due()
         self.assertEqual(self.ctx.llm_calls, [])
+
+    async def test_send_rechecks_live_fat_fish_config(self):
+        import astrbot.api.event
+        class Chain:
+            def message(self, text): return self
+        astrbot.api.event.MessageChain = Chain
+        now = datetime(2025, 1, 6, 8, 0)
+        self.ctx.fat_fish_config.update(manual_override="auto", peak_periods="09:00-12:00", peak_weekdays=[])
+        self.svc.state["entries"] = [{"id": "E1", "trigger_time": "08:00", "message": "检查门控", "sent": False}]
+        await self.svc.send_due(now)
+        self.assertTrue(self.svc.state["entries"][0]["sent"])
+        self.svc.state["entries"][0].update(sent=False, delivered_umos=[])
+        self.ctx.fat_fish_config["manual_override"] = "always_block"
+        await self.svc.send_due(now)
+        self.assertFalse(self.svc.state["entries"][0]["sent"])
+        self.assertEqual(len(self.ctx.sent), 2)
+
+    async def test_schema_has_no_independent_blocked_windows(self):
+        import json
+        schema = json.loads((Path(__file__).resolve().parents[1] / "_conf_schema.json").read_text(encoding="utf-8"))
+        self.assertNotIn("blocked_windows", schema["life_broadcast"]["items"])
 
     async def test_same_generated_message_is_reused_for_each_target(self):
         from datetime import datetime
@@ -299,7 +406,6 @@ class LifeBroadcastTests(unittest.IsolatedAsyncioTestCase):
             def message(self, text): self.content = text; return self
         astrbot.api.event.MessageChain = Chain
         now = datetime.now().replace(second=0, microsecond=0)
-        self.svc.cfg["blocked_windows"] = []
         self.svc.state["entries"] = [{"id": "E1", "trigger_time": now.strftime("%H:%M"), "message": "完全相同", "sent": False}]
         await self.svc.send_due(now)
         self.assertEqual([chain.content for _, chain in self.ctx.sent], ["完全相同", "完全相同"])
@@ -320,7 +426,6 @@ class LifeBroadcastTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("offline")
         self.ctx.send_message = send
         now = datetime.now().replace(second=0, microsecond=0)
-        self.svc.cfg["blocked_windows"] = []
         self.svc.state["entries"] = [{"id": "E1", "trigger_time": now.strftime("%H:%M"), "message": "测试", "sent": False}]
         await self.svc.send_due(now)
         entry = self.svc.state["entries"][0]
@@ -346,7 +451,6 @@ class LifeBroadcastTests(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("offline")
         self.ctx.send_message = fail
         now = datetime.now().replace(second=0, microsecond=0)
-        self.svc.cfg["blocked_windows"] = []
         self.svc.state["entries"] = [{"id": "E1", "trigger_time": now.strftime("%H:%M"), "message": "测试", "sent": False}]
         await self.svc.send_due(now)
         entry = self.svc.state["entries"][0]
@@ -361,7 +465,6 @@ class LifeBroadcastTests(unittest.IsolatedAsyncioTestCase):
         astrbot.api.event.MessageChain = Chain
         now = datetime.now().replace(second=0, microsecond=0)
         self.ctx.targets_list.clear()
-        self.svc.cfg["blocked_windows"] = []
         entry = {"id": "E1", "trigger_time": now.strftime("%H:%M"), "message": "测试", "sent": False}
         self.svc.state["entries"] = [entry]
         await self.svc.send_due(now)
@@ -373,26 +476,22 @@ class LifeBroadcastTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_invalid_json_has_at_most_one_repair(self):
         self.ctx.outputs = ["not json", json.dumps({"E1": "a", "E2": "b"})]
-        self.svc.blocked = lambda *_: False
         await self.refresh()
         self.assertEqual(len(self.ctx.llm_calls), 2)
 
     async def test_invalid_json_failure_does_not_retry_forever(self):
         self.ctx.outputs = ["bad", "still bad"]
-        self.svc.blocked = lambda *_: False
         await self.refresh()
         await self.refresh()
         self.assertEqual(len(self.ctx.llm_calls), 2)
 
     async def test_missing_event_id_skips_only_missing_message(self):
         self.ctx.outputs = [json.dumps({"E1": "有消息"}, ensure_ascii=False)]
-        self.svc.blocked = lambda *_: False
         await self.refresh()
         self.assertEqual(self.svc.state["entries"][0]["message"], "有消息")
         self.assertEqual(self.svc.state["entries"][1]["message"], "")
 
     async def test_schedule_change_replaces_old_plan(self):
-        self.svc.blocked = lambda *_: False
         await self.refresh()
         old_hash = self.svc.state["schedule_hash"]
         self.ctx.schedule = ROW
@@ -403,7 +502,6 @@ class LifeBroadcastTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_expired_due_item_is_marked_not_sent(self):
         from datetime import datetime, timedelta
-        self.svc.cfg["blocked_windows"] = []
         now = datetime.now().replace(second=0, microsecond=0)
         trigger = (now - timedelta(minutes=3)).strftime("%H:%M")
         self.svc.state["entries"] = [{"id": "E1", "trigger_time": trigger, "message": "过期", "sent": False}]
@@ -429,7 +527,7 @@ class LifeBroadcastTests(unittest.IsolatedAsyncioTestCase):
         import astrbot.api
         astrbot.api.logger.info = lambda *_args, **_kwargs: None
         now = datetime.now().replace(second=0, microsecond=0)
-        self.svc.cfg.update(dry_run=True, blocked_windows=[])
+        self.svc.cfg.update(dry_run=True)
         self.svc.state["entries"] = [{"id": "E1", "trigger_time": now.strftime("%H:%M"), "message": "预览", "sent": False}]
         await self.svc.send_due(now)
         self.assertEqual(self.ctx.sent, [])
