@@ -35,11 +35,12 @@ class Main(Star):
     async def initialize(self) -> None:
         """Start optional schedule broadcast after AstrBot initializes the plugin."""
         self._time_awareness = TimeAwarenessAdapter(self.context)
+        cfg = self._config.get("schedule_broadcast", {})
         self._rolling_day_bridge = RollingDayBridge(self.context, self._time_awareness)
-        self._rolling_day_bridge.install()
+        if cfg.get("rolling_day_bridge_enabled", True):
+            self._rolling_day_bridge.install()
         self._fat_fish_bridge = FatFishBridge(self.context, self._time_awareness)
         self._fat_fish_bridge.install()
-        cfg = self._config.get("schedule_broadcast", {})
         if not cfg.get("enable", False):
             return
         data_dir = getattr(self, "data_dir", None)
@@ -47,7 +48,8 @@ class Main(Star):
             data_dir = StarTools.get_data_dir("astrbot_plugin_xiaoman_personal_interface")
         self._schedule_broadcast = ScheduleBroadcastService(
             self.context, self._config, data_dir,
-            time_awareness=self._time_awareness, fat_fish=self._fat_fish_bridge)
+            time_awareness=self._time_awareness, fat_fish=self._fat_fish_bridge,
+            rolling_day_bridge=self._rolling_day_bridge)
         self._schedule_broadcast.start()
 
     async def terminate(self) -> None:
