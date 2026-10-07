@@ -36,11 +36,12 @@ class Main(Star):
         """Start optional schedule broadcast after AstrBot initializes the plugin."""
         self._time_awareness = TimeAwarenessAdapter(self.context)
         cfg = self._config.get("schedule_broadcast", {})
-        self._rolling_day_bridge = RollingDayBridge(self.context, self._time_awareness)
-        if cfg.get("rolling_day_bridge_enabled", True):
-            self._rolling_day_bridge.install()
         self._fat_fish_bridge = FatFishBridge(self.context, self._time_awareness)
         self._fat_fish_bridge.install()
+        self._rolling_day_bridge = RollingDayBridge(
+            self.context, self._time_awareness, self._fat_fish_bridge)
+        if cfg.get("rolling_day_bridge_enabled", True):
+            self._rolling_day_bridge.install()
         if not cfg.get("enable", False):
             return
         data_dir = getattr(self, "data_dir", None)
@@ -91,11 +92,13 @@ class Main(Star):
                 if self._rolling_day_bridge is not None
                 else {"installed": False, "clock": "unknown", "raw": ""}
             )
+            peak_windows = ",".join(f"{start}-{end}" for start, end in rolling.get("peak_windows", [])) or "none"
             yield event.plain_result(
                 "日程广播：enabled={enabled}, dry_run={dry_run}; TimeAwareness={time_awareness_found}, "
                 "Fat Fish={fat_fish_found}, day={day_kind}; "
                 f"life_day={rolling.get('clock','unknown')}→+24h "
                 f"(source={rolling.get('raw','') or 'unavailable'}, bridge={rolling.get('installed',False)}); "
+                f"peak_windows={peak_windows}, peak_prompt_bridge={rolling.get('installed', False)}; "
                 "today snapshot={today_id}/{today_count}, plan={today_plan}; "
                 "tomorrow snapshot={tomorrow_id}/{tomorrow_count}, plan={tomorrow_plan}; "
                 "next={next}, error={last_error}".format(
@@ -108,6 +111,28 @@ class Main(Star):
                     tomorrow_plan=state["tomorrow_plan_status"],
                 )
             )
+            return
+        if action == "regenerate":
+            if self._rolling_day_bridge is not None:
+                self._rolling_day_bridge.ensure_installed()
+            if argument not in {"today", "tomorrow", "cycle"}:
+                yield event.plain_result("用法：/xiaoman_broadcast regenerate today|tomorrow|cycle")
+                return
+            if argument == "today":
+                dates = [now.date()]
+            elif argument == "tomorrow":
+                dates = [now.date() + timedelta(days=1)]
+            else:
+                dates = self._time_awareness.rolling_day_dates(now)
+            results = [await self._time_awareness.regenerate_date(
+                event.unified_msg_origin, target_date) for target_date in dates]
+            rows = []
+            for result in results:
+                if result["status"] == "regenerated":
+                    rows.append(f"{result['date']}: regenerated old={result.get('old_id') or 'none'} new={result['new_id']} slots={result.get('slot_count', 0)}")
+                else:
+                    rows.append(f"{result['date']}: {result['status']} ({result.get('reason', '')})")
+            yield event.plain_result("\n".join(rows))
             return
         if action == "refresh":
             changed = await service.refresh(force=True)
@@ -150,7 +175,7 @@ class Main(Star):
             )
             return
         if argument not in {"today", "tomorrow"} and action != "test":
-            yield event.plain_result("用法：/xiaoman_broadcast simulate HH:MM；或 raw cycle；或 raw|plan|build|reset today|tomorrow")
+            yield event.plain_result("用法：/xiaoman_broadcast regenerate today|tomorrow|cycle；simulate HH:MM；raw cycle；或 raw|plan|build|reset today|tomorrow")
             return
         if action == "raw":
             snapshot = await service.raw_schedule(command_date)
@@ -188,7 +213,7 @@ class Main(Star):
             success, result = await service.test_entry(argument, event.unified_msg_origin)
             yield event.plain_result(result)
             return
-        yield event.plain_result("支持：status、raw、plan、build、reset、test、simulate")
+        yield event.plain_result("支持：status、raw、plan、build、reset、test、simulate、regenerate")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("xiaoman_test")

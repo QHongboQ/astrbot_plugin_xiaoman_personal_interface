@@ -13,9 +13,10 @@ from .time_awareness_adapter import TimeAwarenessAdapter
 class RollingDayBridge:
     """Treat TimeAwareness generation_time clock as Xiaoman's life-day boundary."""
 
-    def __init__(self, context, adapter: TimeAwarenessAdapter | None = None):
+    def __init__(self, context, adapter: TimeAwarenessAdapter | None = None, fat_fish=None):
         self.context = context
         self.adapter = adapter or TimeAwarenessAdapter(context)
+        self.fat_fish = fat_fish
         self._generation = None
         self._original_plan_prompt = None
         self._original_boundary_prompt = None
@@ -44,6 +45,44 @@ class RollingDayBridge:
             "\n</XIAOMAN_ROLLING_DAY>"
         )
 
+    def peak_windows(self) -> list[tuple[str, str]]:
+        """Read current Fat Fish periods without caching or changing its config."""
+        fish = self.fat_fish.discover() if self.fat_fish is not None else None
+        if fish is None:
+            return []
+        try:
+            periods = fish._periods()
+        except Exception:
+            return []
+        result = []
+        for period in periods or []:
+            try:
+                start, end = int(period.start), int(period.end)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if start < 0 or end <= start:
+                continue
+            result.append((f"{start // 3600:02d}:{(start % 3600) // 60:02d}",
+                           f"{end // 3600:02d}:{(end % 3600) // 60:02d}"))
+        return result
+
+    def _peak_instruction(self, now) -> str:
+        if now is None or self.adapter.get_day_policy(now).get("kind") not in {"workday", "adjusted"}:
+            return ""
+        windows = self.peak_windows()
+        if not windows:
+            return ""
+        ranges = "、".join(f"{start}-{end}" for start, end in windows)
+        return (
+            "\n\n<XIAOMAN_FAT_FISH_PEAK_BLOCKS>\n"
+            f"Fat Fish 当前工作日高峰窗口：{ranges}。本次目标日为工作日或调休工作日；"
+            "规划时每个窗口优先由一个连贯的主要活动时段覆盖，可自然略早开始或略晚结束。"
+            "咖啡、饮料、短暂吃东西/休息、聊天、刷手机、逛小店、拍照、如厕等同一情境内的小事"
+            "写进该时段 state，不拆成独立活动。只有上课转跨城、学校转医院等重大情境变化才拆分。"
+            "不得为了填满窗口编造工作或学习；可使用有日程依据的课程、创作、外出、办事、社交、休息等。"
+            "周末和节假日不追加此约束。\n</XIAOMAN_FAT_FISH_PEAK_BLOCKS>"
+        )
+
     def install(self) -> bool:
         plugin = self.adapter.discover()
         service = getattr(plugin, "daily_schedule_service", None) if plugin else None
@@ -69,7 +108,7 @@ class RollingDayBridge:
 
         def plan_wrapper(*args, **kwargs):
             base = original_plan(*args, **kwargs)
-            return str(base) + bridge._instruction()
+            return str(base) + bridge._instruction() + bridge._peak_instruction(kwargs.get("now"))
 
         self._original_plan_prompt = original_plan
         self._plan_wrapper = plan_wrapper
@@ -79,7 +118,7 @@ class RollingDayBridge:
         if callable(original_boundary):
             def boundary_wrapper(*args, **kwargs):
                 base = original_boundary(*args, **kwargs)
-                return str(base) + bridge._instruction()
+                return str(base) + bridge._instruction() + bridge._peak_instruction(kwargs.get("now"))
 
             self._original_boundary_prompt = original_boundary
             self._boundary_wrapper = boundary_wrapper
@@ -108,6 +147,7 @@ class RollingDayBridge:
                 and self._plan_wrapper is not None
                 and getattr(self._generation, "_build_prompt", None) is self._plan_wrapper
             ),
+            "peak_windows": self.peak_windows(),
         }
 
     def uninstall(self) -> None:

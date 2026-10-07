@@ -100,6 +100,33 @@ class RollingDayBridgeTests(unittest.TestCase):
         self.assertFalse(bridge.install())
         self.assertFalse(bridge.status()["available"])
 
+    def test_dynamic_peak_prompt_only_for_workdays(self):
+        for kind, expected in (("workday", True), ("adjusted", True), ("weekend", False), ("holiday", False)):
+            with self.subTest(kind=kind):
+                ctx, plugin, _ = self._fixture()
+                ctx.day = Day(kind)
+                plugin.time_context = types.SimpleNamespace(
+                    now=lambda: datetime(2026,10,7,8),
+                    facts=types.SimpleNamespace(collect=lambda **kw: types.SimpleNamespace(
+                        workday=types.SimpleNamespace(kind=ctx.day.kind, available=True, value=ctx.day.kind),
+                        now=kw["now"])))
+                fish = Fish()
+                fish._periods = lambda: [types.SimpleNamespace(start=9*3600, end=12*3600),
+                                         types.SimpleNamespace(start=14*3600, end=18*3600+1800)]
+                ctx.stars.append(meta(FF, fish))
+                fat_bridge = FatFishBridge(ctx, ctx.day)
+                bridge = RollingDayBridge(ctx, TimeAwarenessAdapter(ctx), fat_bridge)
+                self.assertTrue(bridge.install())
+                prompt = plugin.daily_schedule_service.generation._build_prompt(
+                    now=datetime(2026,10,7,8), persona_prompt="", sensors={}, policy=None, enhanced=None, anti_repeat=None)
+                self.assertEqual("<XIAOMAN_FAT_FISH_PEAK_BLOCKS>" in prompt, expected)
+                if expected:
+                    self.assertIn("09:00-12:00、14:00-18:30", prompt)
+                    fish._periods = lambda: [types.SimpleNamespace(start=10*3600, end=13*3600)]
+                    self.assertIn("10:00-13:00", plugin.daily_schedule_service.generation._build_prompt(
+                        now=datetime(2026,10,7,8)))
+                bridge.uninstall()
+
 class BridgeTests(unittest.TestCase):
     def setup_bridge(self, kind="holiday", override="auto", enabled=True):
         f=Fixture(kind, Fish(override, enabled));
@@ -183,6 +210,67 @@ class AdapterScheduleTests(unittest.IsolatedAsyncioTestCase):
         window=adapter.rolling_day_window(datetime(2026,10,8,6,0,tzinfo=at.tzinfo))
         self.assertEqual(window["clock"],"03:30")
         self.assertEqual(window["start"].isoformat(),"2026-10-08T03:30:00+08:00")
+
+    def test_cycle_dates_follow_rolling_window(self):
+        from datetime import timezone, timedelta
+        adapter=TimeAwarenessAdapter(self.ctx)
+        at=datetime(2026,10,8,6,0,tzinfo=timezone(timedelta(hours=8)))
+        self.assertEqual([str(day) for day in adapter.rolling_day_dates(at)], ["2026-10-08","2026-10-09"])
+        plugin=self.ctx.stars[0].star_cls
+        plugin.daily_schedule_service._daily_config=lambda:{"generation_time":"-03:30"}
+        self.assertEqual([str(day) for day in adapter.rolling_day_dates(at)], ["2026-10-08","2026-10-09"])
+
+    async def test_regeneration_targets_tomorrow_waits_for_new_snapshot(self):
+        from datetime import date
+        plugin=self.ctx.stars[0].star_cls
+        svc=plugin.daily_schedule_service
+        svc.get_snapshot_for_session=lambda session,*,now:{"snapshot_id":"old","status":"ready"}
+        svc.get_failure_for_session=lambda session,*,now:None
+        queued=[]
+        def queue(session,*,force,target_date):
+            queued.append((session,force,target_date))
+            async def publish():
+                await __import__("asyncio").sleep(0.01)
+                svc.get_snapshot_for_session=lambda session,*,now:{"snapshot_id":"new","status":"ready","slots":[{}]}
+            __import__("asyncio").create_task(publish())
+            return True
+        svc.queue_generation=queue
+        result=await TimeAwarenessAdapter(self.ctx).regenerate_date("umo",date(2026,10,8),timeout=1)
+        self.assertEqual(queued,[ ("umo",True,date(2026,10,8)) ])
+        self.assertEqual((result["status"],result["old_id"],result["new_id"]),("regenerated","old","new"))
+
+    async def test_regeneration_timeout_and_queue_failure_are_honest(self):
+        from datetime import date
+        plugin=self.ctx.stars[0].star_cls
+        svc=plugin.daily_schedule_service
+        svc.register_session_async=lambda session,*,trigger=False: __import__("asyncio").sleep(0,result="ph")
+        svc.get_snapshot_for_session=lambda session,*,now:{"snapshot_id":"old","status":"ready"}
+        svc.get_failure_for_session=lambda session,*,now:None
+        svc.queue_generation=lambda *args,**kwargs:True
+        adapter=TimeAwarenessAdapter(self.ctx)
+        timeout=await adapter.regenerate_date("umo",date(2026,10,8),timeout=0.01)
+        self.assertEqual(timeout["status"],"timeout")
+        svc.queue_generation=lambda *args,**kwargs:False
+        rejected=await adapter.regenerate_date("umo",date(2026,10,8),timeout=1)
+        self.assertEqual(rejected["status"],"failed")
+
+    async def test_regeneration_reports_new_terminal_failure(self):
+        from datetime import date
+        plugin=self.ctx.stars[0].star_cls
+        svc=plugin.daily_schedule_service
+        svc.register_session_async=lambda session,*,trigger=False: __import__("asyncio").sleep(0,result="ph")
+        svc.get_snapshot_for_session=lambda session,*,now:{"snapshot_id":"old","status":"ready"}
+        failures=[None]
+        svc.get_failure_for_session=lambda session,*,now:failures[0]
+        def queue(*args,**kwargs):
+            async def fail():
+                await __import__("asyncio").sleep(0.01)
+                failures[0]={"failed_at":"later","error_type":"llm_error"}
+            __import__("asyncio").create_task(fail())
+            return True
+        svc.queue_generation=queue
+        result=await TimeAwarenessAdapter(self.ctx).regenerate_date("umo",date(2026,10,8),timeout=1)
+        self.assertEqual((result["status"],result["reason"]),("failed","llm_error"))
 
     async def test_explicit_generate_request_denied(self): self.assertIsNone(await TimeAwarenessAdapter(self.ctx).get_daily_schedule("umo",allow_generate=True))
     async def test_missing_snapshot_returns_unavailable_without_generation(self):
