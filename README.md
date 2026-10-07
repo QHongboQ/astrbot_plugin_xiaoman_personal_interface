@@ -31,7 +31,7 @@ send_xiaoman_photo()
 
 本版本不包含任何 TTS、语音提示、表演标签或 MiMo 逻辑。
 
-## 可选：TimeAwareness 日程广播（v0.4.0）
+## 可选：TimeAwareness 日程广播（v0.5.0）
 
 默认关闭。启用前请安装并启用官方 `time_awareness`。Xiaoman 仅经该插件的运行时服务注册指定会话 Persona（`trigger=False`）、读取已经存在的日程快照，并由 TimeAwareness 自己的详情 API 提供合并后的有效时间线；不读取其文件/数据库，不手动合并 AI、用户、静态与已执行层，也不会触发 TimeAwareness 日程生成。没有可用快照时不广播。
 
