@@ -140,7 +140,8 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
                 at=at or self.now
                 return {"enabled":True,"allowed":at.strftime("%H:%M") not in self.denied,"state":"peak" if at.strftime("%H:%M") in self.denied else "offpeak","evaluated_at":at,"timezone":"UTC","manual_override":"auto","provider_affected":True,"day_kind":"holiday","day_label":"holiday"}
         self.fish=NativeFish()
-        async def conversations(): return [types.SimpleNamespace(user_id="qq:GroupMessage:g1"),types.SimpleNamespace(user_id="qq:FriendMessage:u1")]
+        self.conversation_rows=[types.SimpleNamespace(user_id="qq:GroupMessage:g1"),types.SimpleNamespace(user_id="qq:FriendMessage:u1")]
+        async def conversations(): return self.conversation_rows
         async def persona(): return {"prompt":"persona unchanged"}
         self.provider_lookups=[]
         async def provider(umo): self.provider_lookups.append(umo); return "provider"
@@ -150,10 +151,12 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
             ids=re.findall(r'"id":\s*"([^"]+)"',kwargs["prompt"])
             return types.SimpleNamespace(completion_text=json.dumps({key:f"message-{key}" for key in ids}))
         async def send(umo,chain): self.sent.append((umo,chain))
+        self.platforms={}
         self.ctx=types.SimpleNamespace(get_all_stars=lambda:[meta(TA,ta),meta(FF,self.fish)],
             conversation_manager=types.SimpleNamespace(get_conversations=conversations),
             persona_manager=types.SimpleNamespace(get_default_persona_v3=persona),
-            get_current_chat_provider_id=provider,llm_generate=llm,send_message=send)
+            get_current_chat_provider_id=provider,llm_generate=llm,send_message=send,
+            get_platform_inst=lambda platform_id:self.platforms.get(platform_id))
         class Policy:
             def __init__(_self): _self.calls=[]
             def discover(_self): return self.fish
@@ -181,6 +184,108 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.service.cfg["dry_run"]=False
         self.assertTrue(await self.service.refresh(now=self.now),self.service.last_error)
         return copy.deepcopy(self.service.plan_for_date(self.now.date()))
+
+    def _aiocqhttp(self, *instance_ids):
+        for instance_id in instance_ids:
+            self.platforms[instance_id]=types.SimpleNamespace(meta=lambda:types.SimpleNamespace(name="aiocqhttp"))
+
+    async def test_physical_qq_group_aliases_deduplicate_and_distinct_groups_remain(self):
+        self._aiocqhttp("bot-a")
+        self.conversation_rows=[
+            types.SimpleNamespace(user_id="default:GroupMessage:1153387215",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="default:GroupMessage:979675497_1153387215",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="default:GroupMessage:123456789_1153387215",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="default:GroupMessage:1153387216",platform_id="bot-a"),
+        ]
+        targets=await self.service.targets()
+        self.assertEqual(targets,["default:GroupMessage:1153387215","default:GroupMessage:1153387216"])
+
+    async def test_group_private_flags_and_alias_deny_allow(self):
+        self._aiocqhttp("bot-a")
+        self.conversation_rows=[
+            types.SimpleNamespace(user_id="default:GroupMessage:1153387215",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="default:GroupMessage:979675497_1153387215",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="default:FriendMessage:1153387215",platform_id="bot-a"),
+        ]
+        self.service.cfg.update(send_groups=False,send_private=True)
+        self.assertEqual(await self.service.targets(),["default:FriendMessage:1153387215"])
+        self.service.cfg.update(send_groups=True,send_private=False,
+                                allowlist_umos=["default:GroupMessage:979675497_1153387215"],
+                                denylist_umos=["default:GroupMessage:1153387215"])
+        self.assertEqual(await self.service.targets(),[])
+        self.service.cfg["denylist_umos"]=[]
+        self.assertEqual(await self.service.targets(),["default:GroupMessage:1153387215"])
+
+    async def test_other_platforms_and_bot_instances_are_not_merged(self):
+        self._aiocqhttp("bot-a","bot-b")
+        self.conversation_rows=[
+            types.SimpleNamespace(user_id="default:GroupMessage:1153387215",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="default:GroupMessage:979675497_1153387215",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="default:GroupMessage:1153387215",platform_id="bot-b"),
+            types.SimpleNamespace(user_id="other:GroupMessage:1153387215",platform_id="other-bot"),
+        ]
+        self.assertEqual(len(await self.service.targets()),3)
+
+    async def test_invalid_umo_is_not_canonicalized(self):
+        self._aiocqhttp("bot-a")
+        self.conversation_rows=[
+            types.SimpleNamespace(user_id="default:GroupMessage:bad_1153387215_extra",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="default:GroupMessage:1153387215",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="default:GroupMessage:",platform_id="bot-a"),
+        ]
+        self.assertEqual(await self.service.targets(),["default:GroupMessage:1153387215","default:GroupMessage:bad_1153387215_extra"])
+
+    async def test_simulated_event_sends_once_to_one_physical_qq_group(self):
+        import astrbot.api.event
+        class Chain:
+            def message(self,value): return self
+        astrbot.api.event.MessageChain=Chain
+        self._aiocqhttp("bot-a")
+        self.conversation_rows=[
+            types.SimpleNamespace(user_id="default:GroupMessage:1153387215",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="default:GroupMessage:979675497_1153387215",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="default:GroupMessage:123456789_1153387215",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="default:GroupMessage:1153387216",platform_id="bot-a"),
+            types.SimpleNamespace(user_id="default:GroupMessage:987654321_1153387216",platform_id="bot-a"),
+        ]
+        original=await self._prepare_simulation([{"start":"10:00","end":"10:05","name":"event","state":"x"}])
+        result,error=await self.service.simulate_time("10:00")
+        self.assertFalse(error)
+        self.assertEqual((result["target_count"],result["success_count"],result["failure_count"]),(2,2,0))
+        self.assertEqual([umo for umo,_ in self.sent],["default:GroupMessage:1153387215","default:GroupMessage:1153387216"])
+        self.assertEqual(self.service.plan_for_date(self.now.date()),original)
+
+    async def test_legacy_delivered_alias_suppresses_physical_group_resend(self):
+        self._aiocqhttp("bot-a")
+        self.conversation_rows=[
+            types.SimpleNamespace(user_id="default:GroupMessage:1153387215",platform_id="bot-a"),
+        ]
+        self.slots=[{"start":"20:30","name":"x","state":"y"}]
+        await self.service.refresh(now=self.now)
+        entry=self.service.plan_for_date(self.now.date())["entries"][0]
+        entry["delivered_umos"]=["default:GroupMessage:979675497_1153387215"]
+        result=await self.service.send_due(self.now.replace(hour=20,minute=30))
+        self.assertEqual(result["success_count"],0)
+        self.assertTrue(entry["sent"])
+        self.assertEqual(self.sent,[])
+
+    async def test_send_message_false_is_reported_and_retried(self):
+        import astrbot.api.event
+        class Chain:
+            def message(self,value): return self
+        astrbot.api.event.MessageChain=Chain
+        self.slots=[{"start":"20:30","name":"x","state":"y"}]
+        await self.service.refresh(now=self.now)
+        calls=[]
+        async def false_send(umo,chain): calls.append(umo); return False
+        self.ctx.send_message=false_send
+        now=self.now.replace(hour=20,minute=30)
+        result=await self.service.send_due(now)
+        entry=self.service.plan_for_date(self.now.date())["entries"][0]
+        self.assertFalse(entry["sent"])
+        self.assertEqual(result["failure_count"],2)
+        self.assertTrue(all(item["reason"]=="send_message returned False" for item in result["failures"]))
+        self.assertEqual(entry["delivered_umos"],[])
 
     async def test_simulate_due_event_sends_only_due_and_preserves_formal_plan(self):
         import astrbot.api.event

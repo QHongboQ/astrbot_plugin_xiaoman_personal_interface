@@ -5,6 +5,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import re
 from datetime import date, datetime, time, timedelta, timezone as datetime_timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -94,16 +95,116 @@ class ScheduleBroadcastService:
             return []
         allow = set(self._get("allowlist_umos", []))
         deny = set(self._get("denylist_umos", []))
-        result = set()
+        candidates = []
         for row in rows:
             umo = getattr(row, "user_id", None)
-            if not isinstance(umo, str) or umo in deny or (allow and umo not in allow):
+            parsed = self._parse_umo(umo)
+            if parsed is None:
                 continue
-            if ":GroupMessage:" in umo and self._get("send_groups", True):
-                result.add(umo)
-            elif ":FriendMessage:" in umo and self._get("send_private", True):
-                result.add(umo)
-        return sorted(result)
+            platform_name, message_type, session_id = parsed
+            if message_type == "GroupMessage" and not self._get("send_groups", True):
+                continue
+            if message_type == "FriendMessage" and not self._get("send_private", True):
+                continue
+            platform_id = str(getattr(row, "platform_id", "") or platform_name)
+            is_qq_group = message_type == "GroupMessage" and self._is_aiocqhttp(platform_id)
+            group_id = self._qq_group_id(session_id) if is_qq_group else None
+            identity = ("qq-group", platform_id, group_id) if group_id else ("umo", umo)
+            candidates.append({"umo": umo, "identity": identity, "group_id": group_id,
+                               "platform_name": platform_name})
+
+        # Resolve list entries against all aliases before deduplication. A deny on
+        # any alias suppresses the physical QQ group, even if another alias is allowed.
+        def configured_matches(candidate, values):
+            if candidate["umo"] in values:
+                return True
+            if candidate["group_id"] is None:
+                return False
+            return any(
+                self._configured_group_id(value, candidate["platform_name"]) == candidate["group_id"]
+                for value in values
+            )
+
+        grouped = {}
+        qq_instances = {}
+        for candidate in candidates:
+            grouped.setdefault(candidate["identity"], []).append(candidate)
+            if candidate["group_id"] is not None:
+                signature = (candidate["platform_name"], candidate["group_id"])
+                qq_instances.setdefault(signature, set()).add(candidate["identity"][1])
+        selected = []
+        self._target_delivery = {}
+        for identity, aliases in grouped.items():
+            if any(configured_matches(alias, deny) for alias in aliases):
+                continue
+            if allow and not any(configured_matches(alias, allow) for alias in aliases):
+                continue
+            target = min(aliases, key=lambda item: item["umo"])
+            signature = (target["platform_name"], target["group_id"])
+            selected.append((target["umo"], identity, {
+                "key": self._delivery_key(identity),
+                "aliases": {alias["umo"] for alias in aliases},
+                "legacy_group_signature": signature if target["group_id"] is not None else None,
+                "legacy_group_unambiguous": target["group_id"] is not None and len(qq_instances[signature]) == 1,
+            }))
+        selected.sort(key=lambda item: (item[0], item[1]))
+        targets = []
+        for umo, _identity, state in selected:
+            targets.append(umo)
+            self._target_delivery.setdefault(umo, []).append(state)
+        return targets
+
+    @staticmethod
+    def _parse_umo(umo):
+        if not isinstance(umo, str):
+            return None
+        parts = umo.split(":", 2)
+        if len(parts) != 3 or not all(parts) or parts[1] not in {"GroupMessage", "FriendMessage"}:
+            return None
+        return parts[0], parts[1], parts[2]
+
+    def _is_aiocqhttp(self, platform_id):
+        getter = getattr(self.context, "get_platform_inst", None)
+        if not callable(getter):
+            return False
+        try:
+            platform = getter(platform_id)
+            meta = platform.meta() if platform else None
+            return getattr(meta, "name", None) == "aiocqhttp"
+        except Exception:
+            return False
+
+    @staticmethod
+    def _qq_group_id(session_id):
+        # AstrBot's aiocqhttp adapter uses sender_group for unique sessions and
+        # sends to the final underscore-delimited component.
+        group_id = str(session_id).rsplit("_", 1)[-1]
+        return group_id if re.fullmatch(r"\d+", group_id) else None
+
+    @classmethod
+    def _configured_group_id(cls, umo, platform_name):
+        parsed = cls._parse_umo(umo)
+        if not parsed or parsed[0] != platform_name or parsed[1] != "GroupMessage":
+            return None
+        return cls._qq_group_id(parsed[2])
+
+    @staticmethod
+    def _delivery_key(identity):
+        if identity[0] == "qq-group":
+            return f"physical-qq-group:{identity[1]}:{identity[2]}"
+        return identity[1]
+
+    @classmethod
+    def _was_delivered(cls, delivered, umo, target_state):
+        if target_state.get("key", umo) in delivered or umo in delivered:
+            return True
+        if delivered.intersection(target_state.get("aliases", set())):
+            return True
+        signature = target_state.get("legacy_group_signature")
+        if not signature or not target_state.get("legacy_group_unambiguous"):
+            return False
+        platform_name, group_id = signature
+        return any(cls._configured_group_id(old_umo, platform_name) == group_id for old_umo in delivered)
 
     async def read_schedule(self, targets, *, at=None):
         configured = str(self._get("schedule_source_umo", "") or "").strip()
@@ -553,13 +654,26 @@ class ScheduleBroadcastService:
                             self._save()
                     continue
                 delivered = set(entry.get("delivered_umos", []))
+                target_occurrences = {}
                 for umo in targets:
-                    if umo in delivered:
+                    occurrence = target_occurrences.get(umo, 0)
+                    target_occurrences[umo] = occurrence + 1
+                    states = self._target_delivery.get(umo, [])
+                    target_state = states[occurrence] if occurrence < len(states) else {}
+                    # Old states stored raw UMOs. Match any current alias of a
+                    # physical target so unique_session history remains valid.
+                    if self._was_delivered(delivered, umo, target_state):
                         continue
                     try:
-                        await self.context.send_message(umo, MessageChain().message(entry["message"]))
+                        sent = await self.context.send_message(umo, MessageChain().message(entry["message"]))
+                        if sent is False:
+                            result["failures"].append({
+                                "entry_id": entry.get("id", ""), "umo": umo,
+                                "reason": "send_message returned False",
+                            })
+                            continue
                         result["success_count"] += 1
-                        delivered.add(umo)
+                        delivered.add(target_state.get("key", umo))
                         entry["delivered_umos"] = sorted(delivered)
                         if persist:
                             self._save()
@@ -569,7 +683,17 @@ class ScheduleBroadcastService:
                             "reason": str(exc) or type(exc).__name__,
                         })
                         logger.warning("Schedule broadcast send failed", exc_info=True)
-                entry["sent"] = bool(targets) and all(umo in delivered for umo in targets)
+                target_occurrences = {}
+                all_delivered = bool(targets)
+                for umo in targets:
+                    occurrence = target_occurrences.get(umo, 0)
+                    target_occurrences[umo] = occurrence + 1
+                    states = self._target_delivery.get(umo, [])
+                    target_state = states[occurrence] if occurrence < len(states) else {}
+                    if not self._was_delivered(delivered, umo, target_state):
+                        all_delivered = False
+                        break
+                entry["sent"] = all_delivered
                 if persist:
                     self._save()
         result["failure_count"] = len(result["failures"])
