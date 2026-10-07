@@ -14,6 +14,7 @@ from .services.test_bypass import (
 from .services.schedule_broadcast import ScheduleBroadcastService
 from .services.fat_fish_bridge import FatFishBridge
 from .services.time_awareness_adapter import TimeAwarenessAdapter
+from .services.rolling_day_bridge import RollingDayBridge
 from .services.tool_visibility_adapter import hide_gallery_tool_for_xiaoman_request
 from .tools.photo_tool import XiaomanPhotoTool
 
@@ -27,12 +28,15 @@ class Main(Star):
         self._config = config or {}
         self._schedule_broadcast = None
         self._time_awareness = None
+        self._rolling_day_bridge = None
         self._fat_fish_bridge = None
         self.context.add_llm_tools(XiaomanPhotoTool(context))
 
     async def initialize(self) -> None:
         """Start optional schedule broadcast after AstrBot initializes the plugin."""
         self._time_awareness = TimeAwarenessAdapter(self.context)
+        self._rolling_day_bridge = RollingDayBridge(self.context, self._time_awareness)
+        self._rolling_day_bridge.install()
         self._fat_fish_bridge = FatFishBridge(self.context, self._time_awareness)
         self._fat_fish_bridge.install()
         cfg = self._config.get("schedule_broadcast", {})
@@ -51,12 +55,16 @@ class Main(Star):
             await self._schedule_broadcast.stop()
         elif self._fat_fish_bridge is not None:
             self._fat_fish_bridge.uninstall()
+        if self._rolling_day_bridge is not None:
+            self._rolling_day_bridge.uninstall()
 
     def get_wallet_policy(self, *, at=None, provider_id=None) -> dict:
         bridge = self._fat_fish_bridge or FatFishBridge(self.context, TimeAwarenessAdapter(self.context))
         return bridge.get_wallet_policy(at=at, provider_id=provider_id)
 
     async def get_xiaoman_schedule(self, session: str, *, at=None, allow_generate=False):
+        if self._rolling_day_bridge is not None:
+            self._rolling_day_bridge.ensure_installed()
         adapter = self._time_awareness or TimeAwarenessAdapter(self.context)
         return await adapter.get_daily_schedule(session, at=at, allow_generate=allow_generate)
 
@@ -71,12 +79,21 @@ class Main(Star):
         now = service._now()
         command_date = now.date() if argument == "today" else now.date() + timedelta(days=1)
         if action == "status":
+            if self._rolling_day_bridge is not None:
+                self._rolling_day_bridge.ensure_installed()
             state = service.status(now)
             today_snapshot = state["today_snapshot"] or {}
             tomorrow_snapshot = state["tomorrow_snapshot"] or {}
+            rolling = (
+                self._rolling_day_bridge.status()
+                if self._rolling_day_bridge is not None
+                else {"installed": False, "clock": "unknown", "raw": ""}
+            )
             yield event.plain_result(
                 "日程广播：enabled={enabled}, dry_run={dry_run}; TimeAwareness={time_awareness_found}, "
                 "Fat Fish={fat_fish_found}, day={day_kind}; "
+                f"life_day={rolling.get('clock','unknown')}→+24h "
+                f"(source={rolling.get('raw','') or 'unavailable'}, bridge={rolling.get('installed',False)}); "
                 "today snapshot={today_id}/{today_count}, plan={today_plan}; "
                 "tomorrow snapshot={tomorrow_id}/{tomorrow_count}, plan={tomorrow_plan}; "
                 "next={next}, error={last_error}".format(
@@ -111,8 +128,27 @@ class Main(Star):
                 f"原因：{result.get('reason', '全部成功')}\n失败明细：{failures}"
             )
             return
+        if action == "raw" and argument == "cycle":
+            cycle = await service.raw_cycle(now=now)
+            if not cycle.get("snapshots"):
+                yield event.plain_result("没有可用的 TimeAwareness 快照来组成生活日。")
+                return
+            rows = [
+                f"{slot.get('start_at','?')} → {slot.get('end_at','?')} "
+                f"{slot.get('name','')} {slot.get('state','')}".strip()
+                for slot in cycle.get("slots", [])
+            ]
+            yield event.plain_result(
+                f"ROLLING RAW boundary={cycle.get('boundary_clock')} "
+                f"source={cycle.get('generation_time')} "
+                f"window={cycle.get('window_start')} → {cycle.get('window_end')} "
+                f"snapshots={','.join(cycle.get('snapshots', [])) or 'missing'} "
+                f"complete={cycle.get('complete')} slots={len(rows)}\n"
+                + "\n".join(rows)
+            )
+            return
         if argument not in {"today", "tomorrow"} and action != "test":
-            yield event.plain_result("用法：/xiaoman_broadcast simulate HH:MM；或 raw|plan|build|reset today|tomorrow")
+            yield event.plain_result("用法：/xiaoman_broadcast simulate HH:MM；或 raw cycle；或 raw|plan|build|reset today|tomorrow")
             return
         if action == "raw":
             snapshot = await service.raw_schedule(command_date)
