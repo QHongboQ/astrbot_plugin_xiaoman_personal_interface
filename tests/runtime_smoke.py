@@ -16,8 +16,10 @@ import urllib.request
 from pathlib import Path
 
 from astrbot.api.star import Star
+from astrbot.core.agent.message import TextPart
 from astrbot.core.agent.tool import FunctionTool, ToolSet
 from astrbot.core.pipeline.context_utils import call_event_hook
+from astrbot.core.provider.entities import ProviderRequest
 from astrbot.core.star.star_handler import StarHandlerRegistry
 
 
@@ -196,6 +198,7 @@ async def run(official_airi_root: Path | None = None) -> None:
     from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.test_bypass import (
         ANGELHEART_HANDLER_NAME,
         ANGELHEART_PLUGIN_NAME,
+        TEST_GUIDANCE,
         inject_test_guidance,
     )
 
@@ -229,17 +232,35 @@ async def run(official_airi_root: Path | None = None) -> None:
     assert len(activated) == 1 and activated[0].handler_name == "normal_handler"
     assert bypass_event.is_at_or_wake_command
     assert bypass_event.message_str == message
-    guidance_req = types.SimpleNamespace(
+    guidance_req = ProviderRequest(
         extra_user_content_parts=[],
         system_prompt="unchanged system",
-        prompt="unchanged prompt",
+        prompt=message,
     )
     assert inject_test_guidance(
         bypass_event, {bypass_event.unified_msg_origin}, guidance_req
     )
+    assert not inject_test_guidance(
+        bypass_event, {bypass_event.unified_msg_origin}, guidance_req
+    )
     assert len(guidance_req.extra_user_content_parts) == 1
+    guidance_part = guidance_req.extra_user_content_parts[0]
+    assert isinstance(guidance_part, TextPart)
+    assert guidance_part.text == TEST_GUIDANCE
+    assert guidance_part.model_dump_for_context().get("_no_save") is True
     assert guidance_req.system_prompt == "unchanged system"
-    assert guidance_req.prompt == "unchanged prompt"
+    assert guidance_req.prompt == message
+    assembled = await guidance_req.assemble_context()
+    assembled_content = assembled["content"]
+    assert isinstance(assembled_content, list)
+    guidance_blocks = [
+        block
+        for block in assembled_content
+        if block.get("type") == "text" and block.get("text") == TEST_GUIDANCE
+    ]
+    assert len(guidance_blocks) == 1
+    assert guidance_blocks[0].get("_no_save") is True
+    assert bypass_event.message_str == message
 
     # Exercise the actual AstrBot 4.28.2 request-local ToolSet behavior.
     req = types.SimpleNamespace(

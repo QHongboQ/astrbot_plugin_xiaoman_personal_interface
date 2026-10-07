@@ -21,6 +21,21 @@ class FunctionToolStub:
         self.parameters = kwargs["parameters"]
 
 
+class TextPartStub:
+    type = "text"
+
+    def __init__(self, text):
+        self.text = text
+        self._no_save = False
+
+    def mark_as_temp(self):
+        self._no_save = True
+        return self
+
+    def model_dump_for_context(self):
+        return {"type": self.type, "text": self.text, "_no_save": self._no_save}
+
+
 class StarStub:
     def __init__(self, context):
         self.context = context
@@ -67,12 +82,15 @@ def _install_astrbot_stubs() -> None:
     agent = types.ModuleType("astrbot.core.agent")
     tool = types.ModuleType("astrbot.core.agent.tool")
     tool.FunctionTool = FunctionToolStub
+    message = types.ModuleType("astrbot.core.agent.message")
+    message.TextPart = TextPartStub
     astrbot.api = api
     astrbot.core = core
     api.event = api_event
     api.star = api_star
     core.agent = agent
     agent.tool = tool
+    agent.message = message
     sys.modules.update(
         {
             "astrbot": astrbot,
@@ -82,6 +100,7 @@ def _install_astrbot_stubs() -> None:
             "astrbot.core": core,
             "astrbot.core.agent": agent,
             "astrbot.core.agent.tool": tool,
+            "astrbot.core.agent.message": message,
         }
     )
 

@@ -7,7 +7,7 @@ import ast
 import types
 import unittest
 
-from test_photo_tool import MAIN_MODULE, PluginContext, ToolManager
+from test_photo_tool import MAIN_MODULE, PluginContext, TextPartStub, ToolManager
 from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.test_bypass import (
     ANGELHEART_HANDLER_NAME,
     ANGELHEART_PLUGIN_NAME,
@@ -197,7 +197,11 @@ class TestBypassTests(unittest.TestCase):
         message = event.message_str
         self.assertTrue(inject_test_guidance(event, {event.unified_msg_origin}, req))
         self.assertFalse(inject_test_guidance(event, {event.unified_msg_origin}, req))
-        self.assertEqual(req.extra_user_content_parts, [TEST_GUIDANCE])
+        self.assertEqual(len(req.extra_user_content_parts), 1)
+        part = req.extra_user_content_parts[0]
+        self.assertIsInstance(part, TextPartStub)
+        self.assertEqual(part.text, TEST_GUIDANCE)
+        self.assertTrue(part.model_dump_for_context()["_no_save"])
         self.assertEqual(req.system_prompt, "system")
         self.assertEqual(req.prompt, "prompt")
         self.assertEqual(event.message_str, message)

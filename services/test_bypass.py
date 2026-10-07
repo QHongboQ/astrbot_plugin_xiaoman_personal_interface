@@ -6,6 +6,8 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
+from astrbot.core.agent.message import TextPart
+
 TEST_ADMIN_UID = "979675497"
 ANGELHEART_PLUGIN_NAME = "astrbot_plugin_angel_heart"
 ANGELHEART_HANDLER_NAME = "smart_reply_handler"
@@ -158,9 +160,18 @@ def inject_test_guidance(event: Any, enabled_umos: set[str], req: Any) -> bool:
         return False
     try:
         parts = req.extra_user_content_parts
-        if not isinstance(parts, list) or TEST_GUIDANCE in parts:
+        if not isinstance(parts, list) or any(
+            (isinstance(part, TextPart) and part.text == TEST_GUIDANCE)
+            or (
+                isinstance(part, dict)
+                and part.get("type") == "text"
+                and part.get("text") == TEST_GUIDANCE
+            )
+            or part == TEST_GUIDANCE
+            for part in parts
+        ):
             return False
-        parts.append(TEST_GUIDANCE)
+        parts.append(TextPart(text=TEST_GUIDANCE).mark_as_temp())
         return True
     except Exception:
         return False
