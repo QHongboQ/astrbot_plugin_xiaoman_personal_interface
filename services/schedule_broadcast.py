@@ -379,6 +379,11 @@ class ScheduleBroadcastService:
                 "peak_start": window["peak_start"].isoformat(),
                 "peak_end": window["peak_end"].isoformat(),
                 "primary_activity": primary_activity,
+                # Keep a concise ordered itinerary when a long single activity is absent.
+                # This is sourced entirely from TimeAwareness's existing raw slots.
+                "activity_outline": self._peak_activity_outline(
+                    schedule, local_date, timezone, window["peak_start"], window["peak_end"]
+                ),
             }
             for kind, trigger in (("PEAK_START", window["cover_start"]), ("PEAK_END", window["cover_end"])):
                 if trigger + timedelta(seconds=int(self._get("grace_seconds", 60))) < now.astimezone(_zone(timezone)):
@@ -429,6 +434,43 @@ class ScheduleBroadcastService:
             }))
         return max(candidates, key=lambda item: (item[0], item[1]))[2] if candidates else None
 
+    def _peak_activity_outline(self, schedule, local_date, timezone, peak_start, peak_end, limit=6):
+        """Return a small chronological itinerary of real slots overlapping a peak."""
+        zone = _zone(timezone)
+        candidates = []
+        for index, slot in enumerate(schedule.get("slots", [])):
+            if not isinstance(slot, dict):
+                continue
+            start, start_next_day = self._clock(slot.get("start"))
+            end, end_next_day = self._clock(slot.get("end"))
+            name, state = str(slot.get("name", "")).strip(), str(slot.get("state", "")).strip()
+            if start is None or end is None or not (name or state):
+                continue
+            activity_start = datetime.combine(
+                local_date + timedelta(days=int(start_next_day)), start, tzinfo=zone
+            )
+            activity_end = datetime.combine(
+                local_date + timedelta(days=int(end_next_day)), end, tzinfo=zone
+            )
+            if not end_next_day and activity_end <= activity_start:
+                activity_end += timedelta(days=1)
+            overlap_seconds = (
+                min(activity_end, peak_end) - max(activity_start, peak_start)
+            ).total_seconds()
+            if overlap_seconds <= 0:
+                continue
+            candidates.append((overlap_seconds, index, {
+                "name": name, "state": state,
+                "start": str(slot.get("start", "")),
+                "end": str(slot.get("end", "")),
+                "overlap_minutes": max(1, int(overlap_seconds // 60)),
+            }))
+
+        # Prefer substantial overlaps, then keep their original time order.
+        chosen = sorted(candidates, key=lambda item: (-item[0], item[1]))[:limit]
+        chosen.sort(key=lambda item: item[1])
+        return [item[2] for item in chosen]
+
     def _prompt_lines(self, entries, schedule, day_kind):
         lines = []
         for entry in entries:
@@ -448,8 +490,14 @@ class ScheduleBroadcastService:
             "保留默认 Persona 的活泼、随性、吐槽和情绪变化，像本人随口发消息，不要写成通知或固定模板。"
             "每条都必须独立可懂：没看过前文的群友也要能知道具体在做什么；不要只写情绪、去/回/结束等空泛结论。"
             "NORMAL 必须依据给出的 name、state 和 time_segment 明确说出原日程中的事情；可自然表达情绪，但不得补造地点、人物、原因、结果或与日程矛盾。"
-            "PEAK_START 与同 activity_id 的 PEAK_END 必须依据共享的 primary_activity 描述同一件具体活动：开始说将去/开始做什么，结束说这件事做完了；不可换成别的活动。primary_activity 的 duration_minutes 必须与 peak_duration_minutes 相称，不要把短暂子活动说成覆盖整个高峰。"
-            "若 primary_activity 为 null，表示日程无法确定高峰时的具体活动；不得猜测或虚构，只能自然、诚实地说要忙一阵/忙完了，且不能只写溜了或回来了。"
+            "晚间和凌晨遇到真实的看电影、夜市、演出、宵夜、朋友聚会、游戏等活动时，可更兴奋、好奇、爱玩一点；"
+            "不要默认23点就必须睡觉，也绝不能为制造夜生活而补造日程中没有的活动。"
+            "PEAK_START 与同 activity_id 的 PEAK_END 共享同一份事实：开始说将去/开始做什么，结束说这件事做完了。"
+            "若 primary_activity 存在，以该活动为主；primary_activity 的 duration_minutes 必须与 peak_duration_minutes 相称，不要把短暂子活动说成覆盖整个高峰。"
+            "若 primary_activity 为 null 但 activity_outline 非空，按 outline 的真实时间顺序概括几件相连的事，"
+            "例如先上课后去看展，不能假装它们是一项持续数小时的活动；前后两条消息必须对应这段真实行程。"
+            "只有 primary_activity 为 null 且 activity_outline 也为空，才可以自然描述暂时有事要忙和忙完了。"
+            "所有情况下都不得猜测或虚构事实，不能只写溜了、回来了、忙一阵等无背景的空话。"
             "不要为了交代背景而过度解释；保持口语、简短、有变化。"
         )
         return f"{self._get('broadcast_prompt', DEFAULT_PROMPT)}\n{instructions}\n" + "\n".join(lines)
