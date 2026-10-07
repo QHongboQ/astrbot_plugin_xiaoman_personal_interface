@@ -5,6 +5,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import re
 from datetime import date, datetime, time, timedelta, timezone as datetime_timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -94,16 +95,116 @@ class ScheduleBroadcastService:
             return []
         allow = set(self._get("allowlist_umos", []))
         deny = set(self._get("denylist_umos", []))
-        result = set()
+        candidates = []
         for row in rows:
             umo = getattr(row, "user_id", None)
-            if not isinstance(umo, str) or umo in deny or (allow and umo not in allow):
+            parsed = self._parse_umo(umo)
+            if parsed is None:
                 continue
-            if ":GroupMessage:" in umo and self._get("send_groups", True):
-                result.add(umo)
-            elif ":FriendMessage:" in umo and self._get("send_private", True):
-                result.add(umo)
-        return sorted(result)
+            platform_name, message_type, session_id = parsed
+            if message_type == "GroupMessage" and not self._get("send_groups", True):
+                continue
+            if message_type == "FriendMessage" and not self._get("send_private", True):
+                continue
+            platform_id = str(getattr(row, "platform_id", "") or platform_name)
+            is_qq_group = message_type == "GroupMessage" and self._is_aiocqhttp(platform_id)
+            group_id = self._qq_group_id(session_id) if is_qq_group else None
+            identity = ("qq-group", platform_id, group_id) if group_id else ("umo", umo)
+            candidates.append({"umo": umo, "identity": identity, "group_id": group_id,
+                               "platform_name": platform_name})
+
+        # Resolve list entries against all aliases before deduplication. A deny on
+        # any alias suppresses the physical QQ group, even if another alias is allowed.
+        def configured_matches(candidate, values):
+            if candidate["umo"] in values:
+                return True
+            if candidate["group_id"] is None:
+                return False
+            return any(
+                self._configured_group_id(value, candidate["platform_name"]) == candidate["group_id"]
+                for value in values
+            )
+
+        grouped = {}
+        qq_instances = {}
+        for candidate in candidates:
+            grouped.setdefault(candidate["identity"], []).append(candidate)
+            if candidate["group_id"] is not None:
+                signature = (candidate["platform_name"], candidate["group_id"])
+                qq_instances.setdefault(signature, set()).add(candidate["identity"][1])
+        selected = []
+        self._target_delivery = {}
+        for identity, aliases in grouped.items():
+            if any(configured_matches(alias, deny) for alias in aliases):
+                continue
+            if allow and not any(configured_matches(alias, allow) for alias in aliases):
+                continue
+            target = min(aliases, key=lambda item: item["umo"])
+            signature = (target["platform_name"], target["group_id"])
+            selected.append((target["umo"], identity, {
+                "key": self._delivery_key(identity),
+                "aliases": {alias["umo"] for alias in aliases},
+                "legacy_group_signature": signature if target["group_id"] is not None else None,
+                "legacy_group_unambiguous": target["group_id"] is not None and len(qq_instances[signature]) == 1,
+            }))
+        selected.sort(key=lambda item: (item[0], item[1]))
+        targets = []
+        for umo, _identity, state in selected:
+            targets.append(umo)
+            self._target_delivery.setdefault(umo, []).append(state)
+        return targets
+
+    @staticmethod
+    def _parse_umo(umo):
+        if not isinstance(umo, str):
+            return None
+        parts = umo.split(":", 2)
+        if len(parts) != 3 or not all(parts) or parts[1] not in {"GroupMessage", "FriendMessage"}:
+            return None
+        return parts[0], parts[1], parts[2]
+
+    def _is_aiocqhttp(self, platform_id):
+        getter = getattr(self.context, "get_platform_inst", None)
+        if not callable(getter):
+            return False
+        try:
+            platform = getter(platform_id)
+            meta = platform.meta() if platform else None
+            return getattr(meta, "name", None) == "aiocqhttp"
+        except Exception:
+            return False
+
+    @staticmethod
+    def _qq_group_id(session_id):
+        # AstrBot's aiocqhttp adapter uses sender_group for unique sessions and
+        # sends to the final underscore-delimited component.
+        group_id = str(session_id).rsplit("_", 1)[-1]
+        return group_id if re.fullmatch(r"\d+", group_id) else None
+
+    @classmethod
+    def _configured_group_id(cls, umo, platform_name):
+        parsed = cls._parse_umo(umo)
+        if not parsed or parsed[0] != platform_name or parsed[1] != "GroupMessage":
+            return None
+        return cls._qq_group_id(parsed[2])
+
+    @staticmethod
+    def _delivery_key(identity):
+        if identity[0] == "qq-group":
+            return f"physical-qq-group:{identity[1]}:{identity[2]}"
+        return identity[1]
+
+    @classmethod
+    def _was_delivered(cls, delivered, umo, target_state):
+        if target_state.get("key", umo) in delivered or umo in delivered:
+            return True
+        if delivered.intersection(target_state.get("aliases", set())):
+            return True
+        signature = target_state.get("legacy_group_signature")
+        if not signature or not target_state.get("legacy_group_unambiguous"):
+            return False
+        platform_name, group_id = signature
+        return any(cls._configured_group_id(old_umo, platform_name) == group_id for old_umo in delivered)
 
     async def read_schedule(self, targets, *, at=None):
         configured = str(self._get("schedule_source_umo", "") or "").strip()
@@ -268,15 +369,16 @@ class ScheduleBroadcastService:
 
         for window in windows:
             cover_id = f"{local_date.isoformat()}-P{window['index']:02d}"
-            duration = int((window["cover_end"] - window["cover_start"]).total_seconds() // 60)
+            peak_duration = int((window["peak_end"] - window["peak_start"]).total_seconds() // 60)
+            primary_activity = self._primary_peak_activity(
+                schedule, local_date, timezone, window["peak_start"], window["peak_end"]
+            )
             context = {
                 "activity_id": cover_id,
-                "duration_minutes": duration,
+                "peak_duration_minutes": peak_duration,
                 "peak_start": window["peak_start"].isoformat(),
                 "peak_end": window["peak_end"].isoformat(),
-                "primary_activity": self._primary_peak_activity(
-                    schedule, local_date, timezone, window["peak_start"], window["peak_end"]
-                ),
+                "primary_activity": primary_activity,
             }
             for kind, trigger in (("PEAK_START", window["cover_start"]), ("PEAK_END", window["cover_end"])):
                 if trigger + timedelta(seconds=int(self._get("grace_seconds", 60))) < now.astimezone(_zone(timezone)):
@@ -285,7 +387,9 @@ class ScheduleBroadcastService:
                     "id": f"{cover_id}-{kind}",
                     "kind": kind,
                     "activity_id": cover_id,
-                    "activity_duration_minutes": duration,
+                    "activity_duration_minutes": (
+                        primary_activity["duration_minutes"] if primary_activity else None
+                    ),
                     "trigger_at": trigger.isoformat(),
                     "message": "",
                     "sent": False,
@@ -298,6 +402,8 @@ class ScheduleBroadcastService:
     def _primary_peak_activity(self, schedule, local_date, timezone, peak_start, peak_end):
         candidates = []
         zone = _zone(timezone)
+        peak_duration = peak_end - peak_start
+        minimum_overlap = max(timedelta(minutes=30), peak_duration / 2)
         for index, slot in enumerate(schedule.get("slots", [])):
             if not isinstance(slot, dict):
                 continue
@@ -313,11 +419,13 @@ class ScheduleBroadcastService:
             if not end_next_day and activity_end <= activity_start:
                 activity_end += timedelta(days=1)
             overlap = min(activity_end, peak_end) - max(activity_start, peak_start)
-            if overlap.total_seconds() <= 0:
+            activity_duration = activity_end - activity_start
+            if overlap < minimum_overlap:
                 continue
             candidates.append((overlap, -index, {
                 "name": name, "state": state,
                 "start": str(slot.get("start", "")), "end": str(slot.get("end", "")),
+                "duration_minutes": int(activity_duration.total_seconds() // 60),
             }))
         return max(candidates, key=lambda item: (item[0], item[1]))[2] if candidates else None
 
@@ -340,7 +448,7 @@ class ScheduleBroadcastService:
             "保留默认 Persona 的活泼、随性、吐槽和情绪变化，像本人随口发消息，不要写成通知或固定模板。"
             "每条都必须独立可懂：没看过前文的群友也要能知道具体在做什么；不要只写情绪、去/回/结束等空泛结论。"
             "NORMAL 必须依据给出的 name、state 和 time_segment 明确说出原日程中的事情；可自然表达情绪，但不得补造地点、人物、原因、结果或与日程矛盾。"
-            "PEAK_START 与同 activity_id 的 PEAK_END 必须依据共享的 primary_activity 描述同一件具体活动：开始说将去/开始做什么，结束说这件事做完了；不可换成别的活动。"
+            "PEAK_START 与同 activity_id 的 PEAK_END 必须依据共享的 primary_activity 描述同一件具体活动：开始说将去/开始做什么，结束说这件事做完了；不可换成别的活动。primary_activity 的 duration_minutes 必须与 peak_duration_minutes 相称，不要把短暂子活动说成覆盖整个高峰。"
             "若 primary_activity 为 null，表示日程无法确定高峰时的具体活动；不得猜测或虚构，只能自然、诚实地说要忙一阵/忙完了，且不能只写溜了或回来了。"
             "不要为了交代背景而过度解释；保持口语、简短、有变化。"
         )
@@ -582,13 +690,26 @@ class ScheduleBroadcastService:
                             self._save()
                     continue
                 delivered = set(entry.get("delivered_umos", []))
+                target_occurrences = {}
                 for umo in targets:
-                    if umo in delivered:
+                    occurrence = target_occurrences.get(umo, 0)
+                    target_occurrences[umo] = occurrence + 1
+                    states = self._target_delivery.get(umo, [])
+                    target_state = states[occurrence] if occurrence < len(states) else {}
+                    # Old states stored raw UMOs. Match any current alias of a
+                    # physical target so unique_session history remains valid.
+                    if self._was_delivered(delivered, umo, target_state):
                         continue
                     try:
-                        await self.context.send_message(umo, MessageChain().message(entry["message"]))
+                        sent = await self.context.send_message(umo, MessageChain().message(entry["message"]))
+                        if sent is False:
+                            result["failures"].append({
+                                "entry_id": entry.get("id", ""), "umo": umo,
+                                "reason": "send_message returned False",
+                            })
+                            continue
                         result["success_count"] += 1
-                        delivered.add(umo)
+                        delivered.add(target_state.get("key", umo))
                         entry["delivered_umos"] = sorted(delivered)
                         if persist:
                             self._save()
@@ -598,7 +719,17 @@ class ScheduleBroadcastService:
                             "reason": str(exc) or type(exc).__name__,
                         })
                         logger.warning("Schedule broadcast send failed", exc_info=True)
-                entry["sent"] = bool(targets) and all(umo in delivered for umo in targets)
+                target_occurrences = {}
+                all_delivered = bool(targets)
+                for umo in targets:
+                    occurrence = target_occurrences.get(umo, 0)
+                    target_occurrences[umo] = occurrence + 1
+                    states = self._target_delivery.get(umo, [])
+                    target_state = states[occurrence] if occurrence < len(states) else {}
+                    if not self._was_delivered(delivered, umo, target_state):
+                        all_delivered = False
+                        break
+                entry["sent"] = all_delivered
                 if persist:
                     self._save()
         result["failure_count"] = len(result["failures"])
