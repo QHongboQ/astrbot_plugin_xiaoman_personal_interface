@@ -67,12 +67,13 @@ class Main(Star):
         fish = state["fat_fish"]
         fish_text = (
             "Fat Fish found={found}, enabled={enabled}, timezone={timezone}, manual_override={manual_override}, "
-            "peak_periods={periods}, peak_weekdays={weekdays}, holiday today={holiday_today}, "
-            "current wallet state={wallet_state}, provider affected={provider_affected}"
+            "peak_periods={periods}, peak_weekdays={weekdays}, holiday={holiday} ({holiday_name}), "
+            "wallet state={wallet_state}, provider affected={provider_affected}, allowed={allowed}"
         ).format(
             found=fish.get("found", False), enabled=fish.get("enabled", False), timezone=fish.get("timezone", "Asia/Shanghai"),
-            manual_override=fish.get("manual_override", "auto"), periods=fish.get("periods", []), weekdays=fish.get("weekdays", []),
-            holiday_today=fish.get("holiday_today", False), wallet_state=fish.get("state", "missing"), provider_affected=fish.get("provider_affected", False),
+            manual_override=fish.get("manual_override", "auto"), periods=fish.get("peak_periods", ""), weekdays=fish.get("peak_weekdays", ""),
+            holiday=fish.get("holiday", False), holiday_name=fish.get("holiday_name", ""),
+            wallet_state=fish.get("state", "missing"), provider_affected=fish.get("provider_affected", False), allowed=fish.get("allowed", False),
         )
         yield event.plain_result(
             "日程广播状态：enabled={enabled}, dry_run={dry_run}, Life Scheduler={life_scheduler_found}, "

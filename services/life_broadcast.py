@@ -9,14 +9,12 @@ import json
 import re
 from datetime import datetime, time, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from astrbot.api import logger
 
 
 LIFE_SCHEDULER_NAME = "astrbot_plugin_life_scheduler"
 FAT_FISH_NAME = "astrbot_plugin_fat_fish_wallet"
-DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_PROMPT = "请按每个日程生成一句自然的第一人称 QQ 聊天消息，只输出 JSON。忠于事项，不编造地点或同伴，不提日程、系统、AI，不用表情、Markdown、括号或省略号。"
 
 
@@ -97,115 +95,36 @@ class LifeBroadcastService:
         temp.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
         temp.replace(self.path)
 
-    @staticmethod
-    def _cfg_value(config, key, default=None):
-        try:
-            return config.get(key, default)
-        except Exception:
-            return default
-
-    def fat_fish_config(self):
-        """Read only the active Fat Fish plugin's public StarMetadata.config."""
+    def discover_fat_fish(self):
+        """Return an active Fat Fish instance exposing its public policy API."""
         try:
             for metadata in self.context.get_all_stars():
                 if getattr(metadata, "name", None) == FAT_FISH_NAME:
                     if getattr(metadata, "activated", False) is not True:
                         return None
-                    return getattr(metadata, "config", None)
+                    if getattr(metadata, "config", None) is None:
+                        return None
+                    plugin = getattr(metadata, "star_cls", None)
+                    if callable(getattr(plugin, "get_wallet_policy", None)):
+                        return plugin
+                    return None
         except Exception:
             logger.warning("Fat Fish discovery failed", exc_info=True)
         return None
 
-    @staticmethod
-    def _timezone(config):
-        name = str(LifeBroadcastService._cfg_value(config, "timezone", "") or DEFAULT_TIMEZONE)
-        try:
-            return ZoneInfo(name), name
-        except (ZoneInfoNotFoundError, ValueError):
-            logger.warning("Invalid Fat Fish timezone %r; using %s", name, DEFAULT_TIMEZONE)
-            return ZoneInfo(DEFAULT_TIMEZONE), DEFAULT_TIMEZONE
-
-    @staticmethod
-    def _local_now(zone, now=None):
-        now = now or datetime.now(zone)
-        return now.replace(tzinfo=zone) if now.tzinfo is None else now.astimezone(zone)
-
-    @staticmethod
-    def _peak_period_ranges(config):
-        periods = LifeBroadcastService._cfg_value(config, "peak_periods", "") or ""
-        if isinstance(periods, str):
-            return [part.strip() for part in periods.split(",") if part.strip()]
-        if isinstance(periods, (list, tuple)):
-            return [str(part).strip() for part in periods if str(part).strip()]
-        return []
-
-    @staticmethod
-    def _peak_at(config, local_dt):
-        weekdays = LifeBroadcastService._cfg_value(config, "peak_weekdays", []) or []
-        if isinstance(weekdays, str):
-            weekdays = [part.strip() for part in weekdays.split(",") if part.strip()]
-        try:
-            weekdays = {int(day) for day in weekdays}
-        except (TypeError, ValueError):
-            weekdays = set()
-        if weekdays and local_dt.weekday() not in weekdays:
-            return False
-        for period in LifeBroadcastService._peak_period_ranges(config):
-            try:
-                start_s, end_s = period.split("-", 1)
-                start, end = time.fromisoformat(start_s.strip()), time.fromisoformat(end_s.strip())
-                current = local_dt.time()
-                in_period = start <= current < end if start <= end else current >= start or current < end
-                if in_period:
-                    return True
-            except (ValueError, TypeError):
-                logger.warning("Invalid Fat Fish peak period: %r", period)
-        return False
-
-    @staticmethod
-    def _provider_affected(config, provider_id):
-        affected = LifeBroadcastService._cfg_value(config, "affected_providers", []) or []
-        if isinstance(affected, str):
-            affected = [part.strip() for part in affected.split(",") if part.strip()]
-        affected = [str(item).strip() for item in affected if str(item).strip()]
-        if not affected:
-            return False
-        if "*" in affected:
-            return True
-        if not provider_id:
-            return bool(LifeBroadcastService._cfg_value(config, "gate_when_provider_unknown", True))
-        provider = str(provider_id).casefold()
-        return any(keyword.casefold() in provider for keyword in affected)
-
     def fat_fish_policy(self, now=None, provider_id=None):
-        config = self.fat_fish_config()
-        if config is None:
-            return {"found": False, "enabled": False, "timezone": DEFAULT_TIMEZONE, "state": "missing", "allowed": False, "provider_affected": False, "manual_override": "auto", "periods": [], "weekdays": []}
-        zone, timezone_name = self._timezone(config)
-        local_now = self._local_now(zone, now)
-        enabled = bool(self._cfg_value(config, "enabled", False))
-        override = str(self._cfg_value(config, "manual_override", "auto") or "auto").casefold()
-        affected = self._provider_affected(config, provider_id)
-        periods = self._peak_period_ranges(config)
-        weekdays = self._cfg_value(config, "peak_weekdays", []) or []
-        if isinstance(weekdays, str):
-            weekdays = [p.strip() for p in weekdays.split(",") if p.strip()]
-        state, allowed = "offpeak", True
-        holiday_today = False
+        """Delegate every gate decision to Fat Fish's public policy API."""
+        plugin = self.discover_fat_fish()
+        if plugin is None:
+            return {"found": False, "enabled": False, "allowed": False, "state": "missing", "timezone": "", "manual_override": "auto", "provider_affected": False, "holiday": False, "holiday_name": "", "peak_periods": "", "peak_weekdays": "", "evaluated_at": now}
         try:
-            import holidays
-            holiday_today = local_now.date() in holidays.CN()
+            policy = plugin.get_wallet_policy(at=now, provider_id=provider_id)
+            if not isinstance(policy, dict) or "allowed" not in policy:
+                raise TypeError("Fat Fish get_wallet_policy returned an invalid policy")
+            return {"found": True, **policy}
         except Exception:
-            logger.warning("Chinese holiday calendar unavailable; using Fat Fish weekday/time policy", exc_info=True)
-        if enabled and affected:
-            if override == "always_allow":
-                state, allowed = "forced allow", True
-            elif override == "always_block":
-                state, allowed = "forced block", False
-            else:
-                peak = False if holiday_today else self._peak_at(config, local_now)
-                state, allowed = ("peak", False) if peak else ("offpeak", True)
-        return {"found": True, "enabled": enabled, "timezone": timezone_name, "manual_override": override, "periods": periods, "weekdays": weekdays, "state": state, "allowed": allowed, "provider_affected": affected, "holiday_today": holiday_today, "local_now": local_now}
+            logger.warning("Fat Fish public policy call failed closed", exc_info=True)
+            return {"found": True, "enabled": True, "allowed": False, "state": "policy_error", "timezone": "", "manual_override": "auto", "provider_affected": False, "holiday": False, "holiday_name": "", "peak_periods": "", "peak_weekdays": "", "evaluated_at": now}
 
     def discover(self):
         try:
@@ -285,16 +204,16 @@ class LifeBroadcastService:
         if not targets:
             return None
         offset = int(self._get("event_offset_minutes", 0))
-        fish_config = self.fat_fish_config()
-        if fish_config is None:
-            self.last_error = "Fat Fish unavailable"
+        current_policy = self.fat_fish_policy(now, provider)
+        generation_now = current_policy.get("evaluated_at")
+        if not current_policy.get("found") or not current_policy.get("allowed") or not isinstance(generation_now, datetime):
+            self.last_error = "Fat Fish unavailable or blocked"
             return None
-        zone, _ = self._timezone(fish_config)
-        generation_now = self._local_now(zone, now)
         eligible = []
         for index, row in enumerate(rows, 1):
             trigger_dt = self._trigger_datetime(row["time"], offset, generation_now)
-            if not self.fat_fish_policy(trigger_dt, provider).get("allowed", False) or self._expired_at(trigger_dt, generation_now):
+            future_policy = self.fat_fish_policy(trigger_dt, provider)
+            if not future_policy.get("found") or not future_policy.get("allowed", False) or self._expired_at(trigger_dt, generation_now):
                 continue
             entry_id = f"E{index}"
             eligible.append((entry_id, row, trigger_dt))
@@ -317,6 +236,10 @@ class LifeBroadcastService:
         if not entries:
             return []
         user_prompt = f"{self._get('broadcast_prompt', DEFAULT_PROMPT)}\n事件 offset={offset} 分钟。每项生成 15-60 字消息（最长 {self._get('max_message_chars', 80)} 字），只输出 JSON 对象，键为事件 ID。\n" + "\n".join(inputs)
+        current_policy = self.fat_fish_policy(now, provider)
+        if not current_policy.get("found") or not current_policy.get("allowed"):
+            self.last_error = "blocked by Fat Fish policy before generation"
+            return None
         response = await self.context.llm_generate(chat_provider_id=provider, prompt=user_prompt, system_prompt=persona_prompt, tools=None)
         raw = getattr(response, "completion_text", None) or getattr(response, "text", None) or str(response)
         try:
@@ -325,7 +248,7 @@ class LifeBroadcastService:
                 raise ValueError("response is not an object")
         except Exception:
             # One bounded repair request, only while outside blocked windows.
-            if not self.fat_fish_policy(provider_id=provider).get("allowed", False):
+            if not self.fat_fish_policy(None, provider).get("allowed", False):
                 self.last_error = "blocked during JSON repair"
                 return None
             repaired = await self.context.llm_generate(chat_provider_id=provider, prompt="请只修复为合法 JSON 对象，保留事件 ID 与消息内容：\n" + raw, system_prompt=persona_prompt, tools=None)
@@ -366,21 +289,15 @@ class LifeBroadcastService:
             pending = self.state.get("pending_hash") == digest
             if not incomplete and not pending:
                 return False
-        fish_config = self.fat_fish_config()
-        if fish_config is None:
-            self.state.update(pending_hash=digest, pending_text=text)
-            self._save()
-            return False
-        zone, _ = self._timezone(fish_config)
-        refresh_now = self._local_now(zone, now)
         targets = await self.targets()
         self.last_target_count = len(targets)
         if not targets:
             self.state.update(pending_hash=digest, pending_text=text)
             return False
         provider = await self._provider_for_targets(targets)
-        current_policy = self.fat_fish_policy(refresh_now, provider)
-        if not current_policy.get("found") or not current_policy.get("allowed"):
+        current_policy = self.fat_fish_policy(now, provider)
+        refresh_now = current_policy.get("evaluated_at")
+        if not current_policy.get("found") or not current_policy.get("allowed") or not isinstance(refresh_now, datetime):
             self.state["pending_hash"] = digest
             self.state["pending_text"] = text
             self._save()
@@ -392,7 +309,7 @@ class LifeBroadcastService:
             self.last_error = f"generation failed: {exc}"
             entries = None
         if entries is None:
-            if self.last_error not in {"provider unavailable", "blocked during JSON repair", "Fat Fish unavailable"}:
+            if self.last_error not in {"provider unavailable", "blocked during JSON repair", "Fat Fish unavailable", "Fat Fish unavailable or blocked", "blocked by Fat Fish policy before generation"}:
                 self.state.update(failed_hash=digest, failure_reason=self.last_error)
             self.state.update(pending_hash=digest, pending_text=text)
             self._save()
@@ -403,39 +320,40 @@ class LifeBroadcastService:
 
     def _expired(self, entry, now):
         try:
-            fish_config = self.fat_fish_config()
-            zone, _ = self._timezone(fish_config) if fish_config is not None else (ZoneInfo(DEFAULT_TIMEZONE), DEFAULT_TIMEZONE)
-            local_now = self._local_now(zone, now)
-            event = datetime.combine(local_now.date(), time.fromisoformat(entry["trigger_time"]), tzinfo=zone)
+            policy = self.fat_fish_policy(now)
+            local_now = policy.get("evaluated_at")
+            if not isinstance(local_now, datetime):
+                return True
+            event = datetime.combine(local_now.date(), time.fromisoformat(entry["trigger_time"]), tzinfo=local_now.tzinfo)
             return local_now > event + timedelta(seconds=int(self._get("grace_seconds", 60)))
         except (ValueError, KeyError):
             return True
 
     async def send_due(self, now=None):
-        fish_config = self.fat_fish_config()
-        if fish_config is None:
-            return
-        zone, _ = self._timezone(fish_config)
-        now = self._local_now(zone, now)
+        requested_now = now
         targets = await self.targets()
         self.last_target_count = len(targets)
         provider = await self._provider_for_targets(targets)
+        current_policy = self.fat_fish_policy(now, provider)
+        local_now = current_policy.get("evaluated_at")
+        if not current_policy.get("found") or not isinstance(local_now, datetime):
+            return
         for entry in self.state.get("entries", []):
             if entry.get("sent") or entry.get("expired") or not entry.get("message"):
                 continue
             try:
-                trigger = datetime.combine(now.date(), time.fromisoformat(entry["trigger_time"]), tzinfo=now.tzinfo)
+                trigger = datetime.combine(local_now.date(), time.fromisoformat(entry["trigger_time"]), tzinfo=local_now.tzinfo)
             except (ValueError, KeyError):
                 entry["expired"] = True
                 self._save()
                 continue
-            if self._expired_at(trigger, now):
+            if self._expired_at(trigger, local_now):
                 entry["expired"] = True
                 self._save()
                 continue
-            if now < trigger:
+            if local_now < trigger:
                 continue
-            policy = self.fat_fish_policy(now, provider)
+            policy = self.fat_fish_policy(requested_now, provider)
             if not policy.get("found") or not policy.get("allowed"):
                 continue
             if self._get("dry_run", False):
@@ -453,7 +371,7 @@ class LifeBroadcastService:
             for umo in targets:
                 if umo in delivered:
                     continue
-                policy = self.fat_fish_policy(now, provider)
+                policy = self.fat_fish_policy(requested_now, provider)
                 if not policy.get("found") or not policy.get("allowed"):
                     break
                 try:

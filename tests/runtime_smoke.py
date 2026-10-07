@@ -175,6 +175,17 @@ async def verify_life_broadcast_public_contract():
             assert allow_generate is False
             return f"{stamp}｜地点：学校｜事项：上午课程｜细节：准备上课"
 
+    class PublicFatFishPolicy:
+        def get_wallet_policy(self, *, at=None, provider_id=None):
+            assert provider_id == "runtime-provider"
+            return {
+                "enabled": True, "allowed": True, "state": "offpeak",
+                "timezone": "Asia/Shanghai", "manual_override": "auto",
+                "provider_affected": True, "holiday": False, "holiday_name": "",
+                "peak_periods": "09:00-12:00", "peak_weekdays": "0,1,2,3,4,5,6",
+                "evaluated_at": at or clock,
+            }
+
     class PublicContextFixture:
         def __init__(self):
             self.get_all_stars_called = 0
@@ -191,11 +202,7 @@ async def verify_life_broadcast_public_contract():
             self.get_all_stars_called += 1
             return [
                 StarMetadata(name="astrbot_plugin_life_scheduler", activated=True, star_cls=LifeScheduler()),
-                StarMetadata(name=FAT_FISH_NAME, activated=True, config={
-                    "enabled": True, "timezone": "Asia/Shanghai", "peak_periods": "",
-                    "peak_weekdays": [], "manual_override": "always_allow",
-                    "affected_providers": ["*"], "gate_when_provider_unknown": True,
-                }),
+                StarMetadata(name=FAT_FISH_NAME, activated=True, config={}, star_cls=PublicFatFishPolicy()),
             ]
 
         async def get_conversations(self):

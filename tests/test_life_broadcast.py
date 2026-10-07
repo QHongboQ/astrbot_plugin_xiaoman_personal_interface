@@ -8,7 +8,6 @@ import types
 import unittest
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
 
 from test_photo_tool import MAIN_MODULE  # installs the lightweight public API stubs/package path
 from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.life_broadcast import (
@@ -28,13 +27,10 @@ class FakeContext:
     def __init__(self, schedule=f"{ROW}\n{ROW2}", targets=None, outputs=None):
         self.schedule = schedule
         self.targets_list = targets if targets is not None else ["qq:GroupMessage:1", "qq:FriendMessage:2"]
-        self.fat_fish_config = {
-            "enabled": True, "timezone": "Asia/Shanghai", "peak_periods": "", "peak_weekdays": [],
-            "manual_override": "always_allow", "affected_providers": ["*"], "gate_when_provider_unknown": True,
-        }
+        self.fat_fish = FakeFatFish()
         self.stars = [
             types.SimpleNamespace(name=LIFE_SCHEDULER_NAME, activated=True, star_cls=Life(self)),
-            types.SimpleNamespace(name=FAT_FISH_NAME, activated=True, config=self.fat_fish_config),
+            types.SimpleNamespace(name=FAT_FISH_NAME, activated=True, config={}, star_cls=self.fat_fish),
         ]
         async def get_conversations():
             return [types.SimpleNamespace(user_id=x) for x in self.targets_list]
@@ -68,6 +64,29 @@ class Life:
     async def get_life_context(self, **kwargs):
         self.flags.append(kwargs)
         return self.ctx.schedule
+
+
+class FakeFatFish:
+    """Contract stub: Xiaoman consumes decisions and never parses Fat Fish config."""
+    def __init__(self):
+        self.default_policy = {
+            "enabled": True, "allowed": True, "state": "offpeak", "timezone": "Asia/Shanghai",
+            "manual_override": "auto", "provider_affected": True, "holiday": False,
+            "holiday_name": "", "peak_periods": "09:00-12:00", "peak_weekdays": "0,1,2,3,4,5,6",
+        }
+        self.policy_by_time = {}
+        self.calls = []
+
+    def get_wallet_policy(self, *, at=None, provider_id=None):
+        self.calls.append((at, provider_id))
+        if isinstance(at, datetime):
+            key = at.strftime("%Y-%m-%d %H:%M")
+            policy = self.policy_by_time.get(key, self.default_policy)
+            evaluated_at = at
+        else:
+            policy = self.default_policy
+            evaluated_at = LifeBroadcastTests.FIXED_NOW
+        return {**policy, "evaluated_at": evaluated_at}
 
 
 class LifeBroadcastTests(unittest.IsolatedAsyncioTestCase):
@@ -163,90 +182,36 @@ class LifeBroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.svc.targets(), [])
 
     def test_fat_fish_discovery_exact_name_active_and_config(self):
-        self.assertIs(self.svc.fat_fish_config(), self.ctx.fat_fish_config)
+        self.assertIs(self.svc.discover_fat_fish(), self.ctx.fat_fish)
         self.ctx.stars[1].name = "astrbot_plugin_fat_fish_wallet_copy"
-        self.assertIsNone(self.svc.fat_fish_config())
+        self.assertIsNone(self.svc.discover_fat_fish())
         self.ctx.stars[1].name = FAT_FISH_NAME
         self.ctx.stars[1].activated = False
-        self.assertIsNone(self.svc.fat_fish_config())
+        self.assertIsNone(self.svc.discover_fat_fish())
         self.ctx.stars[1].activated = True
         self.ctx.stars[1].config = None
-        self.assertIsNone(self.svc.fat_fish_config())
+        self.assertIsNone(self.svc.discover_fat_fish())
 
-    def test_reads_only_public_metadata_config_without_fat_fish_import(self):
-        self.assertIs(self.svc.fat_fish_config(), self.ctx.fat_fish_config)
+    def test_uses_only_public_wallet_policy_without_duplicate_rules(self):
+        policy = self.svc.fat_fish_policy(datetime(2025, 1, 6, 10, 0), "deepseek/model")
+        self.assertTrue(policy["allowed"])
+        self.assertEqual(self.ctx.fat_fish.calls[-1], (datetime(2025, 1, 6, 10, 0), "deepseek/model"))
         import inspect
         source = inspect.getsource(type(self.svc))
         self.assertNotIn("astrbot_plugin_fat_fish_wallet.scheduler", source)
-        self.assertNotIn("._periods(", source)
+        self.assertNotIn("import holidays", source)
+        self.assertNotIn("parse_weekdays", source)
+        self.assertNotIn("parse_periods", source)
+        self.assertNotIn("holidays.CN", source)
+        self.assertNotIn("always_allow", source)
+        self.assertNotIn("always_block", source)
+        self.assertNotIn("_provider_affected", source)
 
-    def test_manual_override_modes(self):
-        now = datetime(2025, 1, 6, 10, 0)
-        self.ctx.fat_fish_config.update(peak_periods="09:00-12:00", peak_weekdays=[0], manual_override="always_allow")
-        self.assertTrue(self.svc.fat_fish_policy(now, "provider")["allowed"])
-        self.assertEqual(self.svc.fat_fish_policy(now, "provider")["state"], "forced allow")
-        self.ctx.fat_fish_config["manual_override"] = "always_block"
-        self.assertFalse(self.svc.fat_fish_policy(now, "provider")["allowed"])
-        self.assertEqual(self.svc.fat_fish_policy(now, "provider")["state"], "forced block")
-        self.ctx.fat_fish_config["manual_override"] = "auto"
-        self.assertFalse(self.svc.fat_fish_policy(now, "provider")["allowed"])
-
-    def test_live_fat_fish_config_change_is_read_without_restart(self):
-        now = datetime(2025, 1, 6, 10, 0)
-        self.ctx.fat_fish_config.update(manual_override="auto", peak_periods="09:00-12:00", peak_weekdays=[0])
-        self.assertFalse(self.svc.fat_fish_policy(now, "provider")["allowed"])
-        self.ctx.fat_fish_config["peak_periods"] = "11:00-12:00"
-        self.assertTrue(self.svc.fat_fish_policy(now, "provider")["allowed"])
-
-    def test_peak_interval_start_inclusive_end_exclusive(self):
-        self.ctx.fat_fish_config.update(manual_override="auto", peak_periods="09:00-12:00", peak_weekdays=[])
-        self.assertFalse(self.svc.fat_fish_policy(datetime(2025, 1, 6, 9, 0), "provider")["allowed"])
-        self.assertTrue(self.svc.fat_fish_policy(datetime(2025, 1, 6, 12, 0), "provider")["allowed"])
-
-    def test_weekdays_and_empty_weekdays(self):
-        self.ctx.fat_fish_config.update(manual_override="auto", peak_periods="09:00-12:00", peak_weekdays=[0])
-        self.assertFalse(self.svc.fat_fish_policy(datetime(2025, 1, 6, 10, 0), "provider")["allowed"])
-        self.assertTrue(self.svc.fat_fish_policy(datetime(2025, 1, 7, 10, 0), "provider")["allowed"])
-        self.ctx.fat_fish_config["peak_weekdays"] = []
-        self.assertFalse(self.svc.fat_fish_policy(datetime(2025, 1, 7, 10, 0), "provider")["allowed"])
-
-    def test_timezone_and_provider_awareness(self):
-        self.ctx.fat_fish_config.update(timezone="Asia/Shanghai", manual_override="auto", peak_periods="09:00-12:00", peak_weekdays=[], affected_providers=["deepseek"])
-        policy = self.svc.fat_fish_policy(datetime(2025, 1, 6, 10, 0), "deepseek/deepseek-flash")
-        self.assertFalse(policy["allowed"])
-        self.assertEqual(policy["timezone"], "Asia/Shanghai")
-        self.assertFalse(self.svc.fat_fish_policy(datetime(2025, 1, 6, 10, 0), "openai/gpt")["provider_affected"])
-
-    def test_empty_affected_providers_disables_gate(self):
-        self.ctx.fat_fish_config.update(manual_override="always_block", affected_providers=[])
+    def test_policy_error_fails_closed(self):
+        self.ctx.fat_fish.get_wallet_policy = lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("policy error"))
         policy = self.svc.fat_fish_policy(datetime(2025, 1, 6, 10, 0), "provider")
-        self.assertFalse(policy["provider_affected"])
-        self.assertTrue(policy["allowed"])
-
-    def test_unknown_provider_gate_setting(self):
-        self.ctx.fat_fish_config.update(manual_override="always_block", affected_providers=["deepseek"], gate_when_provider_unknown=True)
-        self.assertFalse(self.svc.fat_fish_policy(datetime(2025, 1, 6, 10, 0), None)["allowed"])
-        self.ctx.fat_fish_config["gate_when_provider_unknown"] = False
-        self.assertTrue(self.svc.fat_fish_policy(datetime(2025, 1, 6, 10, 0), None)["allowed"])
-
-    def test_holiday_suppresses_normal_weekday_peak(self):
-        class Calendar:
-            def __contains__(self, day):
-                return day == datetime(2025, 1, 29).date()
-        fake_holidays = types.SimpleNamespace(CN=lambda: Calendar())
-        self.ctx.fat_fish_config.update(manual_override="auto", peak_periods="14:00-18:00", peak_weekdays=[2])
-        with patch.dict("sys.modules", {"holidays": fake_holidays}):
-            policy = self.svc.fat_fish_policy(datetime(2025, 1, 29, 14, 55), "provider")
-        self.assertTrue(policy["holiday_today"])
-        self.assertTrue(policy["allowed"])
-        self.assertEqual(policy["state"], "offpeak")
-
-    def test_missing_holidays_dependency_falls_back_to_fat_fish_periods(self):
-        self.ctx.fat_fish_config.update(manual_override="auto", peak_periods="14:00-18:00", peak_weekdays=[])
-        with patch.dict("sys.modules", {"holidays": None}):
-            policy = self.svc.fat_fish_policy(datetime(2025, 1, 6, 14, 55), "provider")
+        self.assertTrue(policy["found"])
         self.assertFalse(policy["allowed"])
-        self.assertEqual(policy["state"], "peak")
 
     async def test_missing_fat_fish_fails_closed_for_generation_and_send(self):
         self.ctx.stars = self.ctx.stars[:1]
@@ -282,7 +247,7 @@ class LifeBroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([entry["time"] for entry in self.svc.state["entries"]], ["20:30"])
 
     async def test_blocked_node_is_filtered_before_batch_llm(self):
-        self.ctx.fat_fish_config.update(manual_override="auto", peak_periods="09:00-12:00", peak_weekdays=[])
+        self.ctx.fat_fish.policy_by_time["2025-01-06 10:00"] = {**self.ctx.fat_fish.default_policy, "allowed": False, "state": "peak"}
         self.ctx.schedule = "\n".join(
             [
                 "08:30｜地点：家｜事项：早餐｜细节：吃饭",
@@ -298,7 +263,7 @@ class LifeBroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("E3 | 20:30", prompt)
 
     async def test_current_peak_prevents_batch_llm_call(self):
-        self.ctx.fat_fish_config.update(manual_override="auto", peak_periods="09:00-12:00", peak_weekdays=[])
+        self.ctx.fat_fish.policy_by_time["2025-01-06 10:00"] = {**self.ctx.fat_fish.default_policy, "allowed": False, "state": "peak"}
         await self.svc.refresh(now=datetime(2025, 1, 6, 10, 0))
         self.assertEqual(self.ctx.llm_calls, [])
         self.assertIn("pending_hash", self.svc.state)
@@ -316,10 +281,11 @@ class LifeBroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.ctx.llm_calls), 2)
 
     async def test_blocked_detection_keeps_pending_then_generates(self):
-        self.ctx.fat_fish_config.update(manual_override="auto", peak_periods="09:00-12:00", peak_weekdays=[])
+        key = "2025-01-06 10:00"
+        self.ctx.fat_fish.policy_by_time[key] = {**self.ctx.fat_fish.default_policy, "allowed": False, "state": "peak"}
         await self.svc.refresh(now=datetime(2025, 1, 6, 10, 0))
         self.assertEqual(self.ctx.llm_calls, [])
-        self.ctx.fat_fish_config["manual_override"] = "always_allow"
+        self.ctx.fat_fish.policy_by_time[key] = {**self.ctx.fat_fish.default_policy, "allowed": True, "state": "forced allow", "manual_override": "always_allow"}
         await self.svc.refresh(now=datetime(2025, 1, 6, 10, 0))
         self.assertEqual(len(self.ctx.llm_calls), 1)
 
@@ -383,15 +349,38 @@ class LifeBroadcastTests(unittest.IsolatedAsyncioTestCase):
             def message(self, text): return self
         astrbot.api.event.MessageChain = Chain
         now = datetime(2025, 1, 6, 8, 0)
-        self.ctx.fat_fish_config.update(manual_override="auto", peak_periods="09:00-12:00", peak_weekdays=[])
         self.svc.state["entries"] = [{"id": "E1", "trigger_time": "08:00", "message": "检查门控", "sent": False}]
         await self.svc.send_due(now)
         self.assertTrue(self.svc.state["entries"][0]["sent"])
         self.svc.state["entries"][0].update(sent=False, delivered_umos=[])
-        self.ctx.fat_fish_config["manual_override"] = "always_block"
+        self.ctx.fat_fish.policy_by_time["2025-01-06 08:00"] = {**self.ctx.fat_fish.default_policy, "allowed": False, "state": "forced block", "manual_override": "always_block"}
         await self.svc.send_due(now)
         self.assertFalse(self.svc.state["entries"][0]["sent"])
         self.assertEqual(len(self.ctx.sent), 2)
+
+    async def test_2026_10_07_holiday_policy_is_consumed_for_generation_and_future_node(self):
+        self.ctx.schedule = "14:55｜地点：家｜事项：休息｜细节：休息一会儿"
+        self.ctx.outputs = [json.dumps({"E1": "我准备休息一会儿"}, ensure_ascii=False)]
+        holiday_policy = {
+            **self.ctx.fat_fish.default_policy, "holiday": True, "holiday_name": "National Day",
+            "allowed": True, "state": "offpeak", "manual_override": "auto",
+        }
+        self.ctx.fat_fish.policy_by_time["2026-10-07 14:50"] = holiday_policy
+        self.ctx.fat_fish.policy_by_time["2026-10-07 14:55"] = holiday_policy
+        await self.svc.refresh(now=datetime(2026, 10, 7, 14, 50))
+        self.assertEqual(len(self.ctx.llm_calls), 1)
+        self.assertIn("E1 | 14:55", self.ctx.llm_calls[0]["prompt"])
+        self.assertIn((datetime(2026, 10, 7, 14, 55), "provider"), self.ctx.fat_fish.calls)
+
+        blocked_policy = {
+            **holiday_policy, "allowed": False, "state": "forced block", "manual_override": "always_block",
+        }
+        self.ctx.schedule += "\n15:05｜地点：家｜事项：喝水｜细节：喝水"
+        self.ctx.fat_fish.policy_by_time["2026-10-07 14:55"] = blocked_policy
+        self.ctx.fat_fish.policy_by_time["2026-10-07 15:05"] = blocked_policy
+        self.ctx.outputs.append(json.dumps({"E1": "喝水"}, ensure_ascii=False))
+        await self.svc.refresh(now=datetime(2026, 10, 7, 14, 55))
+        self.assertEqual(len(self.ctx.llm_calls), 1)
 
     async def test_schema_has_no_independent_blocked_windows(self):
         import json

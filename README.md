@@ -48,7 +48,7 @@ send_xiaoman_photo()
 
 计划仅保存在本插件数据目录的 `life_broadcast_state.json`，使用原子替换写入。重启后相同日程复用已生成消息；已发送项目不会重复发送，过期项目不补发。广播只投递至 AstrBot 已有会话，不读取 QQ 好友/群列表，也不写入聊天历史。
 
-高峰期策略完全由已启用的 Fat Fish Wallet (`astrbot_plugin_fat_fish_wallet`) 控制。每次轮询读取其 AstrBot 插件元数据 `config`，不读取其私有文件或调用其内部方法。必须安装并启用 Fat Fish Wallet，否则不会生成或发送主动广播。`enabled`、`timezone`、`peak_periods`、`peak_weekdays`、`manual_override`、`affected_providers` 与 `gate_when_provider_unknown` 均以 Fat Fish 当前配置为准；修改后最迟下个轮询周期生效。所有事件按 Fat Fish 时区逐个判断，生成时仅将未来且非高峰的节点放入单次批量 LLM 请求；发送前也会再检查一次当前策略。中国法定节假日使用 `holidays.CN()`，自动模式按非高峰处理。插件状态命令会显示 Fat Fish 启用状态、时区、覆盖模式、时段/星期、今日节假日判定、当前状态及提供商是否受影响。
+高峰期策略完全由已启用的 Fat Fish Wallet (`astrbot_plugin_fat_fish_wallet`) 控制。Xiaoman 只通过 AstrBot 插件元数据发现实例并调用其公开的 `get_wallet_policy()`；不读取插件配置副本、不解析时段/星期，也不重复节假日或强制覆盖逻辑。必须安装并启用带有该公开策略接口的 Fat Fish 版本，否则不会生成或发送主动广播。Fat Fish 返回的当前策略用于生成前保护、每个未来事件过滤、JSON 修复前检查及实际发送前复查。中国法定节假日由 Fat Fish 在自动模式中按非高峰处理。插件状态命令直接显示 Fat Fish 返回的启用状态、时区、覆盖模式、节假日及名称、当前策略、提供商适用性和允许结果。
 
 管理员命令：
 
