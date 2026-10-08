@@ -328,60 +328,58 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
             {"name": "坏权重", "weight": 1}, {"name": "海边,夜游", "weight": 4},
         ])
 
-    async def test_activity_density_and_sleep_target_are_safely_normalized(self):
-        self.service.cfg.update(activity_density="unknown", sleep_target_hours=99)
+    async def test_activity_density_is_safely_normalized(self):
+        self.service.cfg.update(activity_density="unknown")
         self.assertEqual(self.service._activity_density(), "balanced")
-        self.assertEqual(self.service._sleep_target_hours(), 12)
-        self.service.cfg["sleep_target_hours"] = 1
-        self.assertEqual(self.service._sleep_target_hours(), 4)
-        self.service.cfg["sleep_target_hours"] = "invalid"
-        self.assertEqual(self.service._sleep_target_hours(), 8)
 
     async def test_planner_input_includes_activity_pacing_sleep_and_continuity(self):
         self.service.cfg.update({"activity_pool": ["密室逃脱,7", "KTV,6"],
                                  "activity_pool_allow_custom": False,
-                                 "activity_density": "balanced", "sleep_target_hours": 8})
+                                 "activity_density": "balanced"})
         data = await self._input()
         self.assertEqual(data["activity_pool"], [{"name": "密室逃脱", "weight": 7},
                                                  {"name": "KTV", "weight": 6}])
         self.assertEqual(data["activity_density"], "balanced")
         self.assertFalse(data["activity_pool_allow_custom"])
-        self.assertEqual(data["sleep_policy"], {"target_hours": 8})
-        self.assertIn("sleep_continuity", data["continuity"])
+        self.assertNotIn("sleep_policy", data)
+        self.assertNotIn("previous_sleep_minutes", data["continuity"])
+        self.assertNotIn("suggested_wake_not_before", data["continuity"])
+        self.assertNotIn("accumulated_sleep_debt_minutes", data["continuity"])
 
-    async def test_sleep_continuity_calculates_exact_100_minutes_and_1020_wake(self):
+    async def test_previous_sleep_remains_descriptive_without_wake_or_debt_derivation(self):
         previous_start = self.start - timedelta(days=1)
-        previous_end = self.start
         self.service._plans()[previous_start.isoformat()] = {
-            "status": "complete", "life_day_start": previous_start.isoformat(),
-            "life_day_end": previous_end.isoformat(), "daily_theme": "late night",
+            "status": "complete", "planner_version": "0.8.2",
+            "life_day_start": previous_start.isoformat(), "life_day_end": self.start.isoformat(),
+            "daily_theme": "夜生活", "daily_style": "随性",
             "timeline": [{"id": "sleep", "kind": "NORMAL", "category": "sleep",
-                          "name": "睡觉", "state": "入睡", "start_at": "2026-10-09T02:20:00+08:00",
+                          "name": "睡觉", "state": "还在睡", "start_at": "2026-10-09T02:00:00+08:00",
                           "end_at": "2026-10-09T04:00:00+08:00"}],
         }
         data = await self._input()
-        sleep = data["continuity"]["sleep_continuity"]
-        self.assertTrue(sleep["continuous_sleep_at_boundary"])
-        self.assertEqual(sleep["continuous_sleep_start_at"], "2026-10-09T02:20:00+08:00")
-        self.assertEqual(sleep["sleep_minutes_before_boundary"], 100)
-        self.assertEqual(sleep["suggested_wake_not_before"], "2026-10-09T10:20:00+08:00")
-        self.assertTrue(sleep["recovery_sleep_needed"])
+        self.assertTrue(data["continuity"]["has_previous_life_day"])
+        self.assertEqual(data["continuity"]["previous_tail"][-1]["category"], "sleep")
+        self.assertFalse(data["continuity"]["previous_life_day_ended_awake"])
+        forbidden = {"sleep_policy", "sleep_continuity", "previous_sleep_minutes",
+                     "sleep_debt_minutes", "accumulated_sleep_debt_minutes",
+                     "suggested_wake_not_before", "recovery_sleep_needed",
+                     "sleep_minutes_before_boundary", "target_sleep_hours"}
+        self.assertFalse(forbidden.intersection(data))
+        self.assertFalse(forbidden.intersection(data["continuity"]))
 
-    async def test_previous_life_day_ending_awake_requests_recovery_sleep(self):
+    async def test_sleep_history_does_not_change_exact_protected_window(self):
         previous_start = self.start - timedelta(days=1)
         self.service._plans()[previous_start.isoformat()] = {
-            "status": "complete", "life_day_start": previous_start.isoformat(),
-            "life_day_end": self.start.isoformat(),
-            "timeline": [{"id": "late", "kind": "NORMAL", "category": "entertainment",
-                          "name": "聊天", "state": "还在聊天", "start_at": "2026-10-09T02:00:00+08:00",
+            "status": "complete", "planner_version": "0.8.2",
+            "life_day_start": previous_start.isoformat(), "life_day_end": self.start.isoformat(),
+            "timeline": [{"id": "sleep", "kind": "NORMAL", "category": "sleep",
+                          "name": "睡觉", "state": "睡觉", "start_at": "2026-10-09T02:00:00+08:00",
                           "end_at": "2026-10-09T04:00:00+08:00"}],
         }
-        data = await self._input()
-        sleep = data["continuity"]["sleep_continuity"]
-        self.assertTrue(sleep["previous_life_day_ended_awake"])
-        self.assertTrue(sleep["ended_awake_at_boundary"])
-        self.assertTrue(sleep["recovery_sleep_needed"])
-        self.assertEqual(sleep["suggested_wake_not_before"], "2026-10-09T12:00:00+08:00")
+        data = await self._input([window("2026-10-09T09:00:00+08:00", "2026-10-09T12:00:00+08:00")])
+        self.assertEqual([(row["start_at"], row["end_at"]) for row in data["protected_windows"]],
+                         [("2026-10-09T08:55:00+08:00", "2026-10-09T12:05:00+08:00")])
+        self.assertEqual(data["continuity"]["previous_tail"][-1]["category"], "sleep")
 
     async def test_no_history_explicitly_forbids_invented_previous_night(self):
         data = await self._input()
@@ -390,14 +388,23 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("没有可用的既往小满生命日历史", data["continuity"]["history_note"])
         self.assertIn("不得编造昨晚/前几天发生过的事实", prompt)
 
-    async def test_pacing_prompt_allows_idle_blocks_and_bridge_sleep_continuity(self):
+    async def test_pacing_prompt_encourages_sleep_and_rest_without_sleep_debt(self):
         data = await self._input()
         data["activity_density"] = "balanced"
         prompt = self.service._planner_prompt(data)
         self.assertIn("完整覆盖24小时不代表必须保持忙碌", prompt)
         self.assertIn("都可以是长 NORMAL 区块", prompt)
-        self.assertIn("保护窗 BRIDGE 可以继续同一段睡眠/休息/慢启动", prompt)
-        self.assertIn("continuity.accumulated_sleep_debt_minutes", prompt)
+        self.assertIn("正常生命日通常应包含一些睡眠或休息", prompt)
+        self.assertIn("睡眠只是普通生活事件", prompt)
+        self.assertIn("不要计算或补偿前一日睡眠时长", prompt)
+        self.assertIn("不要因为晚睡就推断必须晚起", prompt)
+        self.assertIn("不要因为上一生命日曾在睡觉就强制新生命日继续睡", prompt)
+
+    async def test_prompt_gives_protected_windows_structural_priority_over_sleep_history(self):
+        prompt = self.service._planner_prompt(await self._input())
+        self.assertIn("protected_windows 是结构性的规划锚点，优先级高于睡眠历史", prompt)
+        self.assertIn("睡眠历史绝不能占用、改变或使保护窗失效", prompt)
+        self.assertIn("不存在睡眠推导出的起床时间", prompt)
 
     async def test_prompt_distinguishes_free_sleep_from_mixed_protected_bridge(self):
         prompt = self.service._planner_prompt(await self._input())
@@ -405,8 +412,17 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("protected_window 的 BRIDGE 必须保持一个不可拆分的顶层事件", prompt)
         self.assertIn("睡眠→醒来→慢启动", prompt)
         self.assertIn("通常使用 category=mixed", prompt)
-        self.assertIn("不要为了避免 mixed 而提前叫醒小满", prompt)
-        self.assertIn("不得把一个 BRIDGE 拆成多个顶层事件", prompt)
+        self.assertIn("不得为了避免 mixed 而提前叫醒小满或把 BRIDGE 拆开", prompt)
+
+    async def test_sleep_normal_and_mixed_bridge_categories_are_accepted(self):
+        self.fish.windows = [window("2026-10-09T09:00:00+08:00", "2026-10-09T12:00:00+08:00")]
+        data = await self._input()
+        timeline = valid_response_for(data)["timeline"]
+        normal = next(row for row in timeline if row["kind"] == "NORMAL")
+        bridge = next(row for row in timeline if row["kind"] == "BRIDGE")
+        normal["category"] = "sleep"
+        bridge["category"] = "mixed"
+        self.assertTrue(self.service.validate_timeline(data, timeline)[0])
 
     async def test_new_plans_require_valid_category(self):
         data = await self._input()
@@ -777,7 +793,6 @@ class AdapterAndBridgeTests(unittest.TestCase):
             "allowlist_umos": [], "denylist_umos": [], "provider_id": "",
             "peak_guard_before_minutes": 5, "peak_guard_after_minutes": 5,
             "activity_pool_allow_custom": True, "activity_density": "balanced",
-            "sleep_target_hours": 8,
             "admin_regenerate_bypass_fat_fish": True, "poll_seconds": 15,
             "grace_seconds": 60, "planner_failure_retry_seconds": 1800,
             "max_message_chars": 80, "dry_run": False,
@@ -790,6 +805,7 @@ class AdapterAndBridgeTests(unittest.TestCase):
                 self.assertTrue(items[key].get("description"))
         self.assertNotIn("schema_version", items)
         self.assertNotIn("planner_version", items)
+        self.assertNotIn("sleep_target_hours", items)
         self.assertEqual(items["activity_pool"]["type"], "list")
         self.assertIn("密室逃脱,7", items["activity_pool"]["default"])
         self.assertEqual(items["activity_density"]["options"], ["relaxed", "balanced", "busy"])

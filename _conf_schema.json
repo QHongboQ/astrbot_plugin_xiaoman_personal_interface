@@ -16,7 +16,6 @@
       "activity_pool": {"type": "list", "description": "林小满偏好的具体活动及相对权重", "default": ["游乐园,5", "剧本杀,6", "密室逃脱,7", "电玩城,5", "KTV,6", "Livehouse,5", "夜店/Club,3", "朋友聚会,6", "生日局,4", "晚场电影,4", "夜市,5", "宵夜,6", "海边夜游,3", "短途旅行,2", "露营,2", "潜水/浮潜,1", "冲浪,1", "骑马,2", "卡丁车,3", "攀岩,3", "保龄球,3", "陶艺/手作,4", "古着店,4", "购物扫货,4", "朋友家打游戏,5", "宅家打游戏,5", "睡懒觉,6", "临时出门乱逛,5", "赶作品,4", "什么都不想干,4"], "hint": "每个列表项写‘活动名称,权重’，如‘密室逃脱,7’；不写权重默认1。解析最后一个逗号，权重限制为1–10。权重仅是相对偏好，不是概率。"},
       "activity_pool_allow_custom": {"type": "bool", "description": "允许规划器安排活动池以外的休闲/社交活动", "default": true, "hint": "关闭后主要休闲/社交活动应从活动池选择；世界观、日历事实和既有连续性仍优先。"},
       "activity_density": {"type": "string", "description": "生命日主要活动节奏", "options": ["relaxed", "balanced", "busy"], "labels": ["松弛", "均衡", "忙碌"], "default": "balanced", "hint": "松弛约1–2项主要活动，均衡约2–3项，忙碌约3–4项；仅为软目标，不为凑数制造事件。"},
-      "sleep_target_hours": {"type": "int", "description": "一般睡眠目标小时数", "default": 8, "hint": "安全范围4–12小时。它是规划目标而非硬性规则；前一生命日的睡眠不足会影响次日恢复与活动强度。"},
       "poll_seconds": {"type": "int", "description": "后台检查计划与待发送消息的间隔秒数", "default": 15, "hint": "最小按 1 秒处理；较短间隔会增加后台检查频率。"},
       "grace_seconds": {"type": "int", "description": "计划触发后的补发宽限秒数", "default": 60, "hint": "超过宽限期仍未成功投递的消息会过期，不再追发。"},
       "planner_failure_retry_seconds": {"type": "int", "description": "规划失败后的自动重试等待秒数", "default": 1800, "hint": "等待期内后台不会重复调用规划模型；负数按 0 处理，非法值回退到 1800 秒。"},

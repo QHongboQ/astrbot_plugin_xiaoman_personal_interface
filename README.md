@@ -31,19 +31,19 @@ send_xiaoman_photo()
 
 本版本不包含任何 TTS、语音提示、表演标签或 MiMo 逻辑。
 
-## 可选：林小满生命日规划器（v0.8.2）
+## 可选：林小满生命日规划器（v0.8.3）
 
 默认关闭。启用前请安装并启用 `time_awareness`，并配置可用的 LLM provider。**林小满拥有最终的生命日时间线**；TimeAwareness 仅作为只读时钟、动态生命日边界、工作日/节假日、世界观、人设开关、主题/风格池和可用天气等上下文来源。林小满不会读取或依赖 TimeAwareness 日程快照，不调用它的 AI 日程生成器，也不会修改其源码、配置或快照。
 
 每次生命日规划是一个全局 LLM 请求：先依据 `daily_schedule.ai_daily.generation_time` 生成从边界时刻到下一日同一边界的完整时间线，并在同一次响应中生成主题、风格和所有 NORMAL/高峰桥接消息。Fat Fish 仅提供只读有效高峰政策；规划器按 `peak_guard_before_minutes` / `peak_guard_after_minutes` 扩展保护窗口，再把完整自由窗与保护窗一起交给规划器。保护窗恰好对应一个 BRIDGE 活动。计划通过无缺口、无重叠、类别及消息完整性验证后，保存到 Xiaoman 独立的 `life_day_plans.json`。刷新与到点投递均不调用 LLM；发送失败目标在宽限期内重试，成功目标不会重复发送。
 
-v0.8.2 为 Xiaoman 规划器增加用户可编辑的加权 `activity_pool`、软性 `activity_density` 和 `sleep_target_hours`。近期已完成生命日会为规划器提供主要活动/类别、最后 2–3 个事件及睡眠连续性上下文；如果上一日 02:20 入睡并持续睡到 04:00 边界，8 小时睡眠目标会计算为边界前睡了 100 分钟、建议不早于 10:20 起床。活动密度不会强制填满空闲时间，较长睡眠作为独立 `category=sleep` 事件；保护窗 BRIDGE 也可以延续睡眠或慢启动。新计划所有 timeline 项都必须包含允许值内的 `category`，已有 v0.8.0/v0.8.1 无类别计划仍兼容。
+规划器提供用户可编辑的加权 `activity_pool` 和软性 `activity_density`。睡眠只是普通生活事件，用于自然节奏和避免全天高强度活动；Xiaoman 不按生理/医疗模型计算睡眠债、补偿时长或强制起床时间，也不会因为晚睡推导晚起。前一生命日历史仅提供轻量叙事与防重复线索，不会改变或占用 Fat Fish 保护窗。空闲窗内较长睡眠通常作为独立 `category=sleep` NORMAL；保护 BRIDGE 仍是一个不可拆分的顶层事件，若跨越睡眠、醒来和慢启动，通常用 `category=mixed`。新计划所有 timeline 项都必须包含允许值内的 `category`，已有 v0.8.0/v0.8.1 无类别计划仍兼容。
 
-所有 Xiaoman 自有的可调项都在插件齿轮配置页的“生命日规划与主动播报”组中：`enable`、`send_groups`、`send_private`、`allowlist_umos`、`denylist_umos`、`provider_id`、`peak_guard_before_minutes`、`peak_guard_after_minutes`、`activity_pool`、`activity_pool_allow_custom`、`activity_density`、`sleep_target_hours`、`admin_regenerate_bypass_fat_fish`、`poll_seconds`、`grace_seconds`、`planner_failure_retry_seconds`、`max_message_chars`、`dry_run` 和 `planner_prompt`。活动池每项格式为 `活动名称,权重`，例如 `密室逃脱,7`；权重范围限制为 1–10，不写权重默认 1，权重只表示相对偏好。`activity_density` 可选 `relaxed`（约1–2项主要活动）、`balanced`（约2–3项）或 `busy`（约3–4项），均为软目标；`sleep_target_hours` 安全限制在 4–12 小时。即使时间线完整覆盖24小时，也允许长时间休息、睡觉、宅家或无安排。只使用 AstrBot 已有会话，不枚举 QQ 群/好友。旧的 `schedule_broadcast_state.json` 会保留为 legacy 文件，不会被误当成 v0.8 生命日计划迁移。
+所有 Xiaoman 自有的可调项都在插件齿轮配置页的“生命日规划与主动播报”组中：`enable`、`send_groups`、`send_private`、`allowlist_umos`、`denylist_umos`、`provider_id`、`peak_guard_before_minutes`、`peak_guard_after_minutes`、`activity_pool`、`activity_pool_allow_custom`、`activity_density`、`admin_regenerate_bypass_fat_fish`、`poll_seconds`、`grace_seconds`、`planner_failure_retry_seconds`、`max_message_chars`、`dry_run` 和 `planner_prompt`。活动池每项格式为 `活动名称,权重`，例如 `密室逃脱,7`；权重范围限制为 1–10，不写权重默认 1，权重只表示相对偏好。`activity_density` 可选 `relaxed`（约1–2项主要活动）、`balanced`（约2–3项）或 `busy`（约3–4项），均为软目标。即使时间线完整覆盖24小时，也允许长时间休息、睡觉、宅家或无安排；睡眠时长和起床时间由规划器自由选择，不建模睡眠债或必须起床时间。只使用 AstrBot 已有会话，不枚举 QQ 群/好友。旧的 `schedule_broadcast_state.json` 会保留为 legacy 文件，不会被误当成 v0.8 生命日计划迁移。
 
 三个插件配置页各自是其所属设置的唯一来源：
 
-- Xiaoman 齿轮配置控制小满自己的目标筛选、发送范围、保护分钟数、活动偏好/密度、睡眠目标、规划重试、文案限制、dry-run 和管理员手动重规划开关。
+- Xiaoman 齿轮配置控制小满自己的目标筛选、发送范围、保护分钟数、活动偏好/密度、规划重试、文案限制、dry-run 和管理员手动重规划开关；睡眠时长不作为配置或硬约束。
 - TimeAwareness 齿轮配置控制生命日边界 `daily_schedule.ai_daily.generation_time`、worldview、人设开关、主题/风格池、天气与近期历史窗口（`adaptive.recent_days` / continuity）；Xiaoman 只读这些上下文，不复制成自己的配置。
 - Fat Fish 齿轮配置控制 `enabled`、timezone、高峰时段/星期、provider 范围、`manual_override` 和 `admins_bypass`；Xiaoman 通过 v1.1.1 的公开 `fish.config` 只读这些值，不调用私有方法、不修改配置。
 
