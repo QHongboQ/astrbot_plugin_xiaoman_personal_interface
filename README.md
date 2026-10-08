@@ -31,11 +31,11 @@ send_xiaoman_photo()
 
 本版本不包含任何 TTS、语音提示、表演标签或 MiMo 逻辑。
 
-## 可选：林小满生命日规划器（v0.9.0）
+## 可选：林小满生命日规划器（v0.9.1）
 
 默认关闭。启用前请安装并启用 `time_awareness`，并配置可用的 LLM provider。**林小满拥有最终的生命日时间线**；TimeAwareness 仅作为只读时钟、动态生命日边界、工作日/节假日、世界观、人设开关、主题/风格池和可用天气等上下文来源。林小满不会读取或依赖 TimeAwareness 日程快照，不调用它的 AI 日程生成器，也不会修改其源码、配置或快照。
 
-每次生命日规划是一个全局 LLM 请求。v0.9.0 将语义规划与机械时间线结构分开：LLM 决定活动内容与顺序、每个自由窗内的相对持续时间权重、状态和播报文案；Python 按 `daily_schedule.ai_daily.generation_time` 确定性构造时间戳、NORMAL/BRIDGE 类型、时间线 ID、保护窗边界和完整无缝覆盖。Fat Fish 仅提供只读有效高峰政策；规划器按 `peak_guard_before_minutes` / `peak_guard_after_minutes` 扩展保护窗口，再把自由窗与保护窗交给 LLM。每个 Fxx 自由窗必须返回有序语义活动列表，每个 Pxx 保护窗必须返回一个 BRIDGE 语义对象。权重是窗内相对时长，不是概率；Python 保证正时长并按最大余数法分配分钟。
+每次生命日规划是一个全局 LLM 请求。v0.9.0 将语义规划与机械时间线结构分开：LLM 决定活动内容与顺序、每个自由窗内的相对持续时间权重、状态和播报文案；Python 按 `daily_schedule.ai_daily.generation_time` 确定性构造时间戳、NORMAL/BRIDGE 类型、时间线 ID、保护窗边界和完整无缝覆盖。v0.9.1 仅细化 Planner 提示，减少把短转场和支持动作拆成独立阶段的情况，不改变时间线算法或验证规则。Fat Fish 仅提供只读有效高峰政策；规划器按 `peak_guard_before_minutes` / `peak_guard_after_minutes` 扩展保护窗口，再把自由窗与保护窗交给 LLM。每个 Fxx 自由窗必须返回有序语义活动列表，每个 Pxx 保护窗必须返回一个 BRIDGE 语义对象。权重是窗内相对时长，不是概率；Python 保证正时长并按最大余数法分配分钟。
 
 最终生成的 NORMAL / BRIDGE timeline 与 v0.8.x 持久化格式兼容，`SCHEMA_VERSION` 仍为 2，已有计划不会迁移或重写。对于缺失、空白或超限播报文案，Python 仅按已生成的活动名称提供确定性、有长度上限的兜底，不修改有效消息，也不会进行语义修复或额外 LLM 调用。最终时间线仍通过完整覆盖、无缺口/重叠、类别、边界及消息验证后保存到 Xiaoman 独立的 `life_day_plans.json`。刷新与到点投递均不调用 LLM；发送失败目标在宽限期内重试，成功目标不会重复发送。
 
