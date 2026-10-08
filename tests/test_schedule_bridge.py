@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import sys
 import tempfile
@@ -492,7 +493,7 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         result = await self.service.generate_life_day(self.start)
         self.assertEqual(result["status"], "generated")
         self.assertEqual(len(self.context.llm_calls), 1)
-        self.assertEqual(result["plan"]["planner_version"], "0.10.0")
+        self.assertEqual(result["plan"]["planner_version"], "0.10.1")
         self.assertEqual(result["plan"]["schema_version"], 2)
         for row in result["plan"]["timeline"]:
             self.assertTrue({"id", "kind", "category", "start_at", "end_at", "name", "state"}.issubset(row))
@@ -1292,6 +1293,61 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(simulated["success_count"], 1)
         self.assertEqual(len(self.context.sent), 1)
         self.assertFalse(plan["deliveries"][0]["sent"])
+
+    async def test_simulation_resets_expired_delivery_only_in_isolated_copy(self):
+        trigger = self.start + timedelta(hours=8, minutes=5)
+        event = {"id": "bridge-exit-1205", "trigger_at": trigger.isoformat(),
+                 "message": "离开活动", "sent": False, "expired": True,
+                 "delivered_umos": ["qq:FriendMessage:old"], "dry_run_logged": True}
+        plan = {"timezone": "Asia/Shanghai", "deliveries": [event],
+                "timeline": [{"id": "bridge", "kind": "BRIDGE"}]}
+        self.service._plans()[self.start.isoformat()] = plan
+        before = copy.deepcopy(plan)
+
+        result, error = await self.service.simulate_time("12:05", self.start)
+
+        self.assertFalse(error)
+        self.assertEqual(result["hit_event_ids"], ["bridge-exit-1205"])
+        self.assertEqual(result["success_count"], 1)
+        self.assertEqual(len(self.context.sent), 1)
+        self.assertEqual(plan, before)
+
+    async def test_simulation_retries_previously_sent_event_repeatably_without_persistence(self):
+        trigger = self.start + timedelta(hours=8, minutes=5)
+        event = {"id": "already-sent", "trigger_at": trigger.isoformat(),
+                 "message": "重复模拟", "sent": True, "expired": False,
+                 "delivered_umos": ["qq:FriendMessage:one"], "dry_run_logged": True}
+        plan = {"timezone": "Asia/Shanghai", "deliveries": [event]}
+        self.service._plans()[self.start.isoformat()] = plan
+        before = copy.deepcopy(plan)
+
+        first, first_error = await self.service.simulate_time("12:05", self.start)
+        second, second_error = await self.service.simulate_time("12:05", self.start)
+
+        self.assertFalse(first_error)
+        self.assertFalse(second_error)
+        self.assertEqual(first["success_count"], 1)
+        self.assertEqual(second["success_count"], 1)
+        self.assertEqual([umo for umo, _ in self.context.sent], [
+            "qq:FriendMessage:one", "qq:FriendMessage:one"])
+        self.assertEqual(plan, before)
+
+    async def test_simulation_expires_earlier_events_only_in_isolated_copy(self):
+        early = {"id": "early", "trigger_at": (self.start + timedelta(hours=6)).isoformat(),
+                 "message": "早些时候", "sent": False, "expired": False, "delivered_umos": []}
+        exact = {"id": "exact-1205", "trigger_at": (self.start + timedelta(hours=8, minutes=5)).isoformat(),
+                 "message": "正好触发", "sent": False, "expired": False, "delivered_umos": []}
+        plan = {"timezone": "Asia/Shanghai", "deliveries": [early, exact]}
+        self.service._plans()[self.start.isoformat()] = plan
+        before = copy.deepcopy(plan)
+
+        result, error = await self.service.simulate_time("12:05", self.start)
+
+        self.assertFalse(error)
+        self.assertEqual(result["expired_event_ids"], ["early"])
+        self.assertEqual(result["hit_event_ids"], ["exact-1205"])
+        self.assertEqual(result["success_count"], 1)
+        self.assertEqual(plan, before)
 
     async def test_partial_failure_retries_and_false_is_failure(self):
         self.context.rows = [types.SimpleNamespace(user_id="x:FriendMessage:a", platform_id="x"),

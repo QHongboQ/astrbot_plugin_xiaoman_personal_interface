@@ -280,7 +280,7 @@ async def verify_schedule_bridge_public_contract():
     assert runtime_context.llm_calls[0][2] is None
     assert runtime_context.llm_calls[0][3] == "runtime dict persona"
     assert service.current_plan(clock)["timeline"][0]["name"] == "休息"
-    assert service.current_plan(clock)["planner_version"] == "0.10.0"
+    assert service.current_plan(clock)["planner_version"] == "0.10.1"
     assert service.current_plan(clock)["schema_version"] == 2
     assert {"id", "kind", "start_at", "end_at"}.issubset(service.current_plan(clock)["timeline"][0])
     call_count = len(runtime_context.llm_calls)

@@ -14,7 +14,7 @@ from astrbot.api import logger
 from .fat_fish_bridge import FatFishBridge
 from .time_awareness_adapter import TimeAwarenessAdapter
 
-PLANNER_VERSION = "0.10.0"
+PLANNER_VERSION = "0.10.1"
 SCHEMA_VERSION = 2
 DAILY_THEME_MAX_CHARS = 60
 DAILY_STYLE_MAX_CHARS = 40
@@ -954,6 +954,11 @@ class ScheduleBroadcastService:
         if not plan:
             return None, "当前 life day 没有已生成计划。"
         isolated = copy.deepcopy(plan)
+        for event in isolated.get("deliveries", []):
+            event["sent"] = False
+            event["expired"] = False
+            event["delivered_umos"] = []
+            event.pop("dry_run_logged", None)
         result = await self.send_due(simulated, plans=[isolated], force_send=True)
         result["simulated_at"] = simulated.isoformat()
         if not result["hit_event_ids"] and not result["expired_event_ids"]:
