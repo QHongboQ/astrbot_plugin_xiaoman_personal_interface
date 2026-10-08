@@ -246,7 +246,7 @@ async def verify_schedule_bridge_public_contract():
             free = planner_input["free_windows"][0]
             return types.SimpleNamespace(completion_text=json.dumps({
                 "daily_theme": "runtime theme", "daily_style": "runtime style",
-                "timeline": [{"id": "N01", "kind": "NORMAL", "start_at": free["start_at"],
+                "timeline": [{"id": "N01", "kind": "NORMAL", "category": "rest", "start_at": free["start_at"],
                     "end_at": free["end_at"], "name": "休息", "state": "在家休息",
                     "broadcast_message": "今天先按自己的节奏休息。"}]}, ensure_ascii=False))
 
