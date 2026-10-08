@@ -88,35 +88,36 @@ class FatFishBridge:
 
     def _provider_matches(self, provider_id, terms, gate_unknown):
         terms = str(terms or "").strip()
+        provider = None
+        if provider_id:
+            try:
+                provider = self.context.get_provider_by_id(provider_id)
+            except Exception:
+                provider = None
+        provider_resolved = provider is not None
         if not terms:
-            return False
+            return False, provider_resolved
         if terms == "*":
-            return True
+            return True, provider_resolved
         keywords = [item.strip().lower() for item in terms.split(",") if item.strip()]
         if not keywords:
-            return False
-        if not provider_id:
-            return bool(gate_unknown)
-        try:
-            provider = self.context.get_provider_by_id(provider_id)
-        except Exception:
-            provider = None
+            return False, provider_resolved
         if provider is None:
-            return bool(gate_unknown)
+            return bool(gate_unknown), False
         try:
             meta = provider.meta()
             haystack = " ".join(str(getattr(meta, key, "") or "")
                                 for key in ("id", "model", "type")).lower()
         except Exception:
-            return bool(gate_unknown)
-        return any(term in haystack for term in keywords)
+            return bool(gate_unknown), False
+        return any(term in haystack for term in keywords), provider_resolved
 
     def _policy(self, fish, at, provider_id, day_kind):
         if fish is None:
             return {"found": False, "enabled": False, "timezone": "Asia/Shanghai",
                     "manual_override": "auto", "provider_affected": False,
                     "peak_periods": "", "peak_weekdays": "", "state": "missing",
-                    "allowed": True, "day_kind": day_kind}
+                    "allowed": True, "admins_bypass": True, "day_kind": day_kind}
         config = getattr(fish, "config", None)
         enabled = bool(_config_value(config, "enabled", True))
         timezone_name = str(_config_value(config, "timezone", "Asia/Shanghai") or "Asia/Shanghai")
@@ -130,9 +131,10 @@ class FatFishBridge:
         else:
             at = at.astimezone(zone)
         override = str(_config_value(config, "manual_override", "auto") or "auto")
+        admins_bypass = bool(_config_value(config, "admins_bypass", True))
         peak_periods = str(_config_value(config, "peak_periods", "09:00-12:00,14:00-18:30") or "")
         peak_weekdays = str(_config_value(config, "peak_weekdays", "0,1,2,3,4,5,6") or "")
-        provider_affected = self._provider_matches(
+        provider_affected, provider_resolved = self._provider_matches(
             provider_id,
             _config_value(config, "affected_providers", "deepseek"),
             _config_value(config, "gate_when_provider_unknown", True),
@@ -156,6 +158,7 @@ class FatFishBridge:
         return {"found": True, "enabled": enabled, "timezone": timezone_name,
                 "manual_override": override, "provider_affected": provider_affected,
                 "peak_periods": peak_periods, "peak_weekdays": peak_weekdays,
+                "admins_bypass": admins_bypass, "provider_resolved": provider_resolved,
                 "state": state, "allowed": allowed, "day_kind": day_kind,
                 "evaluated_at": at}
 

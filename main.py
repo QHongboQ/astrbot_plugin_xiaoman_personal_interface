@@ -69,6 +69,10 @@ class Main(Star):
                 f"TimeAwareness={state['time_awareness_available']}\n"
                 f"Fat Fish effective peaks={fmt(state['fat_fish_peaks'])}\n"
                 f"protected={fmt(state['protected_windows'])}\nfree={fmt(state['free_windows'])}\n"
+                f"guards={state['peak_guard_before_minutes']}m/{state['peak_guard_after_minutes']}m "
+                f"admin_regenerate_bypass={state['admin_regenerate_bypass_fat_fish']} "
+                f"fat_fish_admins_bypass={state['fat_fish_admins_bypass']} "
+                f"dry_run={state['dry_run']}\n"
                 f"current_plan={state['current_plan_status']} next_plan={state['next_plan_status']}\n"
                 f"next_broadcast={(next_broadcast or {}).get('trigger_at', '无')}\n"
                 f"last_planner_error={state['last_planner_error'] or '无'}")
@@ -78,9 +82,13 @@ class Main(Star):
             if which not in {"current", "next", "cycle"}:
                 yield event.plain_result("用法：/xiaoman_broadcast regenerate current|next|cycle")
                 return
-            results = await service.regenerate(which, now)
+            # This handler is ADMIN-only. The service still requires both
+            # Xiaoman's and Fat Fish's bypass settings before bypassing a gate.
+            results = await service.regenerate(which, now, allow_wallet_bypass=True)
             yield event.plain_result("\n".join(
-                f"{item.get('status')}: {item.get('reason', item.get('start_at', ''))}" for item in results))
+                f"{item.get('status')}: {item.get('reason', item.get('start_at', ''))}"
+                f"{'; admin wallet bypass used' if item.get('wallet_bypass_used') else ''}"
+                for item in results))
             return
         if action == "refresh":
             changed = await service.refresh()

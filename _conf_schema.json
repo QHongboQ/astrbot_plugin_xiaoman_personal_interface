@@ -2,21 +2,23 @@
   "schedule_broadcast": {
     "type": "object",
     "description": "林小满生命日规划与主动播报",
-    "hint": "TimeAwareness 只提供只读日历、时区与世界观上下文；林小满独立规划并保存从配置边界到次日边界的完整时间线。",
+    "hint": "TimeAwareness 提供生命日边界、日历和创作上下文；Fat Fish 提供高峰策略；本组只控制小满自己的规划与播报。",
     "items": {
-      "enable": {"type": "bool", "description": "启用日程广播", "default": false},
-      "send_groups": {"type": "bool", "description": "发送到群聊", "default": true},
-      "send_private": {"type": "bool", "description": "发送到私聊", "default": true},
-      "allowlist_umos": {"type": "list", "description": "目标 UMO 允许列表（为空不额外限制）", "default": []},
-      "denylist_umos": {"type": "list", "description": "拒绝的 UMO（始终优先）", "default": []},
-      "provider_id": {"type": "string", "description": "模型提供商（留空则从首个会话解析）", "_special": "select_provider", "default": ""},
-      "peak_guard_before_minutes": {"type": "int", "description": "Fat Fish 高峰前保护分钟数", "default": 5},
-      "peak_guard_after_minutes": {"type": "int", "description": "Fat Fish 高峰后保护分钟数", "default": 5},
-      "poll_seconds": {"type": "int", "description": "日程检查间隔（秒）", "default": 15},
-      "grace_seconds": {"type": "int", "description": "发送宽限期（秒）", "default": 60},
-      "max_message_chars": {"type": "int", "description": "消息最大字符数", "default": 80},
-      "dry_run": {"type": "bool", "description": "仅预览，不发送", "default": false},
-      "planner_prompt": {"type": "text", "description": "生活日规划补充指令", "default": "尊重给定世界观、主题池和近期生活日历史；一天要有真实变化，也允许休息和宅家。"}
+      "enable": {"type": "bool", "description": "启用林小满生命日规划与主动播报", "default": false, "hint": "关闭时不生成计划或自动播报。"},
+      "send_groups": {"type": "bool", "description": "允许向已有群聊会话播报", "default": true, "hint": "不会主动枚举或添加新的群。"},
+      "send_private": {"type": "bool", "description": "允许向已有私聊会话播报", "default": true},
+      "allowlist_umos": {"type": "list", "description": "只允许向这些 UMO 会话播报", "default": [], "hint": "留空表示不启用额外允许名单；非空时仅名单内会话可收消息。"},
+      "denylist_umos": {"type": "list", "description": "禁止接收播报的 UMO 会话", "default": [], "hint": "拒绝名单优先于允许名单；同一 QQ 群的会话别名也会一并拒绝。"},
+      "provider_id": {"type": "string", "description": "生命日规划使用的模型提供商", "_special": "select_provider", "default": "", "hint": "留空时从首个符合播报设置的会话解析提供商。"},
+      "peak_guard_before_minutes": {"type": "int", "description": "Fat Fish 自动高峰开始前的额外保护分钟数", "default": 5, "hint": "例如 09:00 高峰、提前保护 5 分钟，则规划保护窗从 08:55 开始。"},
+      "peak_guard_after_minutes": {"type": "int", "description": "Fat Fish 自动高峰结束后的额外保护分钟数", "default": 5, "hint": "例如 12:00 高峰、延后保护 5 分钟，则规划保护窗到 12:05 结束。"},
+      "admin_regenerate_bypass_fat_fish": {"type": "bool", "description": "允许管理员手动重新生成时申请绕过 Fat Fish 高峰拦截", "default": true, "hint": "只有本项与 Fat Fish 的 admins_bypass 同时开启才生效；仅手动命令可用，自动规划始终遵守拦截。"},
+      "poll_seconds": {"type": "int", "description": "后台检查计划与待发送消息的间隔秒数", "default": 15, "hint": "最小按 1 秒处理；较短间隔会增加后台检查频率。"},
+      "grace_seconds": {"type": "int", "description": "计划触发后的补发宽限秒数", "default": 60, "hint": "超过宽限期仍未成功投递的消息会过期，不再追发。"},
+      "planner_failure_retry_seconds": {"type": "int", "description": "规划失败后的自动重试等待秒数", "default": 1800, "hint": "等待期内后台不会重复调用规划模型；负数按 0 处理，非法值回退到 1800 秒。"},
+      "max_message_chars": {"type": "int", "description": "每条预生成播报文案的最大字符数", "default": 80, "hint": "同时用于提示词要求和计划结果校验，最小按 1 个字符处理。"},
+      "dry_run": {"type": "bool", "description": "启用自动播报预览模式", "default": false, "hint": "开启后自动到点只记录预览、不发消息；管理员显式运行 simulate 仍可进行一次真实投递测试。"},
+      "planner_prompt": {"type": "text", "description": "补充林小满生命日规划要求", "default": "尊重给定世界观、主题池和近期生活日历史；一天要有真实变化，也允许休息和宅家。", "hint": "这是对 TimeAwareness 世界观、主题和风格设置的补充，不会替代它们。"}
     }
   }
 }
