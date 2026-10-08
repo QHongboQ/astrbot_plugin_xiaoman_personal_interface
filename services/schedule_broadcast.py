@@ -209,11 +209,20 @@ class ScheduleBroadcastService:
         return any(cls._configured_group_id(old_umo, platform_name) == group_id for old_umo in delivered)
 
     async def read_schedule(self, targets, *, at=None):
-        configured = str(self._get("schedule_source_umo", "") or "").strip()
-        session = configured or (targets[0] if targets else "")
+        session = self.schedule_source_session(targets)
         if not session:
             return None
         return await self.day_adapter.get_daily_schedule(session, at=at, allow_generate=False)
+
+    def schedule_source_session(self, targets):
+        """Resolve the shared TimeAwareness Persona source, not the invoking admin chat."""
+        configured = str(self._get("schedule_source_umo", "") or "").strip()
+        return configured or (targets[0] if targets else "")
+
+    async def regeneration_source_session(self, admin_umo=None):
+        # Deliberately ignore admin_umo: raw/read_schedule uses the configured source
+        # or first eligible target, so regeneration must target that same Persona.
+        return self.schedule_source_session(await self.targets())
 
     async def _provider(self, targets):
         provider = str(self._get("provider_id", "") or "")
@@ -263,13 +272,7 @@ class ScheduleBroadcastService:
 
     @staticmethod
     def _is_peak_state(policy):
-        return bool(
-            policy.get("found")
-            and policy.get("enabled")
-            and policy.get("provider_affected")
-            and policy.get("manual_override", "auto") == "auto"
-            and policy.get("state") == "peak"
-        )
+        return FatFishBridge.is_effective_peak(policy)
 
     def _peak_windows(self, local_date, timezone, day_kind, provider_id):
         if day_kind not in {"workday", "adjusted"}:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import asyncio
 
 TIME_AWARENESS_NAME = "time_awareness"
 
@@ -95,6 +96,15 @@ class TimeAwarenessAdapter:
             "end": start + timedelta(days=1),
         }
 
+    def rolling_day_dates(self, at: datetime | None = None) -> list:
+        window = self.rolling_day_window(at)
+        day, last = window["start"].date(), (window["end"] - timedelta(microseconds=1)).date()
+        dates = []
+        while day <= last:
+            dates.append(day)
+            day += timedelta(days=1)
+        return dates
+
     def get_day_policy(self, at: datetime | None = None) -> dict:
         plugin = self.discover()
         if plugin is None:
@@ -110,6 +120,46 @@ class TimeAwarenessAdapter:
         except Exception:
             return {"available": False, "kind": "unknown", "label": "", "evaluated_at": at}
 
+    @staticmethod
+    def _context_time(now: datetime, target_date):
+        return now if target_date == now.date() else datetime.combine(
+            target_date, datetime.min.time(), tzinfo=now.tzinfo
+        )
+
+    async def regenerate_date(self, session: str, target_date, *, timeout: float = 90.0) -> dict:
+        """Force generation through TimeAwareness and wait for its new ready snapshot."""
+        plugin = self.discover()
+        if plugin is None:
+            return {"date": target_date.isoformat(), "status": "failed", "reason": "TimeAwareness unavailable"}
+        try:
+            service = plugin.daily_schedule_service
+            now = plugin.time_context.now()
+            context_now = self._context_time(now, target_date)
+            persona_hash = await service.register_session_async(session, trigger=False)
+            if not persona_hash:
+                return {"date": target_date.isoformat(), "status": "failed", "reason": "Persona unavailable"}
+            old = service.get_snapshot_for_session(session, now=context_now)
+            old_id = str(old.get("snapshot_id", "")) if isinstance(old, dict) else ""
+            previous_failure = service.get_failure_for_session(session, now=context_now)
+            previous_failure = dict(previous_failure) if isinstance(previous_failure, dict) else None
+            queued = bool(service.queue_generation(session, force=True, target_date=target_date))
+            deadline = asyncio.get_running_loop().time() + max(0.0, timeout)
+            while asyncio.get_running_loop().time() < deadline:
+                snapshot = service.get_snapshot_for_session(session, now=context_now)
+                new_id = str(snapshot.get("snapshot_id", "")) if isinstance(snapshot, dict) else ""
+                if new_id and new_id != old_id and snapshot.get("status") == "ready":
+                    return {"date": target_date.isoformat(), "status": "regenerated", "old_id": old_id,
+                            "new_id": new_id, "slot_count": len(snapshot.get("slots", []))}
+                failure = service.get_failure_for_session(session, now=context_now)
+                if isinstance(failure, dict) and failure != previous_failure:
+                    return {"date": target_date.isoformat(), "status": "failed", "old_id": old_id,
+                            "reason": str(failure.get("error_type", "generation failed"))}
+                await asyncio.sleep(0.5)
+            return {"date": target_date.isoformat(), "status": "timeout", "old_id": old_id,
+                    "reason": (f"no new ready snapshot within {timeout:g}s" if queued else
+                               f"request was not queued and no in-flight result appeared within {timeout:g}s")}
+        except Exception as exc:
+            return {"date": target_date.isoformat(), "status": "failed", "reason": str(exc) or type(exc).__name__}
     async def get_daily_schedule(self, session: str, *, at: datetime | None = None,
                                  allow_generate: bool = False) -> dict | None:
         if allow_generate or not session:
