@@ -393,6 +393,12 @@ class ScheduleBroadcastService:
             for kind, trigger in (("PEAK_START", window["cover_start"]), ("PEAK_END", window["cover_end"])):
                 if trigger + timedelta(seconds=int(self._get("grace_seconds", 60))) < now.astimezone(_zone(timezone)):
                     continue
+                event_context = dict(context)
+                event_context["trigger_at"] = trigger.isoformat()
+                event_context.update(self._peak_temporal_context(
+                    schedule, local_date, timezone, trigger,
+                    window["peak_start"], window["peak_end"], kind,
+                ))
                 entries.append({
                     "id": f"{cover_id}-{kind}",
                     "kind": kind,
@@ -404,7 +410,7 @@ class ScheduleBroadcastService:
                     "message": "",
                     "sent": False,
                     "delivered_umos": [],
-                    "activity_context": context,
+                    "activity_context": event_context,
                 })
         entries.sort(key=lambda item: item["trigger_at"])
         return entries
@@ -468,6 +474,8 @@ class ScheduleBroadcastService:
                 "name": name, "state": state,
                 "start": str(slot.get("start", "")),
                 "end": str(slot.get("end", "")),
+                "start_at": activity_start.isoformat(),
+                "end_at": activity_end.isoformat(),
                 "overlap_minutes": max(1, int(overlap_seconds // 60)),
             }))
 
@@ -475,6 +483,63 @@ class ScheduleBroadcastService:
         chosen = sorted(candidates, key=lambda item: (-item[0], item[1]))[:limit]
         chosen.sort(key=lambda item: item[1])
         return [item[2] for item in chosen]
+
+    def _peak_temporal_context(self, schedule, local_date, timezone, trigger, peak_start, peak_end, kind):
+        """Classify source schedule slots relative to this message's actual trigger."""
+        zone = _zone(timezone)
+        active, completed, upcoming = [], [], []
+        for slot in schedule.get("slots", []):
+            if not isinstance(slot, dict):
+                continue
+            start, start_next_day = self._clock(slot.get("start"))
+            end, end_next_day = self._clock(slot.get("end"))
+            if start is None or end is None:
+                continue
+            start_at = datetime.combine(local_date + timedelta(days=int(start_next_day)), start, tzinfo=zone)
+            end_at = datetime.combine(local_date + timedelta(days=int(end_next_day)), end, tzinfo=zone)
+            if not end_next_day and end_at <= start_at:
+                end_at += timedelta(days=1)
+            if end_at <= start_at:
+                continue
+            item = {
+                "name": str(slot.get("name", "")), "state": str(slot.get("state", "")),
+                "start": str(slot.get("start", "")), "end": str(slot.get("end", "")),
+                "start_at": start_at.isoformat(), "end_at": end_at.isoformat(),
+            }
+            if start_at <= trigger < end_at:
+                active.append(item)
+            if start_at < peak_end and end_at > peak_start and end_at <= trigger:
+                completed.append(item)
+            if start_at > trigger and start_at < peak_end:
+                upcoming.append(item)
+
+        # At peak end, offer only the nearest upcoming real slot outside this peak.
+        if kind == "PEAK_END" and not upcoming:
+            later = []
+            for slot in schedule.get("slots", []):
+                if not isinstance(slot, dict):
+                    continue
+                start, next_day = self._clock(slot.get("start"))
+                if start is None:
+                    continue
+                start_at = datetime.combine(local_date + timedelta(days=int(next_day)), start, tzinfo=zone)
+                if start_at > trigger:
+                    later.append((start_at, slot))
+            if later:
+                start_at, slot = min(later, key=lambda item: item[0])
+                end, end_next_day = self._clock(slot.get("end"))
+                end_at = (datetime.combine(local_date + timedelta(days=int(end_next_day)), end, tzinfo=zone)
+                          if end is not None else None)
+                upcoming.append({
+                    "name": str(slot.get("name", "")), "state": str(slot.get("state", "")),
+                    "start": str(slot.get("start", "")), "end": str(slot.get("end", "")),
+                    "start_at": start_at.isoformat(), "end_at": end_at.isoformat() if end_at else "",
+                })
+        return {
+            "active_at_trigger": active,
+            "completed_before_trigger": completed,
+            "upcoming_after_trigger": upcoming[:3],
+        }
 
     def _prompt_lines(self, entries, schedule, day_kind):
         lines = []
@@ -498,6 +563,10 @@ class ScheduleBroadcastService:
             "晚间和凌晨遇到真实的看电影、夜市、演出、宵夜、朋友聚会、游戏等活动时，可更兴奋、好奇、爱玩一点；"
             "不要默认23点就必须睡觉，也绝不能为制造夜生活而补造日程中没有的活动。"
             "PEAK_START 与同 activity_id 的 PEAK_END 共享同一份事实：开始说将去/开始做什么，结束说这件事做完了。"
+            "PEAK_START 必须依据 activity_context.trigger_at 先描述 active_at_trigger 中的当前现实，再用将来时预告 upcoming_after_trigger 中1–3件相关活动；"
+            "不得把 upcoming_after_trigger 中的事写成已经发生、正在发生或已经到达目的地。若当前仍在睡觉，应明确还在睡/暂时不在线，可简短预告下一项真实安排。"
+            "PEAK_END 只能把 completed_before_trigger 中的事情说成已完成；active_at_trigger 仍在进行的事情只能说正在做，upcoming_after_trigger 只能用将来时。"
+            "严格区分浏览、看、逛与购买：日程写翻看/浏览贴纸或耳饰，绝不表示买了；看展不能补成展览评价，逛完不能擅自说准备回家。"
             "若 primary_activity 存在，以该活动为主；primary_activity 的 duration_minutes 必须与 peak_duration_minutes 相称，不要把短暂子活动说成覆盖整个高峰。"
             "若 primary_activity 为 null 但 activity_outline 非空，按 outline 的真实时间顺序概括几件相连的事，"
             "例如先上课后去看展，不能假装它们是一项持续数小时的活动；前后两条消息必须对应这段真实行程。"

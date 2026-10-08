@@ -576,6 +576,48 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1–3件最能解释这段时间为何不在线的实质活动", prompt)
         self.assertIn("不要把刷手机、发呆、普通吃饭这类短暂过渡", prompt)
 
+    def test_peak_temporal_context_exact_future_slots_are_not_current_or_completed(self):
+        from datetime import timezone, timedelta
+        date=datetime(2026,10,9).date()
+        zone=timezone(timedelta(hours=8))
+        raw={"local_date":str(date),"snapshot_id":"temporal-regression","slots":[
+            {"start":"01:30","end":"09:20","name":"睡觉","state":"入睡"},
+            {"start":"09:20","end":"10:10","name":"赖床刷手机","state":"在床上刷手机"},
+            {"start":"10:10","end":"11:00","name":"出门准备","state":"洗漱换衣准备出门"},
+            {"start":"11:00","end":"13:00","name":"上午闲逛","state":"咖啡店坐坐，浏览贴纸和耳饰"},
+            {"start":"14:00","end":"15:00","name":"散步","state":"出去走走"},
+        ]}
+        start=datetime(2026,10,9,9,0,tzinfo=zone)
+        end=datetime(2026,10,9,12,0,tzinfo=zone)
+        self.service._peak_windows=lambda *args:[{
+            "index":1,"peak_start":start,"peak_end":end,
+            "cover_start":datetime(2026,10,9,8,58,tzinfo=zone),
+            "cover_end":datetime(2026,10,9,12,5,tzinfo=zone),
+        }]
+        entries=self.service._effective_entries(
+            raw,date,"Asia/Shanghai","workday","provider",
+            datetime(2026,10,9,8,0,tzinfo=zone))
+        peak_start=next(entry for entry in entries if entry["kind"]=="PEAK_START")
+        peak_end=next(entry for entry in entries if entry["kind"]=="PEAK_END")
+        self.assertEqual(peak_start["trigger_at"],"2026-10-09T08:58:00+08:00")
+        context=peak_start["activity_context"]
+        self.assertEqual([item["name"] for item in context["active_at_trigger"]],["睡觉"])
+        self.assertEqual([item["name"] for item in context["completed_before_trigger"]],[])
+        self.assertEqual([item["name"] for item in context["upcoming_after_trigger"]],
+                         ["赖床刷手机","出门准备","上午闲逛"])
+        self.assertEqual(context["trigger_at"],peak_start["trigger_at"])
+        self.assertEqual([item["name"] for item in peak_end["activity_context"]["active_at_trigger"]],
+                         ["上午闲逛"])
+        self.assertNotIn("上午闲逛",[item["name"] for item in peak_end["activity_context"]["completed_before_trigger"]])
+        self.assertEqual([item["name"] for item in peak_end["activity_context"]["upcoming_after_trigger"]],
+                         ["散步"])
+        prompt=self.service._prompt_lines([peak_start,peak_end],raw,"workday")
+        self.assertIn('"active_at_trigger": [{"name": "睡觉"',prompt)
+        self.assertIn('"upcoming_after_trigger": [{"name": "赖床刷手机"',prompt)
+        self.assertIn("不得把 upcoming_after_trigger 中的事写成已经发生、正在发生或已经到达目的地",prompt)
+        self.assertIn("PEAK_END 只能把 completed_before_trigger 中的事情说成已完成",prompt)
+        self.assertIn("日程写翻看/浏览贴纸或耳饰，绝不表示买了",prompt)
+
     def test_peak_outline_skips_nonoverlapping_and_caps_context(self):
         date = self.now.date()
         peak_start = self.now.replace(hour=9, minute=0)
@@ -941,8 +983,8 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((len(starts),len(ends)),(2,2))
         for start_entry in starts:
             end_entry=next(entry for entry in ends if entry["activity_id"]==start_entry["activity_id"])
-            self.assertEqual(start_entry["activity_context"],end_entry["activity_context"])
             self.assertIsNone(start_entry["activity_context"]["primary_activity"])
+            self.assertNotEqual(start_entry["activity_context"]["trigger_at"],end_entry["activity_context"]["trigger_at"])
             # These sample sub-slots (15–20 minutes) are too short to represent
             # the 3–4 hour Fat Fish peak windows as one coherent start/end activity.
             self.assertGreaterEqual(start_entry["activity_context"]["peak_duration_minutes"],180)
