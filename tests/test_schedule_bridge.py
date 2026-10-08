@@ -529,19 +529,18 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
             {"id":"end","kind":"PEAK_END","activity_id":"P1","trigger_at":"12:05","activity_context":{"activity_id":"P1","primary_activity":activity}},
         ]
         prompt=self.service._prompt_lines(pair,{"local_date":"2026-10-07"},"workday")
-        self.assertEqual(prompt.count('"name": "上午课程"'),2)
-        self.assertEqual(prompt.count('"activity_id": "P1"'),2)
+        self.assertNotIn('"name": "上午课程"',prompt)
+        self.assertNotIn('"activity_id": "P1"',prompt)
         unknown_pair=[dict(entry,activity_context={"activity_id":"P2","primary_activity":None}) for entry in pair]
         unknown_prompt=self.service._prompt_lines(unknown_pair,{"local_date":"2026-10-07"},"workday")
-        self.assertIn('"primary_activity": null',unknown_prompt)
+        self.assertNotIn('"primary_activity"',unknown_prompt)
         self.assertIn("不得猜测或虚构",unknown_prompt)
-        self.assertIn("PEAK_START 先依据 trigger_at 描述",prompt)
-        self.assertIn("PEAK_END 只可将 completed_before_trigger 中的事项描述为完成",prompt)
+        self.assertIn("PEAK_START 先依据 temporal_payload.current 描述",prompt)
+        self.assertIn("PEAK_END 只可将 temporal_payload.completed 中的事项描述为完成",prompt)
         self.assertNotIn("PEAK_START 与同 activity_id 的 PEAK_END 共享同一份事实",prompt)
         self.assertNotIn("PEAK_END 要自然回扣同一份 outline，概括刚做完的主要事情",prompt)
-        self.assertIn("duration_minutes 必须与 peak_duration_minutes 相称",prompt)
 
-    def test_peak_outline_keeps_a_multi_stop_outing_without_inventing_a_long_event(self):
+    def test_peak_payload_does_not_use_outline_as_a_fact_source(self):
         date = self.now.date()
         peak_start = self.now.replace(hour=14, minute=0)
         peak_end = self.now.replace(hour=18, minute=0)
@@ -570,13 +569,12 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
              "activity_context":context},
         ]
         prompt = self.service._prompt_lines(entries, {"local_date":str(date)}, "workday")
-        self.assertEqual(prompt.count('"name": "看展"'), 2)
-        self.assertEqual(prompt.count('"name": "文创小店"'), 2)
+        self.assertNotIn('"name": "看展"', prompt)
+        self.assertNotIn('"name": "文创小店"', prompt)
         self.assertNotIn('"name": "吃晚饭"', prompt)
-        self.assertIn("activity_outline 仅用于理解高峰背景", prompt)
-        self.assertIn("每条具体表述仍必须符合该事件自己的 trigger_at 分类", prompt)
-        self.assertIn("upcoming_after_trigger 中1–3件相关安排作未来预告", prompt)
-        self.assertIn("不要把刷手机、发呆、普通吃饭这类短暂过渡", prompt)
+        self.assertNotIn('"activity_outline"', prompt)
+        self.assertNotIn('"primary_activity"', prompt)
+        self.assertIn("current、completed、upcoming 分类优先", prompt)
 
     def test_peak_temporal_context_exact_future_slots_are_not_current_or_completed(self):
         from datetime import timezone, timedelta
@@ -614,10 +612,12 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item["name"] for item in peak_end["activity_context"]["upcoming_after_trigger"]],
                          ["散步"])
         prompt=self.service._prompt_lines([peak_start,peak_end],raw,"workday")
-        self.assertIn('"active_at_trigger": [{"name": "睡觉"',prompt)
-        self.assertIn('"upcoming_after_trigger": [{"name": "赖床刷手机"',prompt)
-        self.assertIn("upcoming_after_trigger 严格属于未来",prompt)
-        self.assertIn("PEAK_END 只可将 completed_before_trigger 中的事项描述为完成",prompt)
+        self.assertIn('"current": [{"name": "睡觉"',prompt)
+        self.assertIn('"upcoming": [{"name": "赖床刷手机"',prompt)
+        self.assertIn('"progress": "ongoing_internal_progress_unknown"',prompt)
+        self.assertIn('"progress": "future_not_started"',prompt)
+        self.assertIn("upcoming 只含名称与时段，严格属于未来",prompt)
+        self.assertIn("PEAK_END 只可将 temporal_payload.completed 中的事项描述为完成",prompt)
         self.assertIn("日程写翻看/浏览贴纸或耳饰，绝不表示买了",prompt)
 
     def test_peak_end_upcoming_lunch_remains_future_while_outing_is_current(self):
@@ -632,12 +632,12 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         }
         entry={"id":"p-end-1201","kind":"PEAK_END","trigger_at":context["trigger_at"],"activity_context":context}
         prompt=self.service._prompt_lines([entry],{"local_date":"2026-10-09"},"workday")
-        self.assertIn("active_at_trigger 表示该时段在 trigger_at 仍持续",prompt)
-        self.assertIn("upcoming_after_trigger 严格属于未来",prompt)
-        self.assertIn("其中的活动、地点及其细节只能用明确将来时表达",prompt)
+        self.assertIn("current 只含活动名称与时段",prompt)
+        self.assertIn("upcoming 只含名称与时段，严格属于未来",prompt)
         self.assertIn('"name": "上午闲逛"',prompt)
         self.assertIn('"name": "午饭续摊"',prompt)
-        self.assertIn("不能写成当前正在做、已经发生或已经到达",prompt)
+        self.assertIn('"progress": "future_not_started"',prompt)
+        self.assertIn("upcoming 只含名称与时段，严格属于未来",prompt)
 
     def test_active_slot_state_does_not_timestamp_internal_actions(self):
         context={
@@ -649,18 +649,66 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         }
         entry={"id":"p-start-1359","kind":"PEAK_START","trigger_at":context["trigger_at"],"activity_context":context}
         prompt=self.service._prompt_lines([entry],{"local_date":"2026-10-09"},"adjusted")
-        self.assertIn('"state": "吃面、加甜品、发语音"',prompt)
-        self.assertIn("state 只是整个时段的概述，不是内部动作的时间顺序",prompt)
-        self.assertIn("不能仅因 state 提到某动作，就断言该动作已完成",prompt)
-        self.assertIn("活动仍在进行时，不得说吃完了、买好了、看完了、逛完了或已经去了",prompt)
-        self.assertIn("activity_outline 仅用于理解高峰背景",prompt)
+        self.assertNotIn('"state": "吃面、加甜品、发语音"',prompt)
+        self.assertIn('"name": "午饭续摊"',prompt)
+        self.assertIn('"progress": "ongoing_internal_progress_unknown"',prompt)
+        self.assertIn("current 只含活动名称与时段",prompt)
+        self.assertIn("不要从 current/upcoming 的原始 state",prompt)
+        self.assertNotIn('"activity_outline"',prompt)
 
     def test_legacy_unconditional_peak_activity_done_instruction_is_absent(self):
         prompt=self.service._prompt_lines([],{"local_date":"2026-10-09"},"workday")
         self.assertNotIn("PEAK_START 与同 activity_id 的 PEAK_END 共享同一份事实",prompt)
         self.assertNotIn("结束说这件事做完了",prompt)
         self.assertNotIn("PEAK_END 要自然回扣同一份 outline，概括刚做完的主要事情",prompt)
-        self.assertIn("PEAK_END 只可将 completed_before_trigger 中的事项描述为完成",prompt)
+        self.assertIn("PEAK_END 只可将 temporal_payload.completed 中的事项描述为完成",prompt)
+
+    def test_peak_payload_strips_active_and_upcoming_state_and_diagnostic_context(self):
+        unsafe_active="吃面、加甜品、发语音"
+        unsafe_upcoming="拍细节图、中途买奶茶、逛文创店"
+        context={
+            "trigger_at":"2026-10-09T13:59:00+08:00",
+            "active_at_trigger":[{"name":"午饭续摊","state":unsafe_active,"start":"13:00","end":"14:20","start_at":"2026-10-09T13:00:00+08:00","end_at":"2026-10-09T14:20:00+08:00"}],
+            "completed_before_trigger":[],
+            "upcoming_after_trigger":[{"name":"下午看展","state":unsafe_upcoming,"start":"15:00","end":"16:00","start_at":"2026-10-09T15:00:00+08:00","end_at":"2026-10-09T16:00:00+08:00"}],
+            "activity_outline":[{"name":"午饭续摊","state":unsafe_active},{"name":"下午看展","state":unsafe_upcoming}],
+            "primary_activity":{"name":"午饭续摊","state":unsafe_active},
+        }
+        entry={"id":"safe-peak","kind":"PEAK_START","trigger_at":context["trigger_at"],
+               "state":unsafe_active,"activity_context":context}
+        prompt=self.service._prompt_lines([entry],{"local_date":"2026-10-09"},"workday")
+        payload=json.loads(prompt.splitlines()[-1])["temporal_payload"]
+        self.assertEqual(payload["trigger_at"],context["trigger_at"])
+        self.assertEqual(payload["current"][0]["name"],"午饭续摊")
+        self.assertEqual(payload["current"][0]["progress"],"ongoing_internal_progress_unknown")
+        self.assertEqual(payload["upcoming"][0]["name"],"下午看展")
+        self.assertEqual(payload["upcoming"][0]["progress"],"future_not_started")
+        self.assertNotIn("state",payload["current"][0])
+        self.assertNotIn("state",payload["upcoming"][0])
+        for unsafe in (unsafe_active,unsafe_upcoming):
+            self.assertNotIn(unsafe,prompt)
+        self.assertNotIn("activity_outline",payload)
+        self.assertNotIn("primary_activity",payload)
+        serialized=json.loads(prompt.splitlines()[-1])
+        self.assertNotIn("activity_context",serialized)
+        self.assertNotIn("state",serialized)
+
+    def test_peak_end_completed_slot_state_is_safe_to_include(self):
+        context={"trigger_at":"2026-10-09T18:04:00+08:00","active_at_trigger":[],
+                 "completed_before_trigger":[{"name":"下午看展","state":"拍了很多作品细节","start":"15:00","end":"17:00"}],
+                 "upcoming_after_trigger":[],"activity_outline":[{"name":"下午看展","state":"拍了很多作品细节"}]}
+        entry={"id":"completed-peak","kind":"PEAK_END","trigger_at":context["trigger_at"],"activity_context":context}
+        prompt=self.service._prompt_lines([entry],{"local_date":"2026-10-09"},"workday")
+        payload=json.loads(prompt.splitlines()[-1])["temporal_payload"]
+        self.assertEqual(payload["completed"][0]["state"],"拍了很多作品细节")
+        self.assertEqual(payload["completed"][0]["progress"],"completed_before_trigger")
+
+    def test_normal_prompt_keeps_full_state_unchanged(self):
+        entry={"id":"normal-1","kind":"NORMAL","trigger_at":"2026-10-09T13:00:00+08:00",
+               "name":"午饭续摊","state":"吃面、加甜品、发语音","slot_start":"13:00","slot_end":"14:20"}
+        prompt=self.service._prompt_lines([entry],{"local_date":"2026-10-09"},"workday")
+        payload=json.loads(prompt.splitlines()[-1])
+        self.assertEqual(payload["state"],"吃面、加甜品、发语音")
 
     def test_peak_outline_skips_nonoverlapping_and_caps_context(self):
         date = self.now.date()

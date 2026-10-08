@@ -544,15 +544,22 @@ class ScheduleBroadcastService:
     def _prompt_lines(self, entries, schedule, day_kind):
         lines = []
         for entry in entries:
+            kind = entry["kind"]
+            activity_context = entry.get("activity_context", {})
+            if kind in {"PEAK_START", "PEAK_END"}:
+                activity_context = self._safe_peak_context(activity_context)
             item = {
                 "id": entry["id"],
-                "kind": entry["kind"],
+                "kind": kind,
                 "trigger_at": entry["trigger_at"],
-                "name": entry.get("name", ""),
-                "state": entry.get("state", ""),
-                "time_segment": [entry.get("slot_start", ""), entry.get("slot_end", "")],
-                "activity_context": entry.get("activity_context", {}),
             }
+            if kind in {"PEAK_START", "PEAK_END"}:
+                item["temporal_payload"] = activity_context
+            else:
+                item["name"] = entry.get("name", "")
+                item["state"] = entry.get("state", "")
+                item["time_segment"] = [entry.get("slot_start", ""), entry.get("slot_end", "")]
+                item["activity_context"] = activity_context
             lines.append(json.dumps(item, ensure_ascii=False))
         instructions = (
             f"目标日期 {schedule.get('local_date', '')}，日期性质 {day_kind}。"
@@ -562,24 +569,59 @@ class ScheduleBroadcastService:
             "NORMAL 必须依据给出的 name、state 和 time_segment 明确说出原日程中的事情；可自然表达情绪，但不得补造地点、人物、原因、结果或与日程矛盾。"
             "晚间和凌晨遇到真实的看电影、夜市、演出、宵夜、朋友聚会、游戏等活动时，可更兴奋、好奇、爱玩一点；"
             "不要默认23点就必须睡觉，也绝不能为制造夜生活而补造日程中没有的活动。"
-            "PEAK 消息的时间基准是各自 activity_context.trigger_at，不是高峰窗口结束时间，也不是整份日程的事后总结。"
-            "时间事实权威顺序：active_at_trigger、completed_before_trigger、upcoming_after_trigger 最高；primary_activity 与 activity_outline 只是次级背景。若背景与这三类触发时刻分类冲突，必须服从触发时刻分类。"
-            "active_at_trigger 表示该时段在 trigger_at 仍持续，应用当前/进行时描述整体场景。state 只是整个时段的概述，不是内部动作的时间顺序；不能仅因 state 提到某动作，就断言该动作已完成。"
-            "只有 RAW 明确表明某个内部动作在 trigger_at 之前已完成，才可使用完成时；否则活动仍在进行时，不得说吃完了、买好了、看完了、逛完了或已经去了。"
-            "upcoming_after_trigger 严格属于未来；其中的活动、地点及其细节只能用明确将来时表达，不能写成当前正在做、已经发生或已经到达。即使 activity_outline 提到它们，也不得改变其未来属性。"
-            "PEAK_START 先依据 trigger_at 描述 active_at_trigger 中的当前现实，再从 upcoming_after_trigger 预告1–3件相关真实安排；若当前仍在睡觉，应明确还在睡/暂时不在线。"
-            "PEAK_END 只可将 completed_before_trigger 中的事项描述为完成；active_at_trigger 仍在进行，必须保持进行时；upcoming_after_trigger 仍是未来。不得笼统声称整个 activity_id 或高峰活动已经结束。"
+            "PEAK 消息的时间基准是各自 temporal_payload.trigger_at，不是高峰窗口结束时间，也不是整份日程的事后总结。"
+            "PEAK 输入中的 temporal_payload 是唯一事实来源；current、completed、upcoming 分类优先于任何其他背景。current 只含活动名称与时段，必须只按名称描述为持续场景；不得推断该时段内部做到了哪一步。"
+            "completed 中整段时段已在 trigger_at 前结束，可依据其 name/state 概括已完成的事情。upcoming 只含名称与时段，严格属于未来，必须使用将来时；不得补充未提供的子活动、地点或细节。"
+            "不要从 current/upcoming 的原始 state、primary_activity 或 activity_outline 推断内容；这些内容不会作为 PEAK 事实提供。"
+            "PEAK_START 先依据 temporal_payload.current 描述当前现实，再从 temporal_payload.upcoming 预告1–3件真实安排；若当前名称是睡觉，可明确还在睡/暂时不在线。"
+            "PEAK_END 只可将 temporal_payload.completed 中的事项描述为完成；current 仍在进行，upcoming 仍是未来。不得笼统声称整个高峰活动已经结束。"
             "严格区分浏览、看、逛与购买：日程写翻看/浏览贴纸或耳饰，绝不表示买了；看展不能补成展览评价，逛完不能擅自说准备回家。"
-            "primary_activity 的 duration_minutes 必须与 peak_duration_minutes 相称，不要把短暂子活动说成覆盖整个高峰；它不能覆盖或改写触发时刻分类。"
-            "activity_outline 仅用于理解高峰背景和活动之间的关联，绝不能用来推断某件事已完成，也不能覆盖 active_at_trigger、completed_before_trigger 或 upcoming_after_trigger。"
-            "若 outline 展示先上课后看展，可以说是两件相连的事，不要假装成一项持续数小时的活动；每条具体表述仍必须符合该事件自己的 trigger_at 分类。"
-            "PEAK_START 是离开聊天前的生活分享：当前场景说清楚，再挑 upcoming_after_trigger 中1–3件相关安排作未来预告；不要把刷手机、发呆、普通吃饭这类短暂过渡误说成整段高峰已完成的主活动。"
-            "PEAK_END 可简短回扣同一段行程，但只能把 completed_before_trigger 的内容说成已完成，不能把活动仍在进行的 slot 或尚未开始的 slot 总结成做完了。"
+            "PEAK_START 是离开聊天前的生活分享：当前场景只依据 current 的名称，再挑 upcoming 中1–3件安排作未来预告。"
+            "PEAK_END 可简短回扣行程，但只能把 completed 的内容说成已完成，不能把 current 或 upcoming 总结成做完了。"
             "若 trigger_at 缺少可识别的当前或相关安排，只能用不添加事实的简短状态表达，不得自行补造忙碌、完成或离开等结果。"
             "所有情况下都不得猜测或虚构事实，不能只写溜了、回来了、忙一阵等无背景的空话。"
             "不要为了交代背景而过度解释；保持口语、简短、有变化。"
         )
         return f"{self._get('broadcast_prompt', DEFAULT_PROMPT)}\n{instructions}\n" + "\n".join(lines)
+
+    @staticmethod
+    def _safe_peak_context(context):
+        """Strip unknowable internal progress from PEAK LLM input only."""
+        context = context if isinstance(context, dict) else {}
+
+        def project(slots, *, progress, include_state=False):
+            result = []
+            for slot in slots if isinstance(slots, list) else []:
+                if not isinstance(slot, dict):
+                    continue
+                item = {
+                    key: slot[key]
+                    for key in ("name", "start", "end", "start_at", "end_at")
+                    if key in slot
+                }
+                if progress:
+                    item["progress"] = progress
+                if include_state and "state" in slot:
+                    item["state"] = slot["state"]
+                result.append(item)
+            return result
+
+        return {
+            "trigger_at": context.get("trigger_at", ""),
+            "current": project(
+                context.get("active_at_trigger"),
+                progress="ongoing_internal_progress_unknown",
+            ),
+            "completed": project(
+                context.get("completed_before_trigger"),
+                progress="completed_before_trigger",
+                include_state=True,
+            ),
+            "upcoming": project(
+                context.get("upcoming_after_trigger"),
+                progress="future_not_started",
+            ),
+        }
 
     def _preserve_delivery(self, old_plan, entries):
         if not isinstance(old_plan, dict):
