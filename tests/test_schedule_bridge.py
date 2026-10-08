@@ -980,6 +980,66 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event["sent"])
         self.assertEqual(event["delivered_umos"], ["physical-qq-group:bot:115"])
 
+    def test_regeneration_does_not_reuse_sent_state_for_changed_trigger(self):
+        timeline = [{"id": "N02", "kind": "NORMAL", "start_at": "new", "end_at": "later",
+                     "broadcast_message": "updated"}]
+        old = [{"id": "N02", "trigger_at": "old", "sent": True,
+                "delivered_umos": ["qq:FriendMessage:one"]}]
+        event = self.service._derive_deliveries(
+            timeline, old, reuse_id_only_state=False)[0]
+        self.assertFalse(event["sent"])
+        self.assertEqual(event["delivered_umos"], [])
+
+    def test_regeneration_preserves_state_for_exact_id_and_trigger(self):
+        timeline = [{"id": "N02", "kind": "NORMAL", "start_at": "same", "end_at": "later",
+                     "broadcast_message": "updated"}]
+        old = [{"id": "N02", "trigger_at": "same", "sent": True,
+                "delivered_umos": ["qq:FriendMessage:one"]}]
+        event = self.service._derive_deliveries(
+            timeline, old, reuse_id_only_state=False)[0]
+        self.assertTrue(event["sent"])
+        self.assertEqual(event["delivered_umos"], ["qq:FriendMessage:one"])
+
+    async def test_regeneration_changed_trigger_drops_partial_delivery_and_sends_again(self):
+        self.context.output_factory = lambda prompt: {
+            **valid_response_for(json.loads(prompt.split("PLANNER_INPUT:\n", 1)[1])),
+            "free_window_plans": {"F01": [
+                {"category": "rest", "name": "前段安排", "state": "休息中",
+                 "broadcast_message": "前段消息", "weight": 1},
+                {"category": "social", "name": "新安排", "state": "活动中",
+                 "broadcast_message": "新活动消息", "weight": 1},
+            ]},
+        }
+        changed_trigger = self.start + timedelta(hours=15)
+        self.service._plans()[self.start.isoformat()] = {
+            "status": "complete",
+            "deliveries": [
+                {"id": "N01", "trigger_at": self.start.isoformat(), "sent": True,
+                 "delivered_umos": ["qq:FriendMessage:one"]},
+                {"id": "N02", "trigger_at": changed_trigger.isoformat(), "sent": False,
+                 "delivered_umos": ["qq:FriendMessage:one"]},
+            ],
+        }
+
+        generated = await self.service.generate_life_day(self.start, force=True)
+
+        self.assertEqual(generated["status"], "generated")
+        plan = generated["plan"]
+        first, second = plan["deliveries"]
+        self.assertEqual(first["id"], "N01")
+        self.assertTrue(first["sent"])
+        self.assertEqual(second["id"], "N02")
+        self.assertNotEqual(second["trigger_at"], changed_trigger.isoformat())
+        self.assertFalse(second["sent"])
+        self.assertEqual(second["delivered_umos"], [])
+
+        delivered = await self.service.send_due(datetime.fromisoformat(second["trigger_at"]))
+        self.assertEqual(delivered["success_count"], 1)
+        self.assertEqual(delivered["failure_count"], 0)
+        self.assertEqual(len(self.context.sent), 1)
+        self.assertTrue(second["sent"])
+        self.assertEqual(len(self.context.llm_calls), 1)
+
     def test_old_v07_store_is_preserved_and_not_migrated(self):
         old = Path(self.tmp.name) / "schedule_broadcast_state.json"
         old.write_text('{"entries":[{"sent":true}]}', encoding="utf-8")

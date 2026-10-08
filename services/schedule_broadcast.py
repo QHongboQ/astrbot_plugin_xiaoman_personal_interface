@@ -743,7 +743,7 @@ class ScheduleBroadcastService:
         return True, ""
 
     @staticmethod
-    def _derive_deliveries(timeline, old_deliveries=None):
+    def _derive_deliveries(timeline, old_deliveries=None, *, reuse_id_only_state=True):
         old = {(row.get("id"), row.get("trigger_at")): row for row in old_deliveries or []}
         old_by_id = {row.get("id"): row for row in old_deliveries or []}
         bridge_ends = {row["end_at"] for row in timeline if row["kind"] == "BRIDGE"}
@@ -763,7 +763,7 @@ class ScheduleBroadcastService:
                 ])
         for event in events:
             previous = old.get((event["id"], event["trigger_at"]))
-            if previous is None:
+            if previous is None and reuse_id_only_state:
                 candidate = old_by_id.get(event["id"], {})
                 previous = candidate if candidate.get("sent") or candidate.get("delivered_umos") else {}
             previous = previous or {}
@@ -849,7 +849,8 @@ class ScheduleBroadcastService:
                     "daily_theme": str(result.get("daily_theme", "")).strip(),
                     "daily_style": str(result.get("daily_style", "")).strip(),
                     "timeline": timeline,
-                    "deliveries": self._derive_deliveries(timeline, old_deliveries),
+                    "deliveries": self._derive_deliveries(
+                        timeline, old_deliveries, reuse_id_only_state=False),
                     "status": "complete",
                     "generated_at": self._now().isoformat(),
                 }
