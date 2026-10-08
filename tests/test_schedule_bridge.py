@@ -417,6 +417,22 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("保护窗不是课程表", prompt)
         self.assertIn("不要计算或补偿前一日睡眠时长", prompt)
 
+    async def test_planner_prompt_encourages_soft_cross_day_diversity(self):
+        prompt = self.service._planner_prompt(await self._input())
+        self.assertIn("major_activities、categories_used、previous_tail、late_night_behavior、previous_final_events", prompt)
+        self.assertIn("最近生命日的主要休闲/社交活动进入软冷却", prompt)
+        self.assertIn("明确持续的计划/活动、同一趟旅行或假期、强叙事连续性或上下文强烈暗示时才自然重复", prompt)
+        self.assertIn("优先改变整日形状和活动链，而不只是把昨天的场所换个名字", prompt)
+        self.assertIn("昨天‘密室→夜市→KTV’，今天即使改成‘电玩城→夜市→KTV’仍是重复", prompt)
+        self.assertIn("近期反复呈现同一日型时，合理地换成恢复日、项目日、外出日、居家日、社交日、夜生活日或随性混合日", prompt)
+        self.assertIn("两个 protected_window 都主要是上课/课程/工作室学业", prompt)
+        self.assertIn("课程在日历、世界观或强上下文支持时仍完全允许", prompt)
+        self.assertIn("近期重复应降低高权重活动的相对倾向，但不是禁令", prompt)
+        self.assertIn("记得昨天，但不要重演昨天", prompt)
+        self.assertIn("NORMAL 顶层事件代表有意义的生活阶段", prompt)
+        self.assertIn("daily_theme 概括整日主线、主导活动与整体走向", prompt)
+        self.assertIn("睡眠只是普通生活事件", prompt)
+
     async def test_generated_theme_and_style_are_not_semantically_rewritten(self):
         response = valid_response_for(await self._input())
         response["daily_theme"] = "睡到中午的画画日"
