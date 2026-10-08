@@ -481,6 +481,14 @@ class ScheduleBroadcastService:
                 planner_input = json.loads(json.dumps(planner_input, ensure_ascii=False, default=str))
                 persona_prompt = planner_input.get("persona", "")
                 prompt = self._planner_prompt(planner_input)
+                # Fat Fish gates message events, not this internal planner call.
+                # Recheck its read-only policy at call time; force regeneration
+                # must not bypass an active wallet block either.
+                wallet_policy = self.fat_fish.get_wallet_policy(
+                    at=self._now(), provider_id=provider)
+                if wallet_policy.get("found") and not wallet_policy.get("allowed", True):
+                    return {"status": "deferred", "reason": "blocked_by_fat_fish",
+                            "policy": wallet_policy}
                 response = await self.context.llm_generate(
                     chat_provider_id=provider, prompt=prompt,
                     system_prompt=persona_prompt, tools=None)

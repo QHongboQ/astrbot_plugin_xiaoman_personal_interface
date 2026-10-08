@@ -25,6 +25,7 @@ class FakeDay:
         self.boundary = boundary
         self.kind = kind
         self.available = available
+        self.now = datetime(2026, 10, 9, 4, 0, tzinfo=TZ)
         self.context = {"available": True, "worldview": "用户给定世界观", "use_persona": True,
                         "theme_pool": ["夜游"], "style_pool": ["随性"],
                         "allow_custom_theme": True,
@@ -32,7 +33,7 @@ class FakeDay:
                         "calendar_days": [], "weather": [{"date": "2026-10-09", "forecast": "晴"}]}
 
     def current_time(self):
-        return datetime(2026, 10, 9, 4, 0, tzinfo=TZ)
+        return self.now
 
     def discover(self):
         return object() if self.available else None
@@ -69,6 +70,9 @@ class FakeFish:
     def __init__(self, windows=None):
         self.windows = windows or []
         self.calls = []
+        self.policy = {"found": True, "enabled": True, "allowed": True, "state": "offpeak",
+                       "manual_override": "auto", "provider_affected": True,
+                       "timezone": "Asia/Shanghai"}
 
     def effective_peak_windows(self, start, end, provider, calendar_days):
         self.calls.append((start, end, provider, calendar_days))
@@ -78,8 +82,7 @@ class FakeFish:
         return [row for row in self.windows if row["start_at"] < end and row["end_at"] > start]
 
     def get_wallet_policy(self, *, at=None, provider_id=None):
-        return {"found": True, "enabled": True, "allowed": True, "state": "offpeak",
-                "manual_override": "auto", "provider_affected": True, "timezone": "Asia/Shanghai"}
+        return dict(self.policy)
 
 
 class Context:
@@ -100,6 +103,12 @@ class Context:
 
     async def get_current_chat_provider_id(self, umo):
         return "planner-provider"
+
+    def get_provider_by_id(self, provider_id):
+        if provider_id != "planner-provider":
+            return None
+        return types.SimpleNamespace(meta=lambda: types.SimpleNamespace(
+            id=provider_id, model="deepseek-chat", type="llm"))
 
     async def persona(self):
         return {"prompt": "default persona prompt"}
@@ -166,6 +175,7 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.start = datetime(2026, 10, 9, 4, 0, tzinfo=TZ)
         self.day = FakeDay()
+        self.day.now = self.start
         self.day.context["calendar_days"] = [{"date": "2026-10-09", "kind": "workday", "label": ""},
                                              {"date": "2026-10-10", "kind": "weekend", "label": ""}]
         self.context = Context()
@@ -181,6 +191,19 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         if protected is not None:
             self.fish.windows = protected
         return await self.service.planner_input(self.start, "planner-provider")
+
+    def _use_config_only_fatfish(self, **overrides):
+        config = {"enabled": True, "timezone": "Asia/Shanghai",
+                  "peak_periods": "09:00-12:00,14:00-18:00",
+                  "peak_weekdays": "0,1,2,3,4,5,6",
+                  "affected_providers": "deepseek", "gate_when_provider_unknown": True,
+                  "manual_override": "auto"}
+        config.update(overrides)
+        fish = types.SimpleNamespace(config=config)
+        self.context.stars = [types.SimpleNamespace(
+            name="astrbot_plugin_fat_fish_wallet", activated=True, star_cls=fish)]
+        self.service.fat_fish = FatFishBridge(self.context, self.day)
+        return fish
 
     async def test_exact_guarded_protected_and_free_windows_are_sent_to_planner(self):
         self.fish.windows = [
@@ -204,6 +227,21 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         embedded = json.loads(self.service._planner_prompt(planner_input).split("PLANNER_INPUT:\n", 1)[1])
         self.assertEqual(embedded["protected_windows"], planner_input["protected_windows"])
         self.assertEqual(embedded["free_windows"], planner_input["free_windows"])
+
+    async def test_real_fatfish_111_config_produces_guarded_planner_windows(self):
+        self._use_config_only_fatfish()
+        planner_input = await self.service.planner_input(self.start, "planner-provider")
+        self.assertEqual([(row["start_at"], row["end_at"])
+                          for row in planner_input["protected_windows"]], [
+            ("2026-10-09T08:55:00+08:00", "2026-10-09T12:05:00+08:00"),
+            ("2026-10-09T13:55:00+08:00", "2026-10-09T18:05:00+08:00"),
+        ])
+        self.assertEqual([(row["start_at"], row["end_at"])
+                          for row in planner_input["free_windows"]], [
+            ("2026-10-09T04:00:00+08:00", "2026-10-09T08:55:00+08:00"),
+            ("2026-10-09T12:05:00+08:00", "2026-10-09T13:55:00+08:00"),
+            ("2026-10-09T18:05:00+08:00", "2026-10-10T04:00:00+08:00"),
+        ])
 
     async def test_full_24h_continuous_timeline_is_accepted(self):
         planner_input = await self._input()
@@ -305,6 +343,53 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan["schema_version"], 2)
         self.assertTrue(plan["daily_theme"] and plan["daily_style"])
         self.assertTrue(all(event["message"] for event in plan["deliveries"]))
+
+    async def test_planner_call_is_deferred_during_fatfish_peak_then_runs_offpeak(self):
+        self._use_config_only_fatfish()
+        self.day.now = datetime(2026, 10, 9, 10, 0, tzinfo=TZ)
+        self.context.output_factory = lambda prompt: valid_response_for(
+            json.loads(prompt.split("PLANNER_INPUT:\n", 1)[1]))
+        blocked = await self.service.generate_life_day(self.start)
+        self.assertEqual(blocked["status"], "deferred")
+        self.assertEqual(blocked["reason"], "blocked_by_fat_fish")
+        self.assertEqual(len(self.context.llm_calls), 0)
+        self.assertNotIn(self.start.isoformat(), self.service.state["generation_attempts"])
+
+        self.day.now = datetime(2026, 10, 9, 12, 6, tzinfo=TZ)
+        generated = await self.service.generate_life_day(self.start)
+        self.assertEqual(generated["status"], "generated")
+        self.assertEqual(len(self.context.llm_calls), 1)
+
+    async def test_startup_tick_makes_no_planner_call_during_peak(self):
+        self._use_config_only_fatfish()
+        self.day.now = datetime(2026, 10, 9, 10, 0, tzinfo=TZ)
+        await self.service.tick()
+        self.assertEqual(len(self.context.llm_calls), 0)
+        self.assertEqual(self.service.state["generation_attempts"], {})
+
+    async def test_manual_regenerate_does_not_bypass_fatfish_peak_guard(self):
+        self._use_config_only_fatfish()
+        self.day.now = datetime(2026, 10, 9, 10, 0, tzinfo=TZ)
+        results = await self.service.regenerate("current", now=self.day.now)
+        self.assertEqual(results[0]["status"], "deferred")
+        self.assertEqual(len(self.context.llm_calls), 0)
+
+    async def test_always_allow_and_always_block_override_planner_cost_gate(self):
+        fish = self._use_config_only_fatfish(manual_override="always_allow")
+        self.day.now = datetime(2026, 10, 9, 10, 0, tzinfo=TZ)
+        self.context.output_factory = lambda prompt: valid_response_for(
+            json.loads(prompt.split("PLANNER_INPUT:\n", 1)[1]))
+        allowed = await self.service.generate_life_day(self.start)
+        self.assertEqual(allowed["status"], "generated")
+        self.assertEqual(len(self.context.llm_calls), 1)
+
+        self.service.reset("current", now=self.day.now)
+        self.context.llm_calls.clear()
+        fish.config["manual_override"] = "always_block"
+        self.day.now = datetime(2026, 10, 9, 12, 30, tzinfo=TZ)
+        blocked = await self.service.generate_life_day(self.start)
+        self.assertEqual(blocked["status"], "deferred")
+        self.assertEqual(len(self.context.llm_calls), 0)
 
     async def test_derive_refresh_and_send_due_do_not_call_llm(self):
         self.context.output_factory = lambda prompt: valid_response_for(
@@ -527,41 +612,89 @@ class AdapterAndBridgeTests(unittest.TestCase):
 
     def test_fatfish_bridge_is_read_only_and_uses_effective_period_policy(self):
         class Fish:
-            config = {"timezone": "Asia/Shanghai"}
-            def __init__(self):
-                self._cfg = lambda key, default=None: default
-                self.policy = {"enabled": True, "manual_override": "auto", "provider_affected": True,
-                               "timezone": "Asia/Shanghai", "peak_periods": "09:00-12:00,14:00-18:00",
-                               "peak_weekdays": "0,1,2,3,4,5,6"}
-            def get_wallet_policy(self, *, at=None, provider_id=None):
-                return dict(self.policy)
+            # Public shape from official Fat Fish Wallet v1.1.1: config only.
+            config = {"enabled": True, "timezone": "Asia/Shanghai",
+                      "peak_periods": "09:00-12:00,14:00-18:00",
+                      "peak_weekdays": "0,1,2,3,4,5,6",
+                      "affected_providers": "deepseek", "gate_when_provider_unknown": True,
+                      "manual_override": "auto"}
+
+            def _cfg(self, *_args, **_kwargs):
+                raise AssertionError("private _cfg must not be called")
+
+            def _periods(self, *_args, **_kwargs):
+                raise AssertionError("private _periods must not be called")
+
+            def _weekdays(self, *_args, **_kwargs):
+                raise AssertionError("private _weekdays must not be called")
+
+            def _provider_affected(self, *_args, **_kwargs):
+                raise AssertionError("private _provider_affected must not be called")
+
         fish = Fish()
-        original = fish._cfg
-        context = types.SimpleNamespace(get_all_stars=lambda: [types.SimpleNamespace(
-            name="astrbot_plugin_fat_fish_wallet", activated=True, star_cls=fish)])
-        scheduler = types.SimpleNamespace(
-            parse_periods=lambda text: [types.SimpleNamespace(start=9*3600,end=12*3600),
-                                        types.SimpleNamespace(start=14*3600,end=18*3600)],
-            parse_weekdays=lambda text: list(range(7)))
+        original_config = json.loads(json.dumps(fish.config))
+        provider = types.SimpleNamespace(meta=lambda: types.SimpleNamespace(
+            id="planner-provider", model="deepseek-chat", type="llm"))
+        context = types.SimpleNamespace(
+            get_all_stars=lambda: [types.SimpleNamespace(
+                name="astrbot_plugin_fat_fish_wallet", activated=True, star_cls=fish)],
+            get_provider_by_id=lambda provider_id: provider if provider_id == "planner-provider" else None)
         bridge = FatFishBridge(context, FakeDay())
         start, end = datetime(2026, 10, 9, 4, tzinfo=TZ), datetime(2026, 10, 10, 4, tzinfo=TZ)
         calendar = [{"date": "2026-10-09", "kind": "adjusted"}]
-        with patch.object(FAT_FISH_MODULE, "import_module", return_value=scheduler):
-            windows = bridge.effective_peak_windows(start, end, "provider", calendar)
+        windows = bridge.effective_peak_windows(start, end, "planner-provider", calendar)
         self.assertEqual([(item["start_at"].strftime("%H:%M"), item["end_at"].strftime("%H:%M"))
                           for item in windows], [("09:00", "12:00"), ("14:00", "18:00")])
+        peak_policy = bridge.get_wallet_policy(
+            at=datetime(2026, 10, 9, 10, tzinfo=TZ), provider_id="planner-provider")
+        self.assertTrue(peak_policy["provider_affected"])
+        self.assertEqual(peak_policy["state"], "peak")
+        self.assertFalse(peak_policy["allowed"])
+        offpeak_policy = bridge.get_wallet_policy(
+            at=datetime(2026, 10, 9, 12, 6, tzinfo=TZ), provider_id="planner-provider")
+        self.assertEqual(offpeak_policy["state"], "offpeak")
+        self.assertTrue(offpeak_policy["allowed"])
+        self.assertTrue(bridge.get_wallet_policy(
+            at=datetime(2026, 10, 9, 10, tzinfo=TZ), provider_id="missing")["provider_affected"])
         for day_kind in ("weekend", "holiday"):
-            with patch.object(FAT_FISH_MODULE, "import_module", return_value=scheduler):
-                self.assertEqual(bridge.effective_peak_windows(
-                    start, end, "provider", [{"date": "2026-10-09", "kind": day_kind}]), [])
-        self.assertIs(fish._cfg, original)
+            self.assertEqual(bridge.effective_peak_windows(
+                start, end, "planner-provider", [{"date": "2026-10-09", "kind": day_kind}]), [])
+        self.assertEqual(fish.config, original_config)
         self.assertFalse(hasattr(bridge, "install"))
-        for change in ({"enabled": False}, {"manual_override": "always_allow"},
-                       {"manual_override": "always_block"}, {"provider_affected": False}):
-            fish.policy.update(change)
-            with patch.object(FAT_FISH_MODULE, "import_module", return_value=scheduler):
-                self.assertEqual(bridge.effective_peak_windows(start, end, "provider", calendar), [])
-            fish.policy.update({"enabled": True, "manual_override": "auto", "provider_affected": True})
+        for key, value in (("enabled", False), ("manual_override", "always_allow"),
+                           ("manual_override", "always_block"), ("affected_providers", "openai")):
+            old_value = fish.config.get(key)
+            fish.config[key] = value
+            self.assertEqual(bridge.effective_peak_windows(start, end, "planner-provider", calendar), [])
+            if old_value is None:
+                fish.config.pop(key, None)
+            else:
+                fish.config[key] = old_value
+
+        fish.config["affected_providers"] = ""
+        self.assertFalse(bridge.get_wallet_policy(
+            at=datetime(2026, 10, 9, 10, tzinfo=TZ), provider_id="planner-provider")["provider_affected"])
+        fish.config["affected_providers"] = "*"
+        self.assertTrue(bridge.get_wallet_policy(
+            at=datetime(2026, 10, 9, 10, tzinfo=TZ), provider_id="missing")["provider_affected"])
+        fish.config["affected_providers"] = "openai"
+        not_affected = bridge.get_wallet_policy(
+            at=datetime(2026, 10, 9, 10, tzinfo=TZ), provider_id="planner-provider")
+        self.assertFalse(not_affected["provider_affected"])
+        self.assertTrue(not_affected["allowed"])
+
+    def test_fatfish_unknown_provider_uses_gate_when_unknown_setting(self):
+        class Fish:
+            config = {"enabled": True, "timezone": "Asia/Shanghai", "manual_override": "auto",
+                      "peak_periods": "09:00-12:00", "peak_weekdays": "0,1,2,3,4,5,6",
+                      "affected_providers": "deepseek", "gate_when_provider_unknown": False}
+        context = types.SimpleNamespace(get_all_stars=lambda: [types.SimpleNamespace(
+            name="astrbot_plugin_fat_fish_wallet", activated=True, star_cls=Fish())],
+            get_provider_by_id=lambda _provider_id: (_ for _ in ()).throw(RuntimeError("unknown")))
+        result = FatFishBridge(context, FakeDay()).get_wallet_policy(
+            at=datetime(2026, 10, 9, 10, tzinfo=TZ), provider_id="missing")
+        self.assertFalse(result["provider_affected"])
+        self.assertTrue(result["allowed"])
 
     def test_rolling_day_prompt_bridge_is_not_installed_or_imported_by_main(self):
         source = (ROOT / "main.py").read_text(encoding="utf-8")

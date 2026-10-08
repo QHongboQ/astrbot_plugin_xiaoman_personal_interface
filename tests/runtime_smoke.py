@@ -205,13 +205,17 @@ async def verify_schedule_bridge_public_contract():
                     "state_continuity_enabled": True}, "weather": []}
 
     class RuntimeFish:
-        def effective_peak_windows(self, *_args): return []
+        # Same public shape as Fat Fish Wallet v1.1.1: configuration only.
+        config = {"enabled": False, "timezone": "Asia/Shanghai", "manual_override": "auto",
+                  "peak_periods": "09:00-12:00,14:00-18:00", "peak_weekdays": "0,1,2,3,4,5,6",
+                  "affected_providers": "deepseek", "gate_when_provider_unknown": True}
 
     class PublicContextFixture:
         def __init__(self):
             self.get_all_stars_called = 0
             self.llm_calls = []
             self.sent = []
+            self.fish = RuntimeFish()
             self.persona_manager = types.SimpleNamespace(
                 get_default_persona_v3=self.get_persona
             )
@@ -226,7 +230,12 @@ async def verify_schedule_bridge_public_contract():
 
         def get_provider_by_id(self, provider_id):
             assert provider_id == "runtime-provider"
-            return object()
+            return types.SimpleNamespace(meta=lambda: types.SimpleNamespace(
+                id=provider_id, model="deepseek-chat", type="llm"))
+
+        def get_all_stars(self):
+            return [types.SimpleNamespace(name="astrbot_plugin_fat_fish_wallet",
+                                          activated=True, star_cls=self.fish)]
 
         async def get_persona(self):
             return {"name": "runtime", "prompt": "runtime dict persona"}
@@ -246,9 +255,11 @@ async def verify_schedule_bridge_public_contract():
             self.sent.append((session, message_chain))
 
     runtime_context = PublicContextFixture()
+    from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.fat_fish_bridge import FatFishBridge
     config = {"schedule_broadcast": {"enable": True}}
     service = ScheduleBroadcastService(runtime_context, config, ".",
-                                       time_awareness=RuntimeDayAdapter(), fat_fish=RuntimeFish())
+                                       time_awareness=RuntimeDayAdapter(),
+                                       fat_fish=FatFishBridge(runtime_context, RuntimeDayAdapter()))
     service._save = lambda: None
     result = await service.generate_life_day(clock)
     assert result["status"] == "generated"
