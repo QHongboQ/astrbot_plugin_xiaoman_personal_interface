@@ -89,6 +89,8 @@ class Context:
     def __init__(self, rows=None, *, output_factory=None):
         self.rows = list(rows or [types.SimpleNamespace(user_id="qq:FriendMessage:one", platform_id="qq")])
         self.output_factory = output_factory
+        self.raw_output = None
+        self.provider_type = "llm"
         self.llm_calls = []
         self.sent = []
         self.fail = set()
@@ -108,7 +110,7 @@ class Context:
         if provider_id != "planner-provider":
             return None
         return types.SimpleNamespace(meta=lambda: types.SimpleNamespace(
-            id=provider_id, model="deepseek-chat", type="llm"))
+            id=provider_id, model="deepseek-chat", type=self.provider_type))
 
     async def persona(self):
         return {"prompt": "default persona prompt"}
@@ -119,9 +121,11 @@ class Context:
     def get_platform_inst(self, platform_id):
         return types.SimpleNamespace(meta=lambda: types.SimpleNamespace(name="aiocqhttp"))
 
-    async def llm_generate(self, *, chat_provider_id, prompt, system_prompt=None, tools=None):
+    async def llm_generate(self, *, chat_provider_id, prompt, system_prompt=None, tools=None, **kwargs):
         self.llm_calls.append({"provider": chat_provider_id, "prompt": prompt,
-                               "system_prompt": system_prompt, "tools": tools})
+                               "system_prompt": system_prompt, "tools": tools, **kwargs})
+        if self.raw_output is not None:
+            return types.SimpleNamespace(completion_text=self.raw_output)
         if self.output_factory:
             return types.SimpleNamespace(completion_text=json.dumps(
                 self.output_factory(prompt), ensure_ascii=False))
@@ -482,6 +486,87 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan["schema_version"], 2)
         self.assertTrue(plan["daily_theme"] and plan["daily_style"])
         self.assertTrue(all(event["message"] for event in plan["deliveries"]))
+
+    async def test_openai_compatible_provider_receives_json_mode_and_output_budget(self):
+        self.context.provider_type = "openai_chat_completion"
+        self.context.output_factory = lambda prompt: valid_response_for(
+            json.loads(prompt.split("PLANNER_INPUT:\n", 1)[1]))
+        result = await self.service.generate_life_day(self.start)
+        self.assertEqual(result["status"], "generated")
+        self.assertEqual(len(self.context.llm_calls), 1)
+        self.assertEqual(self.context.llm_calls[0]["response_format"], {"type": "json_object"})
+        self.assertEqual(self.context.llm_calls[0]["max_tokens"], 8192)
+
+    async def test_unknown_provider_type_does_not_receive_json_mode_kwargs(self):
+        self.context.provider_type = "some_other_adapter"
+        self.context.output_factory = lambda prompt: valid_response_for(
+            json.loads(prompt.split("PLANNER_INPUT:\n", 1)[1]))
+        result = await self.service.generate_life_day(self.start)
+        self.assertEqual(result["status"], "generated")
+        self.assertEqual(len(self.context.llm_calls), 1)
+        self.assertNotIn("response_format", self.context.llm_calls[0])
+        self.assertNotIn("max_tokens", self.context.llm_calls[0])
+
+    async def test_complete_markdown_json_fence_is_unwrapped(self):
+        planner_input = await self._input()
+        raw = json.dumps(valid_response_for(planner_input), ensure_ascii=False)
+        self.context.raw_output = f"```json\n{raw}\n```"
+        result = await self.service.generate_life_day(self.start)
+        self.assertEqual(result["status"], "generated")
+        self.assertEqual(len(self.context.llm_calls), 1)
+
+    async def test_malformed_json_fails_once_without_persisting_partial_plan(self):
+        self.context.raw_output = '{"daily_theme":"x" "daily_style":"y","timeline":[]}'
+        result = await self.service.generate_life_day(self.start)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(len(self.context.llm_calls), 1)
+        self.assertNotEqual(self.service._plans().get(self.start.isoformat(), {}).get("status"), "complete")
+
+    async def test_unterminated_json_string_logs_only_bounded_diagnostics(self):
+        secret = "PRIVATE-RAW-TAIL-" + ("x" * 500)
+        self.context.raw_output = '{"daily_theme":"x","daily_style":"y","timeline":[{"state":"' + secret
+        with patch.object(sys.modules[ScheduleBroadcastService.__module__].logger, "warning") as warning:
+            result = await self.service.generate_life_day(self.start)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(len(self.context.llm_calls), 1)
+        warning.assert_called_once()
+        diagnostic = str(warning.call_args)
+        self.assertIn("raw_length", diagnostic)
+        self.assertIn("error_line", diagnostic)
+        self.assertIn("error_column", diagnostic)
+        self.assertIn("error_pos", diagnostic)
+        self.assertIn("raw_tail", diagnostic)
+        self.assertNotIn(secret, diagnostic)
+        self.assertLessEqual(len(warning.call_args.args[-1]), 240)
+
+    async def test_planner_prompt_requires_compact_concise_json(self):
+        prompt = self.service._planner_prompt(await self._input())
+        self.assertIn("紧凑 JSON", prompt)
+        self.assertIn("不要 Markdown、代码围栏、解释", prompt)
+        self.assertIn("NORMAL 的 state 通常只写1句简洁", prompt)
+        self.assertIn("BRIDGE 的 state 可写内部阶段，通常用2-4句", prompt)
+        self.assertIn("不写小说式叙述", prompt)
+
+    async def test_long_valid_json_response_over_4400_chars_is_accepted(self):
+        planner_input = await self._input()
+        result_json = valid_response_for(planner_input)
+        result_json["timeline"][0]["state"] = "continuity " * 550
+        raw = json.dumps(result_json, ensure_ascii=False)
+        self.assertGreater(len(raw), 4400)
+        self.context.raw_output = raw
+        result = await self.service.generate_life_day(self.start)
+        self.assertEqual(result["status"], "generated")
+        self.assertEqual(len(self.context.llm_calls), 1)
+
+    async def test_fatfish_block_still_makes_zero_llm_calls_before_kwargs_resolution(self):
+        self._use_config_only_fatfish()
+        self.day.now = datetime(2026, 10, 9, 10, 0, tzinfo=TZ)
+        self.context.get_provider_by_id = lambda _provider_id: (_ for _ in ()).throw(
+            AssertionError("provider kwargs should not be resolved before Fat Fish gate"))
+        result = await self.service.generate_life_day(self.start)
+        self.assertEqual(result["status"], "deferred")
+        self.assertEqual(result["reason"], "blocked_by_fat_fish")
+        self.assertEqual(len(self.context.llm_calls), 0)
 
     async def test_planner_call_is_deferred_during_fatfish_peak_then_runs_offpeak(self):
         self._use_config_only_fatfish()

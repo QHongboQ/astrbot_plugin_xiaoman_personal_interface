@@ -31,11 +31,13 @@ send_xiaoman_photo()
 
 本版本不包含任何 TTS、语音提示、表演标签或 MiMo 逻辑。
 
-## 可选：林小满生命日规划器（v0.8.3）
+## 可选：林小满生命日规划器（v0.8.4）
 
 默认关闭。启用前请安装并启用 `time_awareness`，并配置可用的 LLM provider。**林小满拥有最终的生命日时间线**；TimeAwareness 仅作为只读时钟、动态生命日边界、工作日/节假日、世界观、人设开关、主题/风格池和可用天气等上下文来源。林小满不会读取或依赖 TimeAwareness 日程快照，不调用它的 AI 日程生成器，也不会修改其源码、配置或快照。
 
 每次生命日规划是一个全局 LLM 请求：先依据 `daily_schedule.ai_daily.generation_time` 生成从边界时刻到下一日同一边界的完整时间线，并在同一次响应中生成主题、风格和所有 NORMAL/高峰桥接消息。Fat Fish 仅提供只读有效高峰政策；规划器按 `peak_guard_before_minutes` / `peak_guard_after_minutes` 扩展保护窗口，再把完整自由窗与保护窗一起交给规划器。保护窗恰好对应一个 BRIDGE 活动。计划通过无缺口、无重叠、类别及消息完整性验证后，保存到 Xiaoman 独立的 `life_day_plans.json`。刷新与到点投递均不调用 LLM；发送失败目标在宽限期内重试，成功目标不会重复发送。
+
+规划请求会在可识别的 OpenAI-compatible chat-completion provider 上请求 JSON object 输出并设置较大的输出预算；其他 provider 不会盲目接收专属参数。完整包裹响应的一层 Markdown fence 可安全移除，但非法 JSON 不会被猜测或修补，也不会触发第二次 LLM 请求；生成失败时不保存部分计划，并仅记录有界解析诊断。
 
 规划器提供用户可编辑的加权 `activity_pool` 和软性 `activity_density`。睡眠只是普通生活事件，用于自然节奏和避免全天高强度活动；Xiaoman 不按生理/医疗模型计算睡眠债、补偿时长或强制起床时间，也不会因为晚睡推导晚起。前一生命日历史仅提供轻量叙事与防重复线索，不会改变或占用 Fat Fish 保护窗。空闲窗内较长睡眠通常作为独立 `category=sleep` NORMAL；保护 BRIDGE 仍是一个不可拆分的顶层事件，若跨越睡眠、醒来和慢启动，通常用 `category=mixed`。新计划所有 timeline 项都必须包含允许值内的 `category`，已有 v0.8.0/v0.8.1 无类别计划仍兼容。
 

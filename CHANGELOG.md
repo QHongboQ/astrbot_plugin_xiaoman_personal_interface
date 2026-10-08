@@ -6,6 +6,14 @@
 - MINOR：新增能力或明显行为变化，保持兼容。
 - PATCH：缺陷修复、测试或文档修正，不改变主要功能边界。
 
+## 0.8.4 — 2026-10-07
+
+### 生命日规划输出稳定性
+
+- 对明确使用 AstrBot OpenAI-compatible chat-completion adapter 的规划请求，传入 JSON object response format 与 8192 输出 token budget；其他 provider 不接收这些专用参数。
+- 规划提示要求紧凑 JSON 和简洁状态描述；仅去除完整响应外的一层 Markdown fence，不修补非法 JSON。
+- 非法 JSON 仍安全失败并记录有界解析诊断，不调用第二次 LLM，也不保存部分计划。
+
 ## 0.8.3 — 2026-10-08
 
 ### 简化睡眠节奏规划
