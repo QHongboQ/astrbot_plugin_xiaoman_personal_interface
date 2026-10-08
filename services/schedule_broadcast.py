@@ -14,7 +14,7 @@ from astrbot.api import logger
 from .fat_fish_bridge import FatFishBridge
 from .time_awareness_adapter import TimeAwarenessAdapter
 
-PLANNER_VERSION = "0.9.1"
+PLANNER_VERSION = "0.10.0"
 SCHEMA_VERSION = 2
 DAILY_THEME_MAX_CHARS = 60
 DAILY_STYLE_MAX_CHARS = 40
@@ -461,10 +461,22 @@ class ScheduleBroadcastService:
             "continuity": continuity,
         }
 
+    @staticmethod
+    def _ordered_windows(planner_input):
+        windows = [
+            (kind, row)
+            for kind, rows in (("FREE", planner_input.get("free_windows", [])),
+                               ("PROTECTED", planner_input.get("protected_windows", [])))
+            for row in rows
+        ]
+        return sorted(windows, key=lambda item: _absolute(item[1]["start_at"]))
+
     def _planner_prompt(self, planner_input):
         guidance = (
-            "你是林小满的生活日规划器。规划的是完整 life_day，不是自然日；一次性从头安排到尾。你负责生活语义，Python 负责机械时间线结构。"
-            "请按输入中的 free_windows 精确 ID 返回 ordered semantic segments + duration weights；每个 protected_windows 精确 ID 返回一个 semantic BRIDGE。不要给事件生成 ID 或 kind，也不要输出任何时间/高峰边界字段；Python 会确定性分配时长并构造完整 timeline。"
+            "你是林小满的生活日规划器。规划的是完整 life_day，不是自然日；这是从生命日开始到次日边界的一段连续生活。你负责生活语义，Python 负责机械时间线结构。"
+            "严格按 window_sequence[0]、window_sequence[1] 一直到最后一项的顺序，从头到尾规划这一天；不要先分别规划所有 FREE 窗口再规划所有 PROTECTED 窗口。每个新窗口都必须自然接续紧邻的前一窗口，先考虑前一窗口结束时的活动与状态，避免互相矛盾的转场。"
+            "PROTECTED 边界是结构边界，不是故事重置或活动必须结束的信号；同一活动可以跨边界继续，进出消息应如实表达继续或结束，不要为了边界而强行收工/离开。若前一阶段清醒而下一阶段又睡觉，应明确是回笼觉、又睡过去或重新躺下补觉。Python 只做机械物化，不会做语义修复；请在这一次 day_sequence 中规划出连贯故事。"
+            "对 window_sequence 中每个 FREE 窗口返回有序 semantic segments + duration weights；每个 PROTECTED 窗口返回一个 semantic BRIDGE。不要给事件生成 ID 或 kind，也不要输出任何时间/高峰边界字段；Python 会确定性分配时长并构造完整 timeline。"
             "NORMAL 语义段提供 category,name,state,broadcast_message,weight；BRIDGE 提供 category,name,state,enter_message,exit_message。weight 只表示当前 free_window 内相对持续时间，允许 1..100，不是概率或精确时长。"
             "name、state、broadcast_message、enter_message、exit_message 不得声称依赖最终时间线的精确钟点或时长；用上午/下午/晚上/深夜/一会儿/晚点等宽泛时间表达。精确时间和时长只由 Python 的最终时间线决定。上下文明确提供的外部固定事实不必回避，但不得为活动时间自行编造具体钟点或时长。"
             "每个正常消息和桥接进出消息尽量写自然完整的短句；消息格式错误会按活动名称使用确定性兜底，不影响其他语义校验。"
@@ -481,7 +493,7 @@ class ScheduleBroadcastService:
             "优先改变整日形状和活动链，而不只是把昨天的场所换个名字。避免连续复刻‘娱乐地点→夜市/宵夜→KTV→打车回家→刷手机→睡觉’；例如昨天‘密室→夜市→KTV’，今天即使改成‘电玩城→夜市→KTV’仍是重复。可改成工作室/项目→晚餐→回家游戏/早休、逛店→电影→晚餐、朋友家做饭/游戏、户外活动→咖啡/回家、宅家游戏/视频或只安排一个夜间主要活动。近期反复呈现同一日型时，合理地换成恢复日、项目日、外出日、居家日、社交日、夜生活日或随性混合日；不追求每天最大新奇。昨天的活动可作为聊天回忆，但不要因此重演整条活动链。"
             "规划保护窗的跨日变化时，比较 recent_life_days[].bridge_activities 中的 category、name 和时间段；若最近一天两个 protected_window 都主要是上课/课程/工作室学业，今天在上下文允许时应考虑不同 BRIDGE 结构，如无课/一节课、个人项目创作、购物外出、休息恢复、社交、办事、旅行或娱乐；课程在日历、世界观或强上下文支持时仍完全允许。目标是打破默认重复，不是编造变化。"
             "优先遵循 worldview、theme_pool、style_pool、天气和真实日历。不要每天塞满高强度活动。人物、地点、天气影响、消费和结果不得无依据编造。"
-            "只输出紧凑 JSON，不要 Markdown、代码围栏、解释或 JSON 前后的文字，尽量避免无意义空白和冗长叙述。顶层格式：daily_theme,daily_style,free_window_plans,bridge_plans。free_window_plans 的键必须与输入 free_windows 的 Fxx 完全一致，值为按活动顺序排列的语义段数组；bridge_plans 的键必须与 protected_windows 的 Pxx 完全一致，值为单个语义对象。不得添加、遗漏或改名窗口。"
+            "只输出紧凑 JSON，不要 Markdown、代码围栏、解释或 JSON 前后的文字，尽量避免无意义空白和冗长叙述。顶层格式：daily_theme,daily_style,day_sequence。day_sequence 必须与 window_sequence 的窗口 ID 数量和时间顺序完全一致，不得重复、遗漏、增加、重排或改名。每个 FREE 项只含 window_id 与 segments（语义段数组）；每个 PROTECTED 项只含 window_id 与 bridge（一个语义对象）；每个窗口恰好一项。"
             "语义事件对象内不得包含 id,kind,start_at,end_at,source_peak_start,source_peak_end；BRIDGE 内部阶段可以写在 state。daily_theme 不超过60字符，daily_style 不超过40字符。category 必须是 sleep,rest,meal,travel,school,creative,social,entertainment,outdoor,shopping,errand,mixed,other 之一。"
             "每项 name 不超过48字符。NORMAL state 不超过120字符，通常只写1句简洁连续性信息；BRIDGE state 不超过240字符，可写内部阶段，通常用2-4句或短阶段描述。weight 缺失或非有效正整数按1处理，低于1按1处理，高于100按100处理。"
             "state 只保留后续规划需要的信息，不写小说式叙述；播报消息仍须自然、有个性。"
@@ -492,7 +504,14 @@ class ScheduleBroadcastService:
             f"每条消息不得超过 {self._int('max_message_chars', 80, 1)} 个字符。"
         )
         extra = str(self._get("planner_prompt", "") or "").strip()
-        return guidance + (f"\n补充规划要求：{extra}" if extra else "") + "\nPLANNER_INPUT:\n" + json.dumps(planner_input, ensure_ascii=False, default=str)
+        llm_input = {key: value for key, value in planner_input.items()
+                     if key not in {"free_windows", "protected_windows"}}
+        window_sequence = [
+            {"id": row["id"], "type": kind, "start_at": row["start_at"], "end_at": row["end_at"]}
+            for kind, row in self._ordered_windows(planner_input)
+        ]
+        llm_input["window_sequence"] = window_sequence
+        return guidance + (f"\n补充规划要求：{extra}" if extra else "") + "\nPLANNER_INPUT:\n" + json.dumps(llm_input, ensure_ascii=False, default=str)
 
     @staticmethod
     def _normalized_weight(value):
@@ -570,47 +589,47 @@ class ScheduleBroadcastService:
             raise ValueError(f"planner semantic event state exceeds {state_limit} characters")
 
     def _materialize_planner_timeline(self, planner_input, planner_result):
-        """Build persisted timeline mechanics from semantic free/protected window plans."""
+        """Build persisted timeline mechanics from one ordered semantic day sequence."""
         if not isinstance(planner_result, dict):
             raise ValueError("planner response must be an object")
-        free_plans = planner_result.get("free_window_plans")
-        bridge_plans = planner_result.get("bridge_plans")
-        if not isinstance(free_plans, dict) or not isinstance(bridge_plans, dict):
-            raise ValueError("planner response missing free_window_plans or bridge_plans")
-        free_windows = planner_input.get("free_windows", [])
-        protected_windows = planner_input.get("protected_windows", [])
-        expected_free = {str(row["id"]) for row in free_windows}
-        expected_bridge = {str(row["id"]) for row in protected_windows}
-        if set(free_plans) != expected_free:
-            raise ValueError("free_window_plans keys do not match input windows")
-        if set(bridge_plans) != expected_bridge:
-            raise ValueError("bridge_plans keys do not match protected windows")
+        if "free_window_plans" in planner_result or "bridge_plans" in planner_result:
+            raise ValueError("legacy planner response contract is not supported")
+        expected = self._ordered_windows(planner_input)
+        day_sequence = planner_result.get("day_sequence")
+        if not isinstance(day_sequence, list) or len(day_sequence) != len(expected):
+            raise ValueError("day_sequence window count does not match expected windows")
 
         timeline = []
-        for window in free_windows:
-            segments = free_plans[window["id"]]
-            if not isinstance(segments, list) or not segments:
-                raise ValueError(f"free window {window['id']} semantic segments missing")
-            for item in segments:
-                self._validate_semantic_event(item)
-            intervals = self._allocate_weighted_durations(
-                _absolute(window["start_at"]), _absolute(window["end_at"]), segments)
-            for item, (start, end) in zip(segments, intervals):
-                timeline.append({"kind": "NORMAL", "category": item["category"],
-                                 "start_at": start.isoformat(), "end_at": end.isoformat(),
+        for (kind, window), entry in zip(expected, day_sequence):
+            if not isinstance(entry, dict) or entry.get("window_id") != window["id"]:
+                raise ValueError("day_sequence window IDs do not match expected chronological order")
+            if kind == "FREE":
+                if set(entry) != {"window_id", "segments"}:
+                    raise ValueError(f"FREE window {window['id']} must contain only segments")
+                segments = entry.get("segments")
+                if not isinstance(segments, list) or not segments:
+                    raise ValueError(f"free window {window['id']} semantic segments missing")
+                for item in segments:
+                    self._validate_semantic_event(item)
+                intervals = self._allocate_weighted_durations(
+                    _absolute(window["start_at"]), _absolute(window["end_at"]), segments)
+                for item, (start, end) in zip(segments, intervals):
+                    timeline.append({"kind": "NORMAL", "category": item["category"],
+                                     "start_at": start.isoformat(), "end_at": end.isoformat(),
+                                     "name": item["name"], "state": item["state"],
+                                     "_message": item.get("broadcast_message")})
+            else:
+                if set(entry) != {"window_id", "bridge"}:
+                    raise ValueError(f"PROTECTED window {window['id']} must contain only bridge")
+                item = entry.get("bridge")
+                self._validate_semantic_event(item, bridge=True)
+                timeline.append({"kind": "BRIDGE", "category": item["category"],
+                                 "start_at": window["start_at"], "end_at": window["end_at"],
                                  "name": item["name"], "state": item["state"],
-                                 "_message": item.get("broadcast_message")})
-
-        for window in protected_windows:
-            item = bridge_plans[window["id"]]
-            self._validate_semantic_event(item, bridge=True)
-            timeline.append({"kind": "BRIDGE", "category": item["category"],
-                             "start_at": window["start_at"], "end_at": window["end_at"],
-                             "name": item["name"], "state": item["state"],
-                             "source_peak_start": window["source_peak_start"],
-                             "source_peak_end": window["source_peak_end"],
-                             "_enter_message": item.get("enter_message"),
-                             "_exit_message": item.get("exit_message")})
+                                 "source_peak_start": window["source_peak_start"],
+                                 "source_peak_end": window["source_peak_end"],
+                                 "_enter_message": item.get("enter_message"),
+                                 "_exit_message": item.get("exit_message")})
 
         timeline.sort(key=lambda row: _absolute(row["start_at"]))
         normal_id = bridge_id = 0

@@ -243,19 +243,24 @@ async def verify_schedule_bridge_public_contract():
         async def llm_generate(self, *, chat_provider_id, prompt=None, tools=None, system_prompt=None, **kwargs):
             self.llm_calls.append((chat_provider_id, prompt, tools, system_prompt))
             planner_input = json.loads(prompt.split("PLANNER_INPUT:\n", 1)[1])
+            day_sequence = []
+            for window in planner_input["window_sequence"]:
+                if window["type"] == "FREE":
+                    day_sequence.append({
+                        "window_id": window["id"],
+                        "segments": [{"category": "rest", "name": "休息", "state": "在家休息",
+                                      "broadcast_message": "今天先按自己的节奏休息。", "weight": 1}],
+                    })
+                else:
+                    day_sequence.append({
+                        "window_id": window["id"],
+                        "bridge": {"category": "rest", "name": "保护窗内休息",
+                                   "state": "安静休息。", "enter_message": "先去休息啦。",
+                                   "exit_message": "休息结束了。"},
+                    })
             return types.SimpleNamespace(completion_text=json.dumps({
                 "daily_theme": "runtime theme", "daily_style": "runtime style",
-                "free_window_plans": {
-                    free["id"]: [{"category": "rest", "name": "休息", "state": "在家休息",
-                                  "broadcast_message": "今天先按自己的节奏休息。", "weight": 1}]
-                    for free in planner_input["free_windows"]
-                },
-                "bridge_plans": {
-                    protected["id"]: {"category": "rest", "name": "保护窗内休息",
-                                      "state": "安静休息。", "enter_message": "先去休息啦。",
-                                      "exit_message": "休息结束了。"}
-                    for protected in planner_input["protected_windows"]
-                }}, ensure_ascii=False))
+                "day_sequence": day_sequence}, ensure_ascii=False))
 
         async def send_message(self, session, message_chain):
             assert isinstance(message_chain, MessageChain)
@@ -275,7 +280,7 @@ async def verify_schedule_bridge_public_contract():
     assert runtime_context.llm_calls[0][2] is None
     assert runtime_context.llm_calls[0][3] == "runtime dict persona"
     assert service.current_plan(clock)["timeline"][0]["name"] == "休息"
-    assert service.current_plan(clock)["planner_version"] == "0.9.1"
+    assert service.current_plan(clock)["planner_version"] == "0.10.0"
     assert service.current_plan(clock)["schema_version"] == 2
     assert {"id", "kind", "start_at", "end_at"}.issubset(service.current_plan(clock)["timeline"][0])
     call_count = len(runtime_context.llm_calls)

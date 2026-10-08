@@ -158,16 +158,41 @@ def window(start, end):
 
 
 def valid_response_for(planner_input):
-    free_window_plans = {}
-    for item in planner_input["free_windows"]:
-        free_window_plans[item["id"]] = [{"category": "rest", "name": "日常安排", "state": "自然活动",
-                                         "broadcast_message": "今天按自己的节奏安排生活。", "weight": 1}]
-    bridge_plans = {}
-    for item in planner_input["protected_windows"]:
-        bridge_plans[item["id"]] = {"category": "social", "name": "连续活动", "state": "内部阶段依次推进",
-                                     "enter_message": "我先去参加今天的活动啦。", "exit_message": "活动告一段落，接着安排下一件事。"}
+    day_sequence = []
+    if "window_sequence" in planner_input:
+        free_windows = [item for item in planner_input["window_sequence"] if item["type"] == "FREE"]
+        protected_windows = [item for item in planner_input["window_sequence"]
+                             if item["type"] == "PROTECTED"]
+    else:
+        free_windows = planner_input["free_windows"]
+        protected_windows = planner_input["protected_windows"]
+    for item in free_windows:
+        day_sequence.append((item["start_at"], {
+            "window_id": item["id"], "segments": [
+                {"category": "rest", "name": "日常安排", "state": "自然活动",
+                 "broadcast_message": "今天按自己的节奏安排生活。", "weight": 1}
+            ]}))
+    for item in protected_windows:
+        day_sequence.append((item["start_at"], {
+            "window_id": item["id"], "bridge": {
+                "category": "social", "name": "连续活动", "state": "内部阶段依次推进",
+                "enter_message": "我先去参加今天的活动啦。", "exit_message": "活动告一段落，接着安排下一件事。"
+            }}))
+    day_sequence.sort(key=lambda pair: datetime.fromisoformat(pair[0]))
     return {"daily_theme": "夜色灵感", "daily_style": "轻松随性",
-            "free_window_plans": free_window_plans, "bridge_plans": bridge_plans}
+            "day_sequence": [entry for _start, entry in day_sequence]}
+
+
+def sequence_item(response, window_id):
+    return next(item for item in response["day_sequence"] if item["window_id"] == window_id)
+
+
+def free_segments(response, window_id):
+    return sequence_item(response, window_id)["segments"]
+
+
+def bridge_semantics(response, window_id):
+    return sequence_item(response, window_id)["bridge"]
 
 
 def materialized_timeline(service, planner_input):
@@ -232,8 +257,18 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("protected_windows", planner_input)
         self.assertIn("free_windows", planner_input)
         embedded = json.loads(self.service._planner_prompt(planner_input).split("PLANNER_INPUT:\n", 1)[1])
-        self.assertEqual(embedded["protected_windows"], planner_input["protected_windows"])
-        self.assertEqual(embedded["free_windows"], planner_input["free_windows"])
+        self.assertEqual([(row["id"], row["type"], row["start_at"], row["end_at"])
+                          for row in embedded["window_sequence"]], [
+            ("F01", "FREE", "2026-10-09T04:00:00+08:00", "2026-10-09T08:55:00+08:00"),
+            ("P01", "PROTECTED", "2026-10-09T08:55:00+08:00", "2026-10-09T12:05:00+08:00"),
+            ("F02", "FREE", "2026-10-09T12:05:00+08:00", "2026-10-09T13:55:00+08:00"),
+            ("P02", "PROTECTED", "2026-10-09T13:55:00+08:00", "2026-10-09T18:05:00+08:00"),
+            ("F03", "FREE", "2026-10-09T18:05:00+08:00", "2026-10-10T04:00:00+08:00"),
+        ])
+        self.assertNotIn("free_windows", embedded)
+        self.assertNotIn("protected_windows", embedded)
+        self.assertNotIn("source_peak_start", json.dumps(embedded))
+        self.assertNotIn("source_peak_end", json.dumps(embedded))
 
     async def test_real_fatfish_111_config_produces_guarded_planner_windows(self):
         self._use_config_only_fatfish()
@@ -262,7 +297,7 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         ]
         data = await self._input()
         response = valid_response_for(data)
-        response["free_window_plans"]["F03"] = [
+        sequence_item(response, "F03")["segments"] = [
             {"category": category, "name": name, "state": "按自己的节奏安排。",
              "broadcast_message": name, "weight": weight}
             for category, name, weight in [
@@ -271,11 +306,11 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
             ]
         ]
         forbidden = {"id", "kind", "start_at", "end_at", "source_peak_start", "source_peak_end"}
-        for segments in response["free_window_plans"].values():
-            for segment in segments:
+        for item in response["day_sequence"]:
+            for segment in item.get("segments", []):
                 self.assertFalse(forbidden.intersection(segment))
-        for bridge in response["bridge_plans"].values():
-            self.assertFalse(forbidden.intersection(bridge))
+            if "bridge" in item:
+                self.assertFalse(forbidden.intersection(item["bridge"]))
 
         timeline = self.service._materialize_planner_timeline(data, response)
         valid, reason = self.service.validate_timeline(data, timeline)
@@ -293,6 +328,69 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
                              (source["start_at"], source["end_at"]))
             self.assertEqual((row["source_peak_start"], row["source_peak_end"]),
                              (source["source_peak_start"], source["source_peak_end"]))
+
+    async def test_day_sequence_materializes_continuation_across_protected_boundary(self):
+        self.fish.windows = [
+            window("2026-10-09T09:00:00+08:00", "2026-10-09T12:00:00+08:00"),
+            window("2026-10-09T14:00:00+08:00", "2026-10-09T18:00:00+08:00"),
+        ]
+        data = await self._input()
+        response = valid_response_for(data)
+        bridge_semantics(response, "P02").update(
+            name="工作室赶稿", state="作品还没完全收尾，还要继续修改。",
+            exit_message="还没画完，继续弄一会儿。")
+        free_segments(response, "F03")[0].update(
+            name="继续把作品收尾", state="接着完成画室里的作品。",
+            broadcast_message="我再把作品收个尾，等会儿去吃饭。")
+
+        timeline = self.service._materialize_planner_timeline(data, response)
+
+        self.assertTrue(self.service.validate_timeline(data, timeline)[0])
+        bridge_index = next(i for i, row in enumerate(timeline)
+                            if row["kind"] == "BRIDGE" and row["name"] == "工作室赶稿")
+        self.assertEqual(timeline[bridge_index]["exit_message"], "还没画完，继续弄一会儿。")
+        self.assertEqual(timeline[bridge_index + 1]["name"], "继续把作品收尾")
+        self.assertEqual(timeline[bridge_index]["end_at"], timeline[bridge_index + 1]["start_at"])
+
+    async def test_day_sequence_order_is_exact_and_invalid_generation_uses_one_planner_call(self):
+        self.fish.windows = [
+            window("2026-10-09T09:00:00+08:00", "2026-10-09T12:00:00+08:00"),
+            window("2026-10-09T14:00:00+08:00", "2026-10-09T18:00:00+08:00"),
+        ]
+        data = await self._input()
+        cases = []
+
+        out_of_order = valid_response_for(data)
+        by_id = {item["window_id"]: item for item in out_of_order["day_sequence"]}
+        out_of_order["day_sequence"] = [by_id[ident] for ident in ["F01", "F02", "F03", "P01", "P02"]]
+        cases.append(out_of_order)
+
+        missing = valid_response_for(data)
+        missing["day_sequence"] = [item for item in missing["day_sequence"]
+                                    if item["window_id"] != "F02"]
+        cases.append(missing)
+
+        duplicate = valid_response_for(data)
+        duplicate["day_sequence"][3] = {
+            **duplicate["day_sequence"][3], "window_id": "P01"}
+        cases.append(duplicate)
+
+        extra = valid_response_for(data)
+        extra["day_sequence"].append({"window_id": "F99", "segments": []})
+        cases.append(extra)
+
+        for response in cases:
+            self.context.llm_calls.clear()
+            self.context.output_factory = lambda _prompt, result=response: result
+            result = await self.service.generate_life_day(self.start, force=True)
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(len(self.context.llm_calls), 1)
+
+        legacy_response = valid_response_for(data)
+        legacy_response.pop("day_sequence")
+        legacy_response.update(free_window_plans={}, bridge_plans={})
+        with self.assertRaisesRegex(ValueError, "legacy planner response contract"):
+            self.service._materialize_planner_timeline(data, legacy_response)
 
     def test_weight_allocator_equal_and_uneven_weights_use_stable_largest_remainder(self):
         start = datetime(2026, 10, 9, 0, 0, tzinfo=TZ)
@@ -334,16 +432,18 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.fish.windows = [window("2026-10-09T09:00:00+08:00", "2026-10-09T12:00:00+08:00")]
         data = await self._input()
         response = valid_response_for(data)
-        del response["free_window_plans"]["F02"]
-        with self.assertRaisesRegex(ValueError, "keys do not match"):
+        response["day_sequence"] = [item for item in response["day_sequence"]
+                                    if item["window_id"] != "F02"]
+        with self.assertRaisesRegex(ValueError, "day_sequence window count"):
             self.service._materialize_planner_timeline(data, response)
         response = valid_response_for(data)
-        response["free_window_plans"]["F99"] = response["free_window_plans"].pop("F01")
-        with self.assertRaisesRegex(ValueError, "keys do not match"):
+        sequence_item(response, "F01")["window_id"] = "F99"
+        with self.assertRaisesRegex(ValueError, "window IDs do not match"):
             self.service._materialize_planner_timeline(data, response)
         response = valid_response_for(data)
-        response["bridge_plans"].pop("P01")
-        with self.assertRaisesRegex(ValueError, "keys do not match"):
+        response["day_sequence"] = [item for item in response["day_sequence"]
+                                    if item["window_id"] != "P01"]
+        with self.assertRaisesRegex(ValueError, "day_sequence window count"):
             self.service._materialize_planner_timeline(data, response)
 
     async def test_message_fallbacks_preserve_valid_and_replace_missing_or_oversized_once(self):
@@ -353,11 +453,11 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         ]
         data = await self._input()
         response = valid_response_for(data)
-        response["free_window_plans"]["F01"][0]["broadcast_message"] = "  valid unchanged  "
-        response["free_window_plans"]["F02"][0]["broadcast_message"] = ""
-        response["free_window_plans"]["F03"][0]["broadcast_message"] = "超" * 81
-        response["bridge_plans"]["P01"]["enter_message"] = None
-        response["bridge_plans"]["P02"]["exit_message"] = "超" * 81
+        free_segments(response, "F01")[0]["broadcast_message"] = "  valid unchanged  "
+        free_segments(response, "F02")[0]["broadcast_message"] = ""
+        free_segments(response, "F03")[0]["broadcast_message"] = "超" * 81
+        bridge_semantics(response, "P01")["enter_message"] = None
+        bridge_semantics(response, "P02")["exit_message"] = "超" * 81
         self.context.output_factory = lambda _prompt: response
         result = await self.service.generate_life_day(self.start)
         self.assertEqual(result["status"], "generated")
@@ -379,20 +479,20 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.service.cfg["max_message_chars"] = 4
         data = await self._input()
         response = valid_response_for(data)
-        response["free_window_plans"]["F01"][0].update(name="很长的活动名称", broadcast_message="too long")
+        free_segments(response, "F01")[0].update(name="很长的活动名称", broadcast_message="too long")
         self.context.output_factory = lambda _prompt: response
         result = await self.service.generate_life_day(self.start)
         self.assertEqual(result["status"], "generated")
         self.assertEqual(len(self.context.llm_calls), 1)
         self.assertLessEqual(len(result["plan"]["timeline"][0]["broadcast_message"]), 4)
 
-    async def test_generation_persists_v09_mechanics_with_legacy_schema_version(self):
+    async def test_generation_persists_v010_planner_with_legacy_schema_version(self):
         self.context.output_factory = lambda prompt: valid_response_for(
             json.loads(prompt.split("PLANNER_INPUT:\n", 1)[1]))
         result = await self.service.generate_life_day(self.start)
         self.assertEqual(result["status"], "generated")
         self.assertEqual(len(self.context.llm_calls), 1)
-        self.assertEqual(result["plan"]["planner_version"], "0.9.1")
+        self.assertEqual(result["plan"]["planner_version"], "0.10.0")
         self.assertEqual(result["plan"]["schema_version"], 2)
         for row in result["plan"]["timeline"]:
             self.assertTrue({"id", "kind", "category", "start_at", "end_at", "name", "state"}.issubset(row))
@@ -673,7 +773,7 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
              "end_at": life_end.isoformat()},
         ]
         response = valid_response_for(planner_input)
-        response["free_window_plans"]["F02"] = [
+        sequence_item(response, "F02")["segments"] = [
             {"category": category, "name": name, "state": "有意义的生活阶段",
              "broadcast_message": name, "weight": 1}
             for category, name in [("meal", "晚饭"), ("social", "朋友聊天"),
@@ -842,13 +942,45 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("NORMAL state 不超过120字符", prompt)
         self.assertIn("BRIDGE state 不超过240字符", prompt)
         self.assertIn("不写小说式叙述", prompt)
-        self.assertIn("free_window_plans", contract)
-        self.assertIn("bridge_plans", contract)
+        self.assertIn("day_sequence", contract)
+        self.assertNotIn("free_window_plans", contract)
+        self.assertNotIn("bridge_plans", contract)
         self.assertIn("不要给事件生成 ID 或 kind，也不要输出任何时间/高峰边界字段", contract)
         self.assertIn("name、state、broadcast_message、enter_message、exit_message 不得声称依赖最终时间线的精确钟点或时长", contract)
         self.assertIn("精确时间和时长只由 Python 的最终时间线决定", contract)
         self.assertIn("上下文明确提供的外部固定事实不必回避", contract)
         self.assertNotIn("source_peak_* 原样照抄", contract)
+
+    async def test_planner_prompt_requires_one_forward_chronological_story(self):
+        prompt = self.service._planner_prompt(await self._input())
+        contract = prompt.split("PLANNER_INPUT:\n", 1)[0]
+        self.assertIn("从生命日开始到次日边界的一段连续生活", contract)
+        self.assertIn("严格按 window_sequence[0]、window_sequence[1] 一直到最后一项的顺序", contract)
+        self.assertIn("不要先分别规划所有 FREE 窗口再规划所有 PROTECTED 窗口", contract)
+        self.assertIn("自然接续紧邻的前一窗口", contract)
+        self.assertIn("PROTECTED 边界是结构边界，不是故事重置或活动必须结束的信号", contract)
+        self.assertIn("同一活动可以跨边界继续", contract)
+        self.assertIn("Python 只做机械物化，不会做语义修复", contract)
+        self.assertIn("顶层格式：daily_theme,daily_style,day_sequence", contract)
+        self.assertIn("每个 FREE 项只含 window_id 与 segments", contract)
+        self.assertIn("每个 PROTECTED 项只含 window_id 与 bridge", contract)
+        self.assertIn("每个窗口恰好一项", contract)
+        self.assertNotIn("free_window_plans", contract)
+        self.assertNotIn("bridge_plans", contract)
+
+    async def test_planner_llm_input_contains_only_ordered_window_sequence(self):
+        self.fish.windows = [
+            window("2026-10-09T09:00:00+08:00", "2026-10-09T12:00:00+08:00"),
+            window("2026-10-09T14:00:00+08:00", "2026-10-09T18:00:00+08:00"),
+        ]
+        planner_input = await self._input()
+        embedded = json.loads(self.service._planner_prompt(planner_input).split("PLANNER_INPUT:\n", 1)[1])
+        self.assertEqual([item["id"] for item in embedded["window_sequence"]],
+                         ["F01", "P01", "F02", "P02", "F03"])
+        self.assertNotIn("free_windows", embedded)
+        self.assertNotIn("protected_windows", embedded)
+        self.assertFalse(any("source_peak_start" in item or "source_peak_end" in item
+                             for item in embedded["window_sequence"]))
 
     async def test_daily_theme_and_style_character_caps(self):
         self.assertTrue(self.service.validate_daily_metadata({"daily_theme": "t" * 60,
@@ -1042,15 +1174,17 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event["delivered_umos"], ["qq:FriendMessage:one"])
 
     async def test_regeneration_changed_trigger_drops_partial_delivery_and_sends_again(self):
-        self.context.output_factory = lambda prompt: {
-            **valid_response_for(json.loads(prompt.split("PLANNER_INPUT:\n", 1)[1])),
-            "free_window_plans": {"F01": [
+        def response_for(prompt):
+            response = valid_response_for(json.loads(prompt.split("PLANNER_INPUT:\n", 1)[1]))
+            sequence_item(response, "F01")["segments"] = [
                 {"category": "rest", "name": "前段安排", "state": "休息中",
                  "broadcast_message": "前段消息", "weight": 1},
                 {"category": "social", "name": "新安排", "state": "活动中",
                  "broadcast_message": "新活动消息", "weight": 1},
-            ]},
-        }
+            ]
+            return response
+
+        self.context.output_factory = response_for
         changed_trigger = self.start + timedelta(hours=15)
         self.service._plans()[self.start.isoformat()] = {
             "status": "complete",
