@@ -31,11 +31,13 @@ send_xiaoman_photo()
 
 本版本不包含任何 TTS、语音提示、表演标签或 MiMo 逻辑。
 
-## 可选：林小满生命日规划器（v0.8.7）
+## 可选：林小满生命日规划器（v0.9.0）
 
 默认关闭。启用前请安装并启用 `time_awareness`，并配置可用的 LLM provider。**林小满拥有最终的生命日时间线**；TimeAwareness 仅作为只读时钟、动态生命日边界、工作日/节假日、世界观、人设开关、主题/风格池和可用天气等上下文来源。林小满不会读取或依赖 TimeAwareness 日程快照，不调用它的 AI 日程生成器，也不会修改其源码、配置或快照。
 
-每次生命日规划是一个全局 LLM 请求：先依据 `daily_schedule.ai_daily.generation_time` 生成从边界时刻到下一日同一边界的完整时间线，并在同一次响应中生成主题、风格和所有 NORMAL/高峰桥接消息。Fat Fish 仅提供只读有效高峰政策；规划器按 `peak_guard_before_minutes` / `peak_guard_after_minutes` 扩展保护窗口，再把完整自由窗与保护窗一起交给规划器。保护窗恰好对应一个 BRIDGE 活动。计划通过无缺口、无重叠、类别及消息完整性验证后，保存到 Xiaoman 独立的 `life_day_plans.json`。刷新与到点投递均不调用 LLM；发送失败目标在宽限期内重试，成功目标不会重复发送。
+每次生命日规划是一个全局 LLM 请求。v0.9.0 将语义规划与机械时间线结构分开：LLM 决定活动内容与顺序、每个自由窗内的相对持续时间权重、状态和播报文案；Python 按 `daily_schedule.ai_daily.generation_time` 确定性构造时间戳、NORMAL/BRIDGE 类型、时间线 ID、保护窗边界和完整无缝覆盖。Fat Fish 仅提供只读有效高峰政策；规划器按 `peak_guard_before_minutes` / `peak_guard_after_minutes` 扩展保护窗口，再把自由窗与保护窗交给 LLM。每个 Fxx 自由窗必须返回有序语义活动列表，每个 Pxx 保护窗必须返回一个 BRIDGE 语义对象。权重是窗内相对时长，不是概率；Python 保证正时长并按最大余数法分配分钟。
+
+最终生成的 NORMAL / BRIDGE timeline 与 v0.8.x 持久化格式兼容，`SCHEMA_VERSION` 仍为 2，已有计划不会迁移或重写。对于缺失、空白或超限播报文案，Python 仅按已生成的活动名称提供确定性、有长度上限的兜底，不修改有效消息，也不会进行语义修复或额外 LLM 调用。最终时间线仍通过完整覆盖、无缺口/重叠、类别、边界及消息验证后保存到 Xiaoman 独立的 `life_day_plans.json`。刷新与到点投递均不调用 LLM；发送失败目标在宽限期内重试，成功目标不会重复发送。
 
 AstrBot 4.28.2 的 `Context.llm_generate` 会将 per-call kwargs 交给 provider 的公开 `text_chat`，但内置 OpenAI adapter 不会把这些 kwargs 合入实际请求 payload。因此，小满不会传递无效的 per-call `response_format` / `max_tokens` 参数。若希望尽量降低完整日程输出被截断的概率，建议在 AstrBot WebUI 新建一个**专供 Xiaoman Planner 使用**的 OpenAI-compatible provider 实例（可以复用相同 API/model 凭据），并仅在该实例的 `custom_extra_body` 中配置：
 
@@ -45,7 +47,7 @@ response_format:
   type: json_object
 ```
 
-随后在小满配置页的 `provider_id` 中选用这个专用实例。不要把 JSON mode 配到日常聊天共用的 provider，否则普通对话也可能被强制要求输出 JSON。即使不做这项 provider 配置，小满仍使用紧凑输出提示、主题/风格/事件名称/状态硬长度限制、严格 JSON 解析和有界错误诊断；非法或超限输出会安全失败，不会自动修补、截断或二次调用 LLM。
+随后在小满配置页的 `provider_id` 中选用这个专用实例。不要把 JSON mode 配到日常聊天共用的 provider，否则普通对话也可能被强制要求输出 JSON。即使不做这项 provider 配置，小满仍使用紧凑输出提示、主题/风格/事件名称/状态硬长度限制、严格 JSON 解析和有界错误诊断；非法 JSON 或无效语义字段会安全失败，不会二次调用 LLM。缺失、空白或超长的投递文案则按已生成的事件名称作有界确定性兜底，不覆盖有效文案。
 
 规划器提供用户可编辑的加权 `activity_pool` 和软性 `activity_density`。睡眠只是普通生活事件，用于自然节奏和避免全天高强度活动；Xiaoman 不按生理/医疗模型计算睡眠债、补偿时长或强制起床时间，也不会因为晚睡推导晚起。前一生命日历史仅提供轻量叙事与防重复线索，不会改变或占用 Fat Fish 保护窗。空闲窗内较长睡眠通常作为独立 `category=sleep` NORMAL；保护 BRIDGE 仍是一个不可拆分的顶层事件，若跨越睡眠、醒来和慢启动，通常用 `category=mixed`。新计划所有 timeline 项都必须包含允许值内的 `category`，已有 v0.8.0/v0.8.1 无类别计划仍兼容。
 

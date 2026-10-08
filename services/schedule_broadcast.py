@@ -14,7 +14,7 @@ from astrbot.api import logger
 from .fat_fish_bridge import FatFishBridge
 from .time_awareness_adapter import TimeAwarenessAdapter
 
-PLANNER_VERSION = "0.8.7"
+PLANNER_VERSION = "0.9.0"
 SCHEMA_VERSION = 2
 DAILY_THEME_MAX_CHARS = 60
 DAILY_STYLE_MAX_CHARS = 40
@@ -463,11 +463,11 @@ class ScheduleBroadcastService:
 
     def _planner_prompt(self, planner_input):
         guidance = (
-            "你是林小满的生活日规划器。规划的是完整 life_day，不是自然日；一次性从头安排到尾。"
-            "NORMAL 事件只能位于一个 free_window 内，且全部 NORMAL 须首尾相接完整填满每个 free_window。"
-            "每个 protected_window 恰好一个 BRIDGE，start_at/end_at 必须精确照抄保护窗边界，不能拆分顶层事件。"
-            "BRIDGE 内部阶段可以写在 state。最终 timeline 按时间排序、连续无缝、无重叠，覆盖 life_day 起止。"
-            "每个 NORMAL 产生 broadcast_message；每个 BRIDGE 产生 enter_message 和 exit_message。"
+            "你是林小满的生活日规划器。规划的是完整 life_day，不是自然日；一次性从头安排到尾。你负责生活语义，Python 负责机械时间线结构。"
+            "请按输入中的 free_windows 精确 ID 返回 ordered semantic segments + duration weights；每个 protected_windows 精确 ID 返回一个 semantic BRIDGE。不要给事件生成 ID 或 kind，也不要输出任何时间/高峰边界字段；Python 会确定性分配时长并构造完整 timeline。"
+            "NORMAL 语义段提供 category,name,state,broadcast_message,weight；BRIDGE 提供 category,name,state,enter_message,exit_message。weight 只表示当前 free_window 内相对持续时间，允许 1..100，不是概率或精确时长。"
+            "name、state、broadcast_message、enter_message、exit_message 不得声称依赖最终时间线的精确钟点或时长；用上午/下午/晚上/深夜/一会儿/晚点等宽泛时间表达。精确时间和时长只由 Python 的最终时间线决定。上下文明确提供的外部固定事实不必回避，但不得为活动时间自行编造具体钟点或时长。"
+            "每个正常消息和桥接进出消息尽量写自然完整的短句；消息格式错误会按活动名称使用确定性兜底，不影响其他语义校验。"
             "桥接活动须和前后事件一起形成因果连续的一天，不要把分段当成互不相关的活动。"
             "林小满是课表相对宽松的艺术专业大学生；protected_window 只是结构性规划窗口，不代表上课时间或课程安排。BRIDGE 必须是该保护窗内的一个大活动，但可以是工作室创作、外出、购物、休息、睡觉、社交、娱乐、旅行或有依据的课程；上课只是选项，不得仅因小满是大学生就默认课堂/食堂/自习/宿舍是每日主轴，也不得把两个 protected_window 模板化地都安排成课。若两个保护窗都是课，应有世界观、日历、历史或其他上下文依据/自然主题关联；否则优先考虑仅一段课程、无课、工作室/项目、临时外出、恢复休息或社交休闲。近期历史若连续多天偏上课，可在上下文允许时换一种结构；不硬性禁止上课，也不为求新奇而违背强上下文。"
             "activity_pool 是小满对具体活动的加权偏好，权重只表示相对偏好，不是精确概率；现实、天气、精力、睡眠和近期重复式样优先于权重。"
@@ -481,18 +481,152 @@ class ScheduleBroadcastService:
             "优先改变整日形状和活动链，而不只是把昨天的场所换个名字。避免连续复刻‘娱乐地点→夜市/宵夜→KTV→打车回家→刷手机→睡觉’；例如昨天‘密室→夜市→KTV’，今天即使改成‘电玩城→夜市→KTV’仍是重复。可改成工作室/项目→晚餐→回家游戏/早休、逛店→电影→晚餐、朋友家做饭/游戏、户外活动→咖啡/回家、宅家游戏/视频或只安排一个夜间主要活动。近期反复呈现同一日型时，合理地换成恢复日、项目日、外出日、居家日、社交日、夜生活日或随性混合日；不追求每天最大新奇。昨天的活动可作为聊天回忆，但不要因此重演整条活动链。"
             "规划保护窗的跨日变化时，比较 recent_life_days[].bridge_activities 中的 category、name 和时间段；若最近一天两个 protected_window 都主要是上课/课程/工作室学业，今天在上下文允许时应考虑不同 BRIDGE 结构，如无课/一节课、个人项目创作、购物外出、休息恢复、社交、办事、旅行或娱乐；课程在日历、世界观或强上下文支持时仍完全允许。目标是打破默认重复，不是编造变化。"
             "优先遵循 worldview、theme_pool、style_pool、天气和真实日历。不要每天塞满高强度活动。人物、地点、天气影响、消费和结果不得无依据编造。"
-            "只输出紧凑 JSON，不要 Markdown、代码围栏、解释或 JSON 前后的文字，尽量避免无意义空白和冗长叙述。字段：daily_theme,daily_style,timeline。daily_theme 不超过60字符，daily_style 不超过40字符。时间为带时区 ISO 8601。"
-            "timeline 每项都必须包含 category，且只能是 sleep,rest,meal,travel,school,creative,social,entertainment,outdoor,shopping,errand,mixed,other 之一。"
-            "每项 name 不超过48字符。NORMAL 项字段：id,kind=NORMAL,category,start_at,end_at,name,state,broadcast_message。NORMAL state 不超过120字符，通常只写1句简洁连续性信息。"
-            "BRIDGE 项字段：id,kind=BRIDGE,category,start_at,end_at,name,state,source_peak_start,source_peak_end,enter_message,exit_message；source_peak_* 原样照抄对应窗口。BRIDGE state 不超过240字符，可写内部阶段，通常用2-4句或短阶段描述。"
+            "只输出紧凑 JSON，不要 Markdown、代码围栏、解释或 JSON 前后的文字，尽量避免无意义空白和冗长叙述。顶层格式：daily_theme,daily_style,free_window_plans,bridge_plans。free_window_plans 的键必须与输入 free_windows 的 Fxx 完全一致，值为按活动顺序排列的语义段数组；bridge_plans 的键必须与 protected_windows 的 Pxx 完全一致，值为单个语义对象。不得添加、遗漏或改名窗口。"
+            "语义事件对象内不得包含 id,kind,start_at,end_at,source_peak_start,source_peak_end；BRIDGE 内部阶段可以写在 state。daily_theme 不超过60字符，daily_style 不超过40字符。category 必须是 sleep,rest,meal,travel,school,creative,social,entertainment,outdoor,shopping,errand,mixed,other 之一。"
+            "每项 name 不超过48字符。NORMAL state 不超过120字符，通常只写1句简洁连续性信息；BRIDGE state 不超过240字符，可写内部阶段，通常用2-4句或短阶段描述。weight 缺失或非有效正整数按1处理，低于1按1处理，高于100按100处理。"
             "state 只保留后续规划需要的信息，不写小说式叙述；播报消息仍须自然、有个性。"
             "NORMAL 顶层事件代表有意义的生活阶段，而不是每个身体动作。只有主要目的、核心活动、社交对象/情境、地点/外出阶段、精力/状态阶段或睡眠休息阶段发生有意义变化时，才通常值得另开一项。相同目的、同一外出/地点链或连续过渡中的小动作应合并到一个 NORMAL 的 name/state；例如吃饭+买咖啡、回家换衣+吃饭再出门、打车回家+洗澡+躺床刷手机通常合并。买咖啡、换衣、打车、洗脸、洗澡、看手机、走到附近另一家店通常不单独成项，除非它本身构成有意义的独立阶段。不要过度合并不同的主要活动，例如电玩城和夜市宵夜可以分别成项。"
             "事件数量是软指导而非硬指标：balanced 时约2小时以内的短 free_window 通常1个 NORMAL；约2-5小时通常1-2个；约5-10小时通常2-4个。像18:05到次日04:00这样的长晚间 free_window，balanced 通常约3-5个顶层 NORMAL。relaxed 使用更少、更长的区块；busy 可稍多。不要为了命中数量而机械拆分，不得仅因数量拒绝或改写有效安排。"
-            "daily_theme 概括整日主线、主导活动与整体走向；daily_style 概括情绪、精力与行为气质。先确定 timeline，再写主题/风格；精确时段和持续时长以 timeline 为准，主题/风格避免依赖精确边界或时长的说法，如睡到中午/下午、玩了一整天、摆烂半天、整天宅家、全天没出门、通宵、一夜没睡、从早玩到晚。上午、下午、晚上、深夜、熬夜后、夜生活等宽泛叙事词仍可自然使用。"
+            "daily_theme 概括整日主线、主导活动与整体走向；daily_style 概括情绪、精力与行为气质。先确定全部窗口中的语义活动，再写主题/风格；不要假定精确时间或权重已决定具体时长。主题/风格避免依赖精确边界或时长的说法，如睡到中午/下午、玩了一整天、摆烂半天、整天宅家、全天没出门、通宵、一夜没睡、从早玩到晚。上午、下午、晚上、深夜、熬夜后、夜生活等宽泛叙事词仍可自然使用。"
             f"每条消息不得超过 {self._int('max_message_chars', 80, 1)} 个字符。"
         )
         extra = str(self._get("planner_prompt", "") or "").strip()
         return guidance + (f"\n补充规划要求：{extra}" if extra else "") + "\nPLANNER_INPUT:\n" + json.dumps(planner_input, ensure_ascii=False, default=str)
+
+    @staticmethod
+    def _normalized_weight(value):
+        """Normalize JSON weight mechanically to the documented 1..100 range."""
+        if isinstance(value, bool) or not isinstance(value, int):
+            return 1
+        return min(100, max(1, value))
+
+    @classmethod
+    def _allocate_weighted_durations(cls, start, end, segments):
+        """Allocate positive, minute-aligned durations by deterministic largest remainder."""
+        if not isinstance(start, datetime) or not isinstance(end, datetime):
+            raise ValueError("free window boundaries must be timezone-aware datetimes")
+        if start.tzinfo is None or end.tzinfo is None:
+            raise ValueError("free window boundaries must be timezone-aware datetimes")
+        total_seconds = (end - start).total_seconds()
+        if total_seconds <= 0 or total_seconds % 60:
+            raise ValueError("free window must have positive whole-minute duration")
+        total_minutes = int(total_seconds // 60)
+        count = len(segments) if isinstance(segments, list) else 0
+        if count <= 0:
+            raise ValueError("free window semantic segments missing")
+        if count > total_minutes:
+            raise ValueError("more semantic segments than available minutes")
+        weights = [cls._normalized_weight(item.get("weight")) for item in segments]
+        distributable = total_minutes - count
+        weight_total = sum(weights)
+        shares = [(distributable * weight) // weight_total for weight in weights]
+        remainders = [(distributable * weight) % weight_total for weight in weights]
+        leftover = distributable - sum(shares)
+        for index in sorted(range(count), key=lambda i: (-remainders[i], i))[:leftover]:
+            shares[index] += 1
+        durations = [share + 1 for share in shares]
+        cursor = start
+        result = []
+        for duration in durations:
+            next_cursor = cursor + timedelta(minutes=duration)
+            result.append((cursor, next_cursor))
+            cursor = next_cursor
+        if cursor != end:
+            raise ValueError("weighted allocation failed to cover free window")
+        return result
+
+    def _planner_message(self, value, fallback, entry_id, field):
+        max_chars = self._int("max_message_chars", 80, 1)
+        if isinstance(value, str) and value.strip() and len(value) <= max_chars:
+            return value
+        reason = "oversized" if isinstance(value, str) and len(value) > max_chars else "missing"
+        text = str(fallback or "活动")
+        text = text[:max_chars] or "活动"[:max_chars]
+        logger.warning("planner message fallback entry=%s field=%s reason=%s",
+                       entry_id, field, reason)
+        return text
+
+    @staticmethod
+    def _validate_semantic_event(item, *, bridge=False):
+        if not isinstance(item, dict):
+            raise ValueError("planner semantic event must be an object")
+        forbidden = {"id", "kind", "start_at", "end_at", "source_peak_start", "source_peak_end"}
+        if forbidden.intersection(item):
+            raise ValueError("planner semantic event contains code-owned fields")
+        category = item.get("category")
+        name = item.get("name")
+        state = item.get("state")
+        if category not in TIMELINE_CATEGORIES:
+            raise ValueError("planner semantic event missing or invalid category")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("planner semantic event missing name")
+        if len(name) > ENTRY_NAME_MAX_CHARS:
+            raise ValueError(f"planner semantic event name exceeds {ENTRY_NAME_MAX_CHARS} characters")
+        state_limit = BRIDGE_STATE_MAX_CHARS if bridge else NORMAL_STATE_MAX_CHARS
+        if not isinstance(state, str) or not state.strip():
+            raise ValueError("planner semantic event missing state")
+        if len(state) > state_limit:
+            raise ValueError(f"planner semantic event state exceeds {state_limit} characters")
+
+    def _materialize_planner_timeline(self, planner_input, planner_result):
+        """Build persisted timeline mechanics from semantic free/protected window plans."""
+        if not isinstance(planner_result, dict):
+            raise ValueError("planner response must be an object")
+        free_plans = planner_result.get("free_window_plans")
+        bridge_plans = planner_result.get("bridge_plans")
+        if not isinstance(free_plans, dict) or not isinstance(bridge_plans, dict):
+            raise ValueError("planner response missing free_window_plans or bridge_plans")
+        free_windows = planner_input.get("free_windows", [])
+        protected_windows = planner_input.get("protected_windows", [])
+        expected_free = {str(row["id"]) for row in free_windows}
+        expected_bridge = {str(row["id"]) for row in protected_windows}
+        if set(free_plans) != expected_free:
+            raise ValueError("free_window_plans keys do not match input windows")
+        if set(bridge_plans) != expected_bridge:
+            raise ValueError("bridge_plans keys do not match protected windows")
+
+        timeline = []
+        for window in free_windows:
+            segments = free_plans[window["id"]]
+            if not isinstance(segments, list) or not segments:
+                raise ValueError(f"free window {window['id']} semantic segments missing")
+            for item in segments:
+                self._validate_semantic_event(item)
+            intervals = self._allocate_weighted_durations(
+                _absolute(window["start_at"]), _absolute(window["end_at"]), segments)
+            for item, (start, end) in zip(segments, intervals):
+                timeline.append({"kind": "NORMAL", "category": item["category"],
+                                 "start_at": start.isoformat(), "end_at": end.isoformat(),
+                                 "name": item["name"], "state": item["state"],
+                                 "_message": item.get("broadcast_message")})
+
+        for window in protected_windows:
+            item = bridge_plans[window["id"]]
+            self._validate_semantic_event(item, bridge=True)
+            timeline.append({"kind": "BRIDGE", "category": item["category"],
+                             "start_at": window["start_at"], "end_at": window["end_at"],
+                             "name": item["name"], "state": item["state"],
+                             "source_peak_start": window["source_peak_start"],
+                             "source_peak_end": window["source_peak_end"],
+                             "_enter_message": item.get("enter_message"),
+                             "_exit_message": item.get("exit_message")})
+
+        timeline.sort(key=lambda row: _absolute(row["start_at"]))
+        normal_id = bridge_id = 0
+        for row in timeline:
+            if row["kind"] == "NORMAL":
+                normal_id += 1
+                row["id"] = f"N{normal_id:02d}"
+                row["broadcast_message"] = self._planner_message(
+                    row.pop("_message"), row["name"], row["id"], "broadcast_message")
+            else:
+                bridge_id += 1
+                row["id"] = f"B{bridge_id:02d}"
+                row["enter_message"] = self._planner_message(
+                    row.pop("_enter_message"), row["name"], row["id"], "enter_message")
+                row["exit_message"] = self._planner_message(
+                    row.pop("_exit_message"), f"{row['name']}结束了", row["id"], "exit_message")
+        return timeline
 
     @staticmethod
     def _normalize_planner_json(raw):
@@ -610,7 +744,7 @@ class ScheduleBroadcastService:
         return True, ""
 
     @staticmethod
-    def _derive_deliveries(timeline, old_deliveries=None):
+    def _derive_deliveries(timeline, old_deliveries=None, *, reuse_id_only_state=True):
         old = {(row.get("id"), row.get("trigger_at")): row for row in old_deliveries or []}
         old_by_id = {row.get("id"): row for row in old_deliveries or []}
         bridge_ends = {row["end_at"] for row in timeline if row["kind"] == "BRIDGE"}
@@ -630,7 +764,7 @@ class ScheduleBroadcastService:
                 ])
         for event in events:
             previous = old.get((event["id"], event["trigger_at"]))
-            if previous is None:
+            if previous is None and reuse_id_only_state:
                 candidate = old_by_id.get(event["id"], {})
                 previous = candidate if candidate.get("sent") or candidate.get("delivered_umos") else {}
             previous = previous or {}
@@ -702,7 +836,7 @@ class ScheduleBroadcastService:
                 metadata_valid, metadata_reason = self.validate_daily_metadata(result)
                 if not metadata_valid:
                     raise ValueError("planner output rejected: " + metadata_reason)
-                timeline = result.get("timeline")
+                timeline = self._materialize_planner_timeline(planner_input, result)
                 valid, reason = self.validate_timeline(planner_input, timeline)
                 if not valid:
                     raise ValueError("planner timeline rejected: " + reason)
@@ -716,7 +850,8 @@ class ScheduleBroadcastService:
                     "daily_theme": str(result.get("daily_theme", "")).strip(),
                     "daily_style": str(result.get("daily_style", "")).strip(),
                     "timeline": timeline,
-                    "deliveries": self._derive_deliveries(timeline, old_deliveries),
+                    "deliveries": self._derive_deliveries(
+                        timeline, old_deliveries, reuse_id_only_state=False),
                     "status": "complete",
                     "generated_at": self._now().isoformat(),
                 }
