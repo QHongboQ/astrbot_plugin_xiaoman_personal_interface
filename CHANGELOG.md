@@ -6,13 +6,13 @@
 - MINOR：新增能力或明显行为变化，保持兼容。
 - PATCH：缺陷修复、测试或文档修正，不改变主要功能边界。
 
-## 0.8.4 — 2026-10-07
+## 0.8.4 — 2026-10-08
 
 ### 生命日规划输出稳定性
 
-- 对明确使用 AstrBot OpenAI-compatible chat-completion adapter 的规划请求，传入 JSON object response format 与 8192 输出 token budget；其他 provider 不接收这些专用参数。
-- 规划提示要求紧凑 JSON 和简洁状态描述；仅去除完整响应外的一层 Markdown fence，不修补非法 JSON。
-- 非法 JSON 仍安全失败并记录有界解析诊断，不调用第二次 LLM，也不保存部分计划。
+- 收紧生命日规划 JSON 输出契约，限制主题、风格、事件名称和状态长度；超限结果安全拒绝且不截断/改写。
+- AstrBot 4.28.2 不会把 `llm_generate` 的 per-call kwargs 合入内置 OpenAI 请求体；README 改为说明专用 planner provider 的 `custom_extra_body` 配置方式。
+- 保留紧凑提示、外层 Markdown fence 规范化、严格 JSON 解析及有界错误诊断；不会修补非法 JSON、二次调用 LLM 或保存部分计划。
 
 ## 0.8.3 — 2026-10-08
 

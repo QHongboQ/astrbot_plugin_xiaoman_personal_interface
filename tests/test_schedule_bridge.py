@@ -487,18 +487,8 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(plan["daily_theme"] and plan["daily_style"])
         self.assertTrue(all(event["message"] for event in plan["deliveries"]))
 
-    async def test_openai_compatible_provider_receives_json_mode_and_output_budget(self):
+    async def test_planner_does_not_rely_on_ineffective_provider_kwargs(self):
         self.context.provider_type = "openai_chat_completion"
-        self.context.output_factory = lambda prompt: valid_response_for(
-            json.loads(prompt.split("PLANNER_INPUT:\n", 1)[1]))
-        result = await self.service.generate_life_day(self.start)
-        self.assertEqual(result["status"], "generated")
-        self.assertEqual(len(self.context.llm_calls), 1)
-        self.assertEqual(self.context.llm_calls[0]["response_format"], {"type": "json_object"})
-        self.assertEqual(self.context.llm_calls[0]["max_tokens"], 8192)
-
-    async def test_unknown_provider_type_does_not_receive_json_mode_kwargs(self):
-        self.context.provider_type = "some_other_adapter"
         self.context.output_factory = lambda prompt: valid_response_for(
             json.loads(prompt.split("PLANNER_INPUT:\n", 1)[1]))
         result = await self.service.generate_life_day(self.start)
@@ -539,30 +529,61 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(secret, diagnostic)
         self.assertLessEqual(len(warning.call_args.args[-1]), 240)
 
-    async def test_planner_prompt_requires_compact_concise_json(self):
+    async def test_planner_prompt_requires_compact_json_and_hard_field_caps(self):
         prompt = self.service._planner_prompt(await self._input())
         self.assertIn("紧凑 JSON", prompt)
         self.assertIn("不要 Markdown、代码围栏、解释", prompt)
-        self.assertIn("NORMAL 的 state 通常只写1句简洁", prompt)
-        self.assertIn("BRIDGE 的 state 可写内部阶段，通常用2-4句", prompt)
+        self.assertIn("daily_theme 不超过60字符", prompt)
+        self.assertIn("daily_style 不超过40字符", prompt)
+        self.assertIn("name 不超过48字符", prompt)
+        self.assertIn("NORMAL state 不超过120字符", prompt)
+        self.assertIn("BRIDGE state 不超过240字符", prompt)
         self.assertIn("不写小说式叙述", prompt)
 
-    async def test_long_valid_json_response_over_4400_chars_is_accepted(self):
-        planner_input = await self._input()
-        result_json = valid_response_for(planner_input)
-        result_json["timeline"][0]["state"] = "continuity " * 550
-        raw = json.dumps(result_json, ensure_ascii=False)
-        self.assertGreater(len(raw), 4400)
-        self.context.raw_output = raw
-        result = await self.service.generate_life_day(self.start)
-        self.assertEqual(result["status"], "generated")
-        self.assertEqual(len(self.context.llm_calls), 1)
+    async def test_daily_theme_and_style_character_caps(self):
+        self.assertTrue(self.service.validate_daily_metadata({"daily_theme": "t" * 60,
+                                                              "daily_style": "s" * 40})[0])
+        self.assertFalse(self.service.validate_daily_metadata({"daily_theme": "t" * 61,
+                                                               "daily_style": "s" * 40})[0])
+        self.assertFalse(self.service.validate_daily_metadata({"daily_theme": "t" * 60,
+                                                               "daily_style": "s" * 41})[0])
 
-    async def test_fatfish_block_still_makes_zero_llm_calls_before_kwargs_resolution(self):
+    async def test_entry_name_and_normal_state_character_caps(self):
+        planner_input = await self._input()
+        timeline = valid_response_for(planner_input)["timeline"]
+        normal = next(row for row in timeline if row["kind"] == "NORMAL")
+        normal["name"] = "n" * 48
+        normal["state"] = "s" * 120
+        self.assertTrue(self.service.validate_timeline(planner_input, timeline)[0])
+        normal["name"] += "x"
+        self.assertFalse(self.service.validate_timeline(planner_input, timeline)[0])
+        normal["name"] = "n" * 48
+        normal["state"] += "x"
+        self.assertFalse(self.service.validate_timeline(planner_input, timeline)[0])
+
+    async def test_bridge_state_character_cap(self):
+        planner_input = await self._input([window("2026-10-09T09:00:00+08:00",
+                                                   "2026-10-09T12:00:00+08:00")])
+        timeline = valid_response_for(planner_input)["timeline"]
+        bridge = next(row for row in timeline if row["kind"] == "BRIDGE")
+        bridge["state"] = "s" * 240
+        self.assertTrue(self.service.validate_timeline(planner_input, timeline)[0])
+        bridge["state"] += "x"
+        self.assertFalse(self.service.validate_timeline(planner_input, timeline)[0])
+
+    async def test_oversized_valid_json_fails_once_without_complete_plan(self):
+        self.context.output_factory = lambda prompt: {
+            **valid_response_for(json.loads(prompt.split("PLANNER_INPUT:\n", 1)[1])),
+            "daily_theme": "t" * 61,
+        }
+        result = await self.service.generate_life_day(self.start)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(len(self.context.llm_calls), 1)
+        self.assertNotEqual(self.service._plans().get(self.start.isoformat(), {}).get("status"), "complete")
+
+    async def test_fatfish_block_still_makes_zero_llm_calls(self):
         self._use_config_only_fatfish()
         self.day.now = datetime(2026, 10, 9, 10, 0, tzinfo=TZ)
-        self.context.get_provider_by_id = lambda _provider_id: (_ for _ in ()).throw(
-            AssertionError("provider kwargs should not be resolved before Fat Fish gate"))
         result = await self.service.generate_life_day(self.start)
         self.assertEqual(result["status"], "deferred")
         self.assertEqual(result["reason"], "blocked_by_fat_fish")

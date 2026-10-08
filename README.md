@@ -37,7 +37,15 @@ send_xiaoman_photo()
 
 每次生命日规划是一个全局 LLM 请求：先依据 `daily_schedule.ai_daily.generation_time` 生成从边界时刻到下一日同一边界的完整时间线，并在同一次响应中生成主题、风格和所有 NORMAL/高峰桥接消息。Fat Fish 仅提供只读有效高峰政策；规划器按 `peak_guard_before_minutes` / `peak_guard_after_minutes` 扩展保护窗口，再把完整自由窗与保护窗一起交给规划器。保护窗恰好对应一个 BRIDGE 活动。计划通过无缺口、无重叠、类别及消息完整性验证后，保存到 Xiaoman 独立的 `life_day_plans.json`。刷新与到点投递均不调用 LLM；发送失败目标在宽限期内重试，成功目标不会重复发送。
 
-规划请求会在可识别的 OpenAI-compatible chat-completion provider 上请求 JSON object 输出并设置较大的输出预算；其他 provider 不会盲目接收专属参数。完整包裹响应的一层 Markdown fence 可安全移除，但非法 JSON 不会被猜测或修补，也不会触发第二次 LLM 请求；生成失败时不保存部分计划，并仅记录有界解析诊断。
+AstrBot 4.28.2 的 `Context.llm_generate` 会将 per-call kwargs 交给 provider 的公开 `text_chat`，但内置 OpenAI adapter 不会把这些 kwargs 合入实际请求 payload。因此，小满不会传递无效的 per-call `response_format` / `max_tokens` 参数。若希望尽量降低完整日程输出被截断的概率，建议在 AstrBot WebUI 新建一个**专供 Xiaoman Planner 使用**的 OpenAI-compatible provider 实例（可以复用相同 API/model 凭据），并仅在该实例的 `custom_extra_body` 中配置：
+
+```yaml
+max_tokens: 8192
+response_format:
+  type: json_object
+```
+
+随后在小满配置页的 `provider_id` 中选用这个专用实例。不要把 JSON mode 配到日常聊天共用的 provider，否则普通对话也可能被强制要求输出 JSON。即使不做这项 provider 配置，小满仍使用紧凑输出提示、主题/风格/事件名称/状态硬长度限制、严格 JSON 解析和有界错误诊断；非法或超限输出会安全失败，不会自动修补、截断或二次调用 LLM。
 
 规划器提供用户可编辑的加权 `activity_pool` 和软性 `activity_density`。睡眠只是普通生活事件，用于自然节奏和避免全天高强度活动；Xiaoman 不按生理/医疗模型计算睡眠债、补偿时长或强制起床时间，也不会因为晚睡推导晚起。前一生命日历史仅提供轻量叙事与防重复线索，不会改变或占用 Fat Fish 保护窗。空闲窗内较长睡眠通常作为独立 `category=sleep` NORMAL；保护 BRIDGE 仍是一个不可拆分的顶层事件，若跨越睡眠、醒来和慢启动，通常用 `category=mixed`。新计划所有 timeline 项都必须包含允许值内的 `category`，已有 v0.8.0/v0.8.1 无类别计划仍兼容。
 
