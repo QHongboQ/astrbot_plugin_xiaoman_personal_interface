@@ -404,6 +404,43 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不要因为晚睡就推断必须晚起", prompt)
         self.assertIn("不要因为上一生命日曾在睡觉就强制新生命日继续睡", prompt)
 
+    async def test_planner_prompt_themes_must_match_the_returned_timeline(self):
+        prompt = self.service._planner_prompt(await self._input())
+        self.assertIn("先在内部安排并核对完整 timeline，再为同一份最终 timeline 选择 daily_theme 和 daily_style", prompt)
+        self.assertIn("主题/风格必须忠实概括实际安排", prompt)
+        self.assertIn("只有时间线确实支持时才可使用‘整天’、‘半天’、‘睡到中午’、‘通宵’、‘全天宅家’", prompt)
+
+    async def test_planner_prompt_groups_minor_support_actions_into_meaningful_phases(self):
+        prompt = self.service._planner_prompt(await self._input())
+        self.assertIn("NORMAL 顶层事件代表有意义的生活阶段，而不是每个身体动作", prompt)
+        self.assertIn("相同目的、同一外出/地点链或连续过渡中的小动作应合并", prompt)
+        self.assertIn("买咖啡、换衣、打车、洗脸、洗澡、看手机", prompt)
+        self.assertIn("电玩城和夜市宵夜可以分别成项", prompt)
+
+    async def test_planner_prompt_soft_event_counts_follow_free_window_length(self):
+        prompt = self.service._planner_prompt(await self._input())
+        self.assertIn("约2小时以内的短 free_window 通常1个 NORMAL", prompt)
+        self.assertIn("约5-10小时通常2-4个", prompt)
+        self.assertIn("18:05到次日04:00这样的长晚间 free_window，balanced 通常约3-5个", prompt)
+        self.assertIn("事件数量是软指导而非硬指标", prompt)
+        self.assertIn("activity_density 控制的是主要活动强度/数量，不是每个小动作或时间转换的事件数", prompt)
+
+    async def test_protected_windows_are_not_implicit_class_periods(self):
+        prompt = self.service._planner_prompt(await self._input())
+        self.assertIn("protected_window 只是结构性规划窗口，不代表上课时间或课程安排", prompt)
+        self.assertIn("不得仅因小满是大学生就默认课堂/食堂/自习/宿舍是每日主轴", prompt)
+        self.assertIn("也不得把两个 protected_window 模板化地都安排成课", prompt)
+        self.assertIn("不要反复套用‘上午上课→午饭→下午上课→晚上娱乐’模板", prompt)
+        self.assertIn("若两个保护窗都是课，应有世界观、日历、历史或其他上下文依据/自然主题关联", prompt)
+        self.assertIn("不硬性禁止上课", prompt)
+
+    async def test_planner_quality_guidance_preserves_sleep_model(self):
+        prompt = self.service._planner_prompt(await self._input())
+        self.assertIn("睡眠只是普通生活事件", prompt)
+        self.assertIn("不要计算或补偿前一日睡眠时长", prompt)
+        self.assertIn("protected_window 的 BRIDGE 必须保持一个不可拆分的顶层事件", prompt)
+        self.assertIn("不得为了避免 mixed 而提前叫醒小满或把 BRIDGE 拆开", prompt)
+
     async def test_prompt_gives_protected_windows_structural_priority_over_sleep_history(self):
         prompt = self.service._planner_prompt(await self._input())
         self.assertIn("protected_windows 是结构性的规划锚点，优先级高于睡眠历史", prompt)

@@ -31,7 +31,7 @@ send_xiaoman_photo()
 
 本版本不包含任何 TTS、语音提示、表演标签或 MiMo 逻辑。
 
-## 可选：林小满生命日规划器（v0.8.4）
+## 可选：林小满生命日规划器（v0.8.5）
 
 默认关闭。启用前请安装并启用 `time_awareness`，并配置可用的 LLM provider。**林小满拥有最终的生命日时间线**；TimeAwareness 仅作为只读时钟、动态生命日边界、工作日/节假日、世界观、人设开关、主题/风格池和可用天气等上下文来源。林小满不会读取或依赖 TimeAwareness 日程快照，不调用它的 AI 日程生成器，也不会修改其源码、配置或快照。
 
@@ -48,6 +48,8 @@ response_format:
 随后在小满配置页的 `provider_id` 中选用这个专用实例。不要把 JSON mode 配到日常聊天共用的 provider，否则普通对话也可能被强制要求输出 JSON。即使不做这项 provider 配置，小满仍使用紧凑输出提示、主题/风格/事件名称/状态硬长度限制、严格 JSON 解析和有界错误诊断；非法或超限输出会安全失败，不会自动修补、截断或二次调用 LLM。
 
 规划器提供用户可编辑的加权 `activity_pool` 和软性 `activity_density`。睡眠只是普通生活事件，用于自然节奏和避免全天高强度活动；Xiaoman 不按生理/医疗模型计算睡眠债、补偿时长或强制起床时间，也不会因为晚睡推导晚起。前一生命日历史仅提供轻量叙事与防重复线索，不会改变或占用 Fat Fish 保护窗。空闲窗内较长睡眠通常作为独立 `category=sleep` NORMAL；保护 BRIDGE 仍是一个不可拆分的顶层事件，若跨越睡眠、醒来和慢启动，通常用 `category=mixed`。新计划所有 timeline 项都必须包含允许值内的 `category`，已有 v0.8.0/v0.8.1 无类别计划仍兼容。
+
+规划提示要求主题/风格忠实概括同一份最终时间线；普通事件按有意义的生活阶段组织，把买咖啡、通勤、换衣、洗澡、刷手机等支持动作通常并入较大的活动块。事件数按空闲窗长度和 `activity_density` 给软性参考，不机械拆分。Fat Fish 保护窗是规划结构，不是默认课程表；课程仍可安排，但两个保护窗不会仅因小满是大学生而自动变成早课和下午课。
 
 所有 Xiaoman 自有的可调项都在插件齿轮配置页的“生命日规划与主动播报”组中：`enable`、`send_groups`、`send_private`、`allowlist_umos`、`denylist_umos`、`provider_id`、`peak_guard_before_minutes`、`peak_guard_after_minutes`、`activity_pool`、`activity_pool_allow_custom`、`activity_density`、`admin_regenerate_bypass_fat_fish`、`poll_seconds`、`grace_seconds`、`planner_failure_retry_seconds`、`max_message_chars`、`dry_run` 和 `planner_prompt`。活动池每项格式为 `活动名称,权重`，例如 `密室逃脱,7`；权重范围限制为 1–10，不写权重默认 1，权重只表示相对偏好。`activity_density` 可选 `relaxed`（约1–2项主要活动）、`balanced`（约2–3项）或 `busy`（约3–4项），均为软目标。即使时间线完整覆盖24小时，也允许长时间休息、睡觉、宅家或无安排；睡眠时长和起床时间由规划器自由选择，不建模睡眠债或必须起床时间。只使用 AstrBot 已有会话，不枚举 QQ 群/好友。旧的 `schedule_broadcast_state.json` 会保留为 legacy 文件，不会被误当成 v0.8 生命日计划迁移。
 
