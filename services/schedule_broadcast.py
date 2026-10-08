@@ -108,7 +108,7 @@ class ScheduleBroadcastService:
                     try:
                         weight = int(raw_weight.strip())
                     except (TypeError, ValueError, OverflowError):
-                        name, weight = text, 1
+                        weight = 1
                 else:
                     name, weight = text, 1
             if not name or name in seen:
@@ -528,7 +528,8 @@ class ScheduleBroadcastService:
             "activity_pool 是小满对具体活动的加权偏好，权重只表示相对偏好，不是精确概率；现实、天气、精力、睡眠和近期重复式样优先于权重。"
             "activity_pool_allow_custom=true 时可自然安排池外活动；为 false 时，主要休闲/社交活动应来自活动池，除非世界观、日历或既有连续性要求其他安排。不得重复实现 theme_pool：主题池决定日子是什么感觉，活动池提供具体可做的事。"
             "activity_density 是软目标：relaxed 约1-2项主要活动并留大量自由/休息时间；balanced 约2-3项；busy 约3-4项。不得为凑数量制造活动。完整覆盖24小时不代表必须保持忙碌。睡觉、躺着、打游戏、看视频、发呆、休息、聊天、通勤和慢慢吃饭都可以是长 NORMAL 区块。"
-            "sleep_policy.target_hours 是一般睡眠目标，不是硬性医学规则；偶尔可少睡或多睡，但既往睡眠不足会降低次日活动强度。较长睡眠必须作为独立 sleep 类时间线事件，不要把补觉/回笼觉藏在其他事件的 state。"
+            "在 free_window 内，较长睡眠通常应作为独立 category=sleep 的 NORMAL 事件，不要把补觉/回笼觉藏在其他事件的 state。protected_window 的 BRIDGE 必须保持一个不可拆分的顶层事件，因此是睡眠事件独立成项规则的例外：若 BRIDGE 跨越自然的睡眠→醒来→慢启动，可在同一 BRIDGE.state 中写明内部阶段，并通常使用 category=mixed；不要为了避免 mixed 而提前叫醒小满，也不得把一个 BRIDGE 拆成多个顶层事件。如果整个 BRIDGE 确实都在睡觉，category=sleep 仍然合适。"
+            "sleep_policy.target_hours 是一般睡眠目标，不是硬性医学规则；偶尔可少睡或多睡，但既往睡眠不足会降低次日活动强度。"
             "如果上一生命日以睡眠结束，且边界前连续睡眠尚未达到目标，通常应把同一睡眠延续到新生命日；不得仅为了腾出活动时间而早起，也不得编造早课、作业、预约或截止日期来解释中断睡眠。若前一生命日很晚仍清醒/在边界时清醒，下一日通常先安排睡眠或恢复。上一日睡眠明显不足时降低活动密度；continuity.accumulated_sleep_debt_minutes 汇总近期睡眠缺口，累积缺口也必须影响后续恢复与活动强度。保护窗 BRIDGE 可以继续同一段睡眠/休息/慢启动，不要为了保护窗凭空制造早课或外出活动。"
             "只根据 continuity 和 recent_life_days 中明确提供的历史延续。若无可用历史，必须视为没有已知的前夜/前几日事件；不得编造‘昨晚通宵赶作业’等事实，只生成合理的起始状态。近期主要活动、类别、主题、风格和睡眠只用于避免重复及维持连续性。"
             "优先遵循 worldview、theme_pool、style_pool、天气和真实日历。不要每天塞满高强度活动。人物、地点、天气影响、消费和结果不得无依据编造。"

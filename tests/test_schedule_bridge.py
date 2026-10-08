@@ -320,11 +320,12 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(data["weather"])
 
     async def test_activity_pool_parser_supports_weighted_and_unweighted_items(self):
-        self.service.cfg["activity_pool"] = ["密室逃脱,7", "KTV,6", "游乐园", "太重,999", "坏权重,abc"]
+        self.service.cfg["activity_pool"] = ["密室逃脱,7", "KTV,6", "游乐园", "太重,999",
+                                               "坏权重,abc", "海边,夜游,4"]
         self.assertEqual(self.service._activity_pool(), [
             {"name": "密室逃脱", "weight": 7}, {"name": "KTV", "weight": 6},
             {"name": "游乐园", "weight": 1}, {"name": "太重", "weight": 10},
-            {"name": "坏权重,abc", "weight": 1},
+            {"name": "坏权重", "weight": 1}, {"name": "海边,夜游", "weight": 4},
         ])
 
     async def test_activity_density_and_sleep_target_are_safely_normalized(self):
@@ -397,6 +398,15 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("都可以是长 NORMAL 区块", prompt)
         self.assertIn("保护窗 BRIDGE 可以继续同一段睡眠/休息/慢启动", prompt)
         self.assertIn("continuity.accumulated_sleep_debt_minutes", prompt)
+
+    async def test_prompt_distinguishes_free_sleep_from_mixed_protected_bridge(self):
+        prompt = self.service._planner_prompt(await self._input())
+        self.assertIn("free_window 内，较长睡眠通常应作为独立 category=sleep 的 NORMAL 事件", prompt)
+        self.assertIn("protected_window 的 BRIDGE 必须保持一个不可拆分的顶层事件", prompt)
+        self.assertIn("睡眠→醒来→慢启动", prompt)
+        self.assertIn("通常使用 category=mixed", prompt)
+        self.assertIn("不要为了避免 mixed 而提前叫醒小满", prompt)
+        self.assertIn("不得把一个 BRIDGE 拆成多个顶层事件", prompt)
 
     async def test_new_plans_require_valid_category(self):
         data = await self._input()
