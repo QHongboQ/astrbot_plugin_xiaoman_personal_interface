@@ -605,7 +605,7 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
                               "全天没出门", "通宵", "一夜没睡", "从早玩到晚"):
             self.assertIn(brittle_claim, prompt)
         self.assertIn("上午、下午、晚上、深夜、熬夜后、夜生活等宽泛叙事词仍可自然使用", prompt)
-        self.assertIn("NORMAL 顶层事件代表有意义的生活阶段", prompt)
+        self.assertIn("NORMAL 顶层事件代表有意义的 LIFE PHASE", prompt)
         self.assertIn("保护窗不是课程表", prompt)
         self.assertIn("不要计算或补偿前一日睡眠时长", prompt)
 
@@ -622,7 +622,7 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("课程在日历、世界观或强上下文支持时仍完全允许", prompt)
         self.assertIn("近期重复应降低高权重活动的相对倾向，但不是禁令", prompt)
         self.assertIn("记得昨天，但不要重演昨天", prompt)
-        self.assertIn("NORMAL 顶层事件代表有意义的生活阶段", prompt)
+        self.assertIn("NORMAL 顶层事件代表有意义的 LIFE PHASE", prompt)
         self.assertIn("daily_theme 概括整日主线、主导活动与整体走向", prompt)
         self.assertIn("睡眠只是普通生活事件", prompt)
 
@@ -639,15 +639,51 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_planner_prompt_groups_minor_support_actions_into_meaningful_phases(self):
         prompt = self.service._planner_prompt(await self._input())
-        self.assertIn("NORMAL 顶层事件代表有意义的生活阶段，而不是每个身体动作", prompt)
-        self.assertIn("相同目的、同一外出/地点链或连续过渡中的小动作应合并", prompt)
-        self.assertIn("买咖啡、换衣、打车、洗脸、洗澡、看手机", prompt)
-        self.assertIn("电玩城和夜市宵夜可以分别成项", prompt)
+        self.assertIn("NORMAL 顶层事件代表有意义的 LIFE PHASE，而不是下一个身体动作", prompt)
+        self.assertIn("支持动作和转场应合并进最近的主要阶段", prompt)
+        self.assertIn("吃饭+买奶茶/咖啡", prompt)
+        self.assertIn("打车回家+洗澡+躺床刷手机", prompt)
+        self.assertIn("不要过度合并真实主要活动", prompt)
+
+    async def test_v091_planner_prompt_reduces_transition_fragmentation_without_overmerging(self):
+        prompt = self.service._planner_prompt(await self._input())
+        self.assertIn("支持动作和转场应合并进最近的主要阶段", prompt)
+        self.assertIn("饭后慢慢走去画室+找纸/颜料/占位并准备材料", prompt)
+        self.assertIn("日常附近短途步行、坐地铁去吃饭或夜生活后打车回家，通常并入前后活动", prompt)
+        self.assertIn("群里喊人/临时攒局/商量去哪/等朋友通常并入前后阶段", prompt)
+        self.assertIn("打车回家+洗澡+躺床刷手机通常合成", prompt)
+        self.assertIn("电玩城→KTV→夜市宵夜、工作室创作→晚场电影可分别成段", prompt)
+
+    async def test_v091_short_window_count_is_soft_not_a_validator(self):
+        prompt = self.service._planner_prompt(await self._input())
+        self.assertIn("不超过2小时的 free_window 通常1个 NORMAL", prompt)
+        self.assertIn("只有明确存在两个不同且有意义的主要阶段时才考虑2个", prompt)
+        self.assertIn("这些是软参考而非配额", prompt)
+
+        planner_input = await self._input()
+        life_start = datetime.fromisoformat(planner_input["life_day"]["start_at"])
+        life_end = datetime.fromisoformat(planner_input["life_day"]["end_at"])
+        short_window_start = life_end - timedelta(hours=1)
+        planner_input["free_windows"] = [
+            {"id": "F01", "start_at": life_start.isoformat(),
+             "end_at": short_window_start.isoformat()},
+            {"id": "F02", "start_at": short_window_start.isoformat(),
+             "end_at": life_end.isoformat()},
+        ]
+        response = valid_response_for(planner_input)
+        response["free_window_plans"]["F02"] = [
+            {"category": category, "name": name, "state": "有意义的生活阶段",
+             "broadcast_message": name, "weight": 1}
+            for category, name in [("meal", "晚饭"), ("social", "朋友聊天"),
+                                   ("rest", "回家休息")]
+        ]
+        timeline = self.service._materialize_planner_timeline(planner_input, response)
+        self.assertTrue(self.service.validate_timeline(planner_input, timeline)[0])
 
     async def test_planner_prompt_soft_event_counts_follow_free_window_length(self):
         prompt = self.service._planner_prompt(await self._input())
-        self.assertIn("约2小时以内的短 free_window 通常1个 NORMAL", prompt)
-        self.assertIn("约5-10小时通常2-4个", prompt)
+        self.assertIn("不超过2小时的 free_window 通常1个 NORMAL", prompt)
+        self.assertIn("2-5小时通常1-2个；5-10小时通常2-4个", prompt)
         self.assertIn("18:05到次日04:00这样的长晚间 free_window，balanced 通常约3-5个", prompt)
         self.assertIn("事件数量是软指导而非硬指标", prompt)
         self.assertIn("activity_density 控制的是主要活动强度/数量，不是每个小动作或时间转换的事件数", prompt)
