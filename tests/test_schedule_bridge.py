@@ -535,8 +535,10 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         unknown_prompt=self.service._prompt_lines(unknown_pair,{"local_date":"2026-10-07"},"workday")
         self.assertIn('"primary_activity": null',unknown_prompt)
         self.assertIn("不得猜测或虚构",unknown_prompt)
-        self.assertIn("开始说将去/开始做什么",prompt)
-        self.assertIn("结束说这件事做完了",prompt)
+        self.assertIn("PEAK_START 先依据 trigger_at 描述",prompt)
+        self.assertIn("PEAK_END 只可将 completed_before_trigger 中的事项描述为完成",prompt)
+        self.assertNotIn("PEAK_START 与同 activity_id 的 PEAK_END 共享同一份事实",prompt)
+        self.assertNotIn("PEAK_END 要自然回扣同一份 outline，概括刚做完的主要事情",prompt)
         self.assertIn("duration_minutes 必须与 peak_duration_minutes 相称",prompt)
 
     def test_peak_outline_keeps_a_multi_stop_outing_without_inventing_a_long_event(self):
@@ -571,9 +573,9 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prompt.count('"name": "看展"'), 2)
         self.assertEqual(prompt.count('"name": "文创小店"'), 2)
         self.assertNotIn('"name": "吃晚饭"', prompt)
-        self.assertIn("按 outline 的真实时间顺序", prompt)
-        self.assertIn("不能假装它们是一项持续数小时的活动", prompt)
-        self.assertIn("1–3件最能解释这段时间为何不在线的实质活动", prompt)
+        self.assertIn("activity_outline 仅用于理解高峰背景", prompt)
+        self.assertIn("每条具体表述仍必须符合该事件自己的 trigger_at 分类", prompt)
+        self.assertIn("upcoming_after_trigger 中1–3件相关安排作未来预告", prompt)
         self.assertIn("不要把刷手机、发呆、普通吃饭这类短暂过渡", prompt)
 
     def test_peak_temporal_context_exact_future_slots_are_not_current_or_completed(self):
@@ -614,9 +616,51 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         prompt=self.service._prompt_lines([peak_start,peak_end],raw,"workday")
         self.assertIn('"active_at_trigger": [{"name": "睡觉"',prompt)
         self.assertIn('"upcoming_after_trigger": [{"name": "赖床刷手机"',prompt)
-        self.assertIn("不得把 upcoming_after_trigger 中的事写成已经发生、正在发生或已经到达目的地",prompt)
-        self.assertIn("PEAK_END 只能把 completed_before_trigger 中的事情说成已完成",prompt)
+        self.assertIn("upcoming_after_trigger 严格属于未来",prompt)
+        self.assertIn("PEAK_END 只可将 completed_before_trigger 中的事项描述为完成",prompt)
         self.assertIn("日程写翻看/浏览贴纸或耳饰，绝不表示买了",prompt)
+
+    def test_peak_end_upcoming_lunch_remains_future_while_outing_is_current(self):
+        context={
+            "trigger_at":"2026-10-09T12:01:00+08:00",
+            "peak_start":"2026-10-09T09:00:00+08:00",
+            "peak_end":"2026-10-09T12:00:00+08:00",
+            "active_at_trigger":[{"name":"上午闲逛","state":"还在外面逛","start_at":"2026-10-09T11:00:00+08:00","end_at":"2026-10-09T13:00:00+08:00"}],
+            "completed_before_trigger":[],
+            "upcoming_after_trigger":[{"name":"午饭续摊","state":"找地方吃面","start_at":"2026-10-09T13:00:00+08:00","end_at":"2026-10-09T14:20:00+08:00"}],
+            "activity_outline":[{"name":"上午闲逛"},{"name":"午饭续摊"}],
+        }
+        entry={"id":"p-end-1201","kind":"PEAK_END","trigger_at":context["trigger_at"],"activity_context":context}
+        prompt=self.service._prompt_lines([entry],{"local_date":"2026-10-09"},"workday")
+        self.assertIn("active_at_trigger 表示该时段在 trigger_at 仍持续",prompt)
+        self.assertIn("upcoming_after_trigger 严格属于未来",prompt)
+        self.assertIn("其中的活动、地点及其细节只能用明确将来时表达",prompt)
+        self.assertIn('"name": "上午闲逛"',prompt)
+        self.assertIn('"name": "午饭续摊"',prompt)
+        self.assertIn("不能写成当前正在做、已经发生或已经到达",prompt)
+
+    def test_active_slot_state_does_not_timestamp_internal_actions(self):
+        context={
+            "trigger_at":"2026-10-09T13:59:00+08:00",
+            "active_at_trigger":[{"name":"午饭续摊","state":"吃面、加甜品、发语音"}],
+            "completed_before_trigger":[],
+            "upcoming_after_trigger":[{"name":"看设计展","state":"去看设计展"}],
+            "activity_outline":[{"name":"午饭续摊","state":"吃面、加甜品、发语音"},{"name":"看设计展"}],
+        }
+        entry={"id":"p-start-1359","kind":"PEAK_START","trigger_at":context["trigger_at"],"activity_context":context}
+        prompt=self.service._prompt_lines([entry],{"local_date":"2026-10-09"},"adjusted")
+        self.assertIn('"state": "吃面、加甜品、发语音"',prompt)
+        self.assertIn("state 只是整个时段的概述，不是内部动作的时间顺序",prompt)
+        self.assertIn("不能仅因 state 提到某动作，就断言该动作已完成",prompt)
+        self.assertIn("活动仍在进行时，不得说吃完了、买好了、看完了、逛完了或已经去了",prompt)
+        self.assertIn("activity_outline 仅用于理解高峰背景",prompt)
+
+    def test_legacy_unconditional_peak_activity_done_instruction_is_absent(self):
+        prompt=self.service._prompt_lines([],{"local_date":"2026-10-09"},"workday")
+        self.assertNotIn("PEAK_START 与同 activity_id 的 PEAK_END 共享同一份事实",prompt)
+        self.assertNotIn("结束说这件事做完了",prompt)
+        self.assertNotIn("PEAK_END 要自然回扣同一份 outline，概括刚做完的主要事情",prompt)
+        self.assertIn("PEAK_END 只可将 completed_before_trigger 中的事项描述为完成",prompt)
 
     def test_peak_outline_skips_nonoverlapping_and_caps_context(self):
         date = self.now.date()
