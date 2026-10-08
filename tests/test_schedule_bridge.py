@@ -72,7 +72,7 @@ class FakeFish:
         self.calls = []
         self.policy = {"found": True, "enabled": True, "allowed": True, "state": "offpeak",
                        "manual_override": "auto", "provider_affected": True,
-                       "timezone": "Asia/Shanghai"}
+                       "timezone": "Asia/Shanghai", "admins_bypass": True}
 
     def effective_peak_windows(self, start, end, provider, calendar_days):
         self.calls.append((start, end, provider, calendar_days))
@@ -197,7 +197,7 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
                   "peak_periods": "09:00-12:00,14:00-18:00",
                   "peak_weekdays": "0,1,2,3,4,5,6",
                   "affected_providers": "deepseek", "gate_when_provider_unknown": True,
-                  "manual_override": "auto"}
+                  "manual_override": "auto", "admins_bypass": True}
         config.update(overrides)
         fish = types.SimpleNamespace(config=config)
         self.context.stars = [types.SimpleNamespace(
@@ -360,6 +360,41 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(generated["status"], "generated")
         self.assertEqual(len(self.context.llm_calls), 1)
 
+    async def test_manual_admin_regenerate_bypasses_peak_only_with_both_settings(self):
+        fish = self._use_config_only_fatfish()
+        self.day.now = datetime(2026, 10, 9, 10, 0, tzinfo=TZ)
+        self.context.output_factory = lambda prompt: valid_response_for(
+            json.loads(prompt.split("PLANNER_INPUT:\n", 1)[1]))
+        results = await self.service.regenerate(
+            "next", now=self.day.now, allow_wallet_bypass=True)
+        self.assertEqual(results[0]["status"], "generated")
+        self.assertEqual(len(self.context.llm_calls), 1)
+        self.assertTrue(results[0]["wallet_bypass_used"])
+
+        self.service.reset("next", now=self.day.now)
+        self.context.llm_calls.clear()
+        self.service.cfg["admin_regenerate_bypass_fat_fish"] = False
+        blocked = await self.service.regenerate(
+            "next", now=self.day.now, allow_wallet_bypass=True)
+        self.assertEqual(blocked[0]["reason"], "blocked_by_fat_fish")
+        self.assertEqual(len(self.context.llm_calls), 0)
+
+        fish.config["admins_bypass"] = True
+        self.context.get_provider_by_id = lambda _provider_id: None
+        blocked = await self.service.regenerate(
+            "next", now=self.day.now, allow_wallet_bypass=True)
+        self.assertEqual(blocked[0]["reason"], "blocked_by_fat_fish")
+        self.assertEqual(len(self.context.llm_calls), 0)
+
+        self.service.cfg["admin_regenerate_bypass_fat_fish"] = True
+        fish = next(row.star_cls for row in self.context.stars
+                    if row.name == "astrbot_plugin_fat_fish_wallet")
+        fish.config["admins_bypass"] = False
+        blocked = await self.service.regenerate(
+            "next", now=self.day.now, allow_wallet_bypass=True)
+        self.assertEqual(blocked[0]["reason"], "blocked_by_fat_fish")
+        self.assertEqual(len(self.context.llm_calls), 0)
+
     async def test_startup_tick_makes_no_planner_call_during_peak(self):
         self._use_config_only_fatfish()
         self.day.now = datetime(2026, 10, 9, 10, 0, tzinfo=TZ)
@@ -387,8 +422,22 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.context.llm_calls.clear()
         fish.config["manual_override"] = "always_block"
         self.day.now = datetime(2026, 10, 9, 12, 30, tzinfo=TZ)
-        blocked = await self.service.generate_life_day(self.start)
-        self.assertEqual(blocked["status"], "deferred")
+        manual = await self.service.regenerate(
+            "current", now=self.day.now, allow_wallet_bypass=True)
+        self.assertEqual(manual[0]["status"], "generated")
+        self.assertTrue(manual[0]["wallet_bypass_used"])
+        self.assertEqual(len(self.context.llm_calls), 1)
+
+        self.service.reset("current", now=self.day.now)
+        self.context.llm_calls.clear()
+        await self.service.tick()
+        self.assertEqual(len(self.context.llm_calls), 0)
+
+    async def test_direct_service_generation_never_inherits_admin_bypass(self):
+        self._use_config_only_fatfish()
+        self.day.now = datetime(2026, 10, 9, 10, 0, tzinfo=TZ)
+        result = await self.service.generate_life_day(self.start)
+        self.assertEqual(result["status"], "deferred")
         self.assertEqual(len(self.context.llm_calls), 0)
 
     async def test_derive_refresh_and_send_due_do_not_call_llm(self):
@@ -433,6 +482,36 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["status"], "failed")
         self.assertEqual(second["status"], "throttled")
         self.assertEqual(len(self.context.llm_calls), 1)
+
+    async def test_planner_failure_retry_seconds_setting_is_respected(self):
+        self.service.cfg["planner_failure_retry_seconds"] = 60
+        self.context.output_factory = lambda _prompt: {"timeline": []}
+        failed = await self.service.generate_life_day(self.start)
+        self.assertEqual(failed["status"], "failed")
+        self.day.now = self.start + timedelta(seconds=59)
+        throttled = await self.service.generate_life_day(self.start)
+        self.assertEqual(throttled["status"], "throttled")
+        self.assertEqual(len(self.context.llm_calls), 1)
+        self.day.now = self.start + timedelta(seconds=60)
+        retried = await self.service.generate_life_day(self.start)
+        self.assertEqual(retried["status"], "failed")
+        self.assertEqual(len(self.context.llm_calls), 2)
+
+    async def test_invalid_planner_retry_setting_falls_back_and_negative_clamps_to_zero(self):
+        self.service.cfg["planner_failure_retry_seconds"] = "not-a-number"
+        self.assertEqual(self.service._int("planner_failure_retry_seconds", 1800), 1800)
+        self.service.cfg["planner_failure_retry_seconds"] = -20
+        self.assertEqual(self.service._int("planner_failure_retry_seconds", 1800), 0)
+
+    async def test_status_reports_bypass_and_broadcast_settings_without_config_dump(self):
+        self.service.cfg.update(peak_guard_before_minutes=7, peak_guard_after_minutes=3,
+                                admin_regenerate_bypass_fat_fish=True, dry_run=True)
+        state = await self.service.status(self.start)
+        self.assertEqual((state["peak_guard_before_minutes"], state["peak_guard_after_minutes"]), (7, 3))
+        self.assertTrue(state["admin_regenerate_bypass_fat_fish"])
+        self.assertTrue(state["fat_fish_admins_bypass"])
+        self.assertTrue(state["dry_run"])
+        self.assertNotIn("config", state)
 
     async def test_automatic_bootstrap_and_pregeneration_do_not_repeat_each_tick(self):
         self.context.output_factory = lambda prompt: valid_response_for(
@@ -567,6 +646,26 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AdapterAndBridgeTests(unittest.TestCase):
+    def test_xiaoman_gear_schema_exposes_owned_settings_and_defaults(self):
+        schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+        items = schema["schedule_broadcast"]["items"]
+        expected = {
+            "enable": False, "send_groups": True, "send_private": True,
+            "allowlist_umos": [], "denylist_umos": [], "provider_id": "",
+            "peak_guard_before_minutes": 5, "peak_guard_after_minutes": 5,
+            "admin_regenerate_bypass_fat_fish": True, "poll_seconds": 15,
+            "grace_seconds": 60, "planner_failure_retry_seconds": 1800,
+            "max_message_chars": 80, "dry_run": False,
+            "planner_prompt": "尊重给定世界观、主题池和近期生活日历史；一天要有真实变化，也允许休息和宅家。",
+        }
+        for key, default in expected.items():
+            with self.subTest(key=key):
+                self.assertIn(key, items)
+                self.assertEqual(items[key]["default"], default)
+                self.assertTrue(items[key].get("description"))
+        self.assertNotIn("schema_version", items)
+        self.assertNotIn("planner_version", items)
+
     def test_timeawareness_planner_context_reads_worldview_pools_and_random_weather(self):
         config = {"daily_schedule": {"ai_daily": {
             "generation_time": "-04:00", "worldview": "wide worldview", "use_persona": False,
@@ -617,7 +716,7 @@ class AdapterAndBridgeTests(unittest.TestCase):
                       "peak_periods": "09:00-12:00,14:00-18:00",
                       "peak_weekdays": "0,1,2,3,4,5,6",
                       "affected_providers": "deepseek", "gate_when_provider_unknown": True,
-                      "manual_override": "auto"}
+                      "manual_override": "auto", "admins_bypass": True}
 
             def _cfg(self, *_args, **_kwargs):
                 raise AssertionError("private _cfg must not be called")
@@ -650,6 +749,7 @@ class AdapterAndBridgeTests(unittest.TestCase):
         self.assertTrue(peak_policy["provider_affected"])
         self.assertEqual(peak_policy["state"], "peak")
         self.assertFalse(peak_policy["allowed"])
+        self.assertTrue(peak_policy["admins_bypass"])
         offpeak_policy = bridge.get_wallet_policy(
             at=datetime(2026, 10, 9, 12, 6, tzinfo=TZ), provider_id="planner-provider")
         self.assertEqual(offpeak_policy["state"], "offpeak")
@@ -682,6 +782,9 @@ class AdapterAndBridgeTests(unittest.TestCase):
             at=datetime(2026, 10, 9, 10, tzinfo=TZ), provider_id="planner-provider")
         self.assertFalse(not_affected["provider_affected"])
         self.assertTrue(not_affected["allowed"])
+        fish.config["affected_providers"] = "openai, DEEPSEEK"
+        self.assertTrue(bridge.get_wallet_policy(
+            at=datetime(2026, 10, 9, 10, tzinfo=TZ), provider_id="planner-provider")["provider_affected"])
 
     def test_fatfish_unknown_provider_uses_gate_when_unknown_setting(self):
         class Fish:

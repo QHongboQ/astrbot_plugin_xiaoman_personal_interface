@@ -31,15 +31,21 @@ send_xiaoman_photo()
 
 本版本不包含任何 TTS、语音提示、表演标签或 MiMo 逻辑。
 
-## 可选：林小满生命日规划器（v0.8.0）
+## 可选：林小满生命日规划器（v0.8.1）
 
 默认关闭。启用前请安装并启用 `time_awareness`，并配置可用的 LLM provider。**林小满拥有最终的生命日时间线**；TimeAwareness 仅作为只读时钟、动态生命日边界、工作日/节假日、世界观、人设开关、主题/风格池和可用天气等上下文来源。林小满不会读取或依赖 TimeAwareness 日程快照，不调用它的 AI 日程生成器，也不会修改其源码、配置或快照。
 
 每次生命日规划是一个全局 LLM 请求：先依据 `daily_schedule.ai_daily.generation_time` 生成从边界时刻到下一日同一边界的完整时间线，并在同一次响应中生成主题、风格和所有 NORMAL/高峰桥接消息。Fat Fish 仅提供只读有效高峰政策；规划器按 `peak_guard_before_minutes` / `peak_guard_after_minutes` 扩展保护窗口，再把完整自由窗与保护窗一起交给规划器。保护窗恰好对应一个 BRIDGE 活动。计划通过无缺口、无重叠及消息完整性验证后，保存到 Xiaoman 独立的 `life_day_plans.json`。刷新与到点投递均不调用 LLM；发送失败目标在宽限期内重试，成功目标不会重复发送。
 
-启用配置包括 `enable`、`provider_id`、`peak_guard_before_minutes`（默认5）、`peak_guard_after_minutes`（默认5）、`send_groups`、`send_private`、`allowlist_umos`、`denylist_umos`、`poll_seconds`、`grace_seconds`、`max_message_chars`、`dry_run` 和可选的 `planner_prompt`。只使用 AstrBot 已有会话，不枚举 QQ 群/好友。旧的 `schedule_broadcast_state.json` 会保留为 legacy 文件，不会被误当成 v0.8 生命日计划迁移。
+所有 Xiaoman 自有的可调项都在插件齿轮配置页的“生命日规划与主动播报”组中：`enable`、`send_groups`、`send_private`、`allowlist_umos`、`denylist_umos`、`provider_id`、`peak_guard_before_minutes`、`peak_guard_after_minutes`、`admin_regenerate_bypass_fat_fish`、`poll_seconds`、`grace_seconds`、`planner_failure_retry_seconds`、`max_message_chars`、`dry_run` 和 `planner_prompt`。只使用 AstrBot 已有会话，不枚举 QQ 群/好友。旧的 `schedule_broadcast_state.json` 会保留为 legacy 文件，不会被误当成 v0.8 生命日计划迁移。
 
-Fat Fish 通过其公开 `get_wallet_policy()` 只读接口提供 enabled、manual override、provider 范围和高峰配置。仅在自动模式、启用且 provider 受影响，并且 TimeAwareness 当日类型为工作日或调休工作日时生成保护窗；周末/节假日、`always_allow` 和 `always_block` 都不生成自动高峰保护窗。Xiaoman 不包装或替换 Fat Fish `_cfg`，不改 Fat Fish 配置。
+三个插件配置页各自是其所属设置的唯一来源：
+
+- Xiaoman 齿轮配置控制小满自己的目标筛选、发送范围、保护分钟数、规划重试、文案限制、dry-run 和管理员手动重规划开关。
+- TimeAwareness 齿轮配置控制生命日边界 `daily_schedule.ai_daily.generation_time`、worldview、人设开关、主题/风格池、天气与近期历史策略；Xiaoman 只读这些上下文，不复制成自己的配置。
+- Fat Fish 齿轮配置控制 `enabled`、timezone、高峰时段/星期、provider 范围、`manual_override` 和 `admins_bypass`；Xiaoman 通过 v1.1.1 的公开 `fish.config` 只读这些值，不调用私有方法、不修改配置。
+
+仅在自动模式、启用且 provider 受影响，并且 TimeAwareness 当日类型为工作日或调休工作日时生成保护窗；周末/节假日、`always_allow` 和 `always_block` 都不生成自动高峰保护窗。管理员显式执行 `regenerate` 时，只有 Xiaoman 的 `admin_regenerate_bypass_fat_fish` 与 Fat Fish 的 `admins_bypass` 同时开启才可绕过钱包高峰拦截；这只影响该次手动规划，启动补全、后台 tick、次日预生成及直接服务调用始终遵守 Fat Fish 拦截。绕过时会记录不含用户隐私的 INFO 审计日志。Fat Fish 管理员绕过开关由 Fat Fish 配置负责，Xiaoman 不复制该设置。
 
 管理员命令：
 
@@ -54,7 +60,7 @@ Fat Fish 通过其公开 `get_wallet_policy()` 只读接口提供 enabled、manu
 /xiaoman_broadcast test <entry_id>
 ```
 
-`status` 展示生命日边界、有效高峰/保护窗/自由窗、当前与下一生命日计划状态、下一条播报和最近规划错误。`raw cycle`/`plan` 查看 Xiaoman 权威时间线。`regenerate` 才会重新调用规划 LLM；`refresh` 只从已有时间线重建投递项；`simulate` 使用隔离状态走真实发送路径，遵守名单设置；`test` 只测试指定已生成消息。`dry_run` 不自动发送，管理员明确运行 `simulate` 时允许一次真实投递。
+`status` 展示生命日边界、有效高峰/保护窗/自由窗、当前与下一生命日计划状态、下一条播报和最近规划错误，也显示保护分钟数、两侧管理员绕过开关和 dry-run。`raw cycle`/`plan` 查看 Xiaoman 权威时间线。`regenerate` 才会重新调用规划 LLM；`refresh` 只从已有时间线重建投递项；`simulate` 使用隔离状态走真实发送路径，遵守名单设置；`test` 只测试指定已生成消息。`dry_run` 不自动发送，管理员明确运行 `simulate` 时允许一次真实投递。
 
 ## 管理员测试模式
 

@@ -14,7 +14,7 @@ from astrbot.api import logger
 from .fat_fish_bridge import FatFishBridge
 from .time_awareness_adapter import TimeAwarenessAdapter
 
-PLANNER_VERSION = "0.8.0"
+PLANNER_VERSION = "0.8.1"
 SCHEMA_VERSION = 2
 
 
@@ -66,6 +66,13 @@ class ScheduleBroadcastService:
 
     def _get(self, key, default=None):
         return self.cfg.get(key, default)
+
+    def _int(self, key, default, minimum=0):
+        try:
+            value = int(self._get(key, default))
+        except (TypeError, ValueError, OverflowError):
+            value = default
+        return max(minimum, value)
 
     def _load(self):
         try:
@@ -315,8 +322,8 @@ class ScheduleBroadcastService:
             start_at, end_at, provider_id, days)
         protected = self._merge_protected(
             source_peaks, start_at, end_at,
-            max(0, int(self._get("peak_guard_before_minutes", 5))),
-            max(0, int(self._get("peak_guard_after_minutes", 5))))
+            self._int("peak_guard_before_minutes", 5),
+            self._int("peak_guard_after_minutes", 5))
         free = self._free_complement(start_at, end_at, protected)
         adaptive = planner_context.get("adaptive", {})
         history = self._history(start_at, int(adaptive.get("recent_days") or 0),
@@ -359,7 +366,7 @@ class ScheduleBroadcastService:
             "只输出 JSON，不要 Markdown。字段：daily_theme,daily_style,timeline。时间为带时区 ISO 8601。"
             "NORMAL 项字段：id,kind=NORMAL,start_at,end_at,name,state,broadcast_message。"
             "BRIDGE 项字段：id,kind=BRIDGE,start_at,end_at,name,state,source_peak_start,source_peak_end,enter_message,exit_message；source_peak_* 原样照抄对应窗口。"
-            f"每条消息不得超过 {int(self._get('max_message_chars', 80))} 个字符。"
+            f"每条消息不得超过 {self._int('max_message_chars', 80, 1)} 个字符。"
         )
         extra = str(self._get("planner_prompt", "") or "").strip()
         return guidance + (f"\n补充规划要求：{extra}" if extra else "") + "\nPLANNER_INPUT:\n" + json.dumps(planner_input, ensure_ascii=False, default=str)
@@ -370,7 +377,7 @@ class ScheduleBroadcastService:
         life = planner_input["life_day"]
         start, end = _absolute(life["start_at"]), _absolute(life["end_at"])
         protected, free = planner_input["protected_windows"], planner_input["free_windows"]
-        ids, parsed, max_chars = set(), [], max(1, int(self._get("max_message_chars", 80)))
+        ids, parsed, max_chars = set(), [], self._int("max_message_chars", 80, 1)
         for row in timeline:
             if not isinstance(row, dict) or row.get("kind") not in {"NORMAL", "BRIDGE"}:
                 return False, "unknown timeline entry"
@@ -456,7 +463,7 @@ class ScheduleBroadcastService:
             event.setdefault("delivered_umos", [])
         return events
 
-    async def generate_life_day(self, life_day_start, *, force=False):
+    async def generate_life_day(self, life_day_start, *, force=False, allow_wallet_bypass=False):
         if isinstance(life_day_start, str):
             life_day_start = datetime.fromisoformat(life_day_start)
         if not life_day_start.tzinfo:
@@ -468,10 +475,12 @@ class ScheduleBroadcastService:
                 return {"status": "exists", "start_at": key}
             attempts = self.state.setdefault("generation_attempts", {})
             attempt = attempts.get(key, {})
-            if (not force and attempt.get("status") == "failed"
-                    and (self._now() - datetime.fromisoformat(attempt["at"])).total_seconds() < 1800):
+            retry_seconds = self._int("planner_failure_retry_seconds", 1800)
+            if (not force and retry_seconds > 0 and attempt.get("status") == "failed"
+                    and (self._now() - datetime.fromisoformat(attempt["at"])).total_seconds() < retry_seconds):
                 return {"status": "throttled", "reason": attempt.get("error", "recent planner failure")}
             self.last_error = ""
+            wallet_bypass_used = False
             try:
                 targets = await self.targets()
                 provider = await self._provider(targets)
@@ -487,8 +496,15 @@ class ScheduleBroadcastService:
                 wallet_policy = self.fat_fish.get_wallet_policy(
                     at=self._now(), provider_id=provider)
                 if wallet_policy.get("found") and not wallet_policy.get("allowed", True):
-                    return {"status": "deferred", "reason": "blocked_by_fat_fish",
-                            "policy": wallet_policy}
+                    wallet_bypass_used = bool(
+                        allow_wallet_bypass
+                        and self._get("admin_regenerate_bypass_fat_fish", True)
+                        and wallet_policy.get("admins_bypass", True)
+                        and wallet_policy.get("provider_resolved", False))
+                    if not wallet_bypass_used:
+                        return {"status": "deferred", "reason": "blocked_by_fat_fish",
+                                "policy": wallet_policy, "wallet_bypass_used": False}
+                    logger.info("Xiaoman planner manual admin bypass used for Fat Fish wallet gate")
                 response = await self.context.llm_generate(
                     chat_provider_id=provider, prompt=prompt,
                     system_prompt=persona_prompt, tools=None)
@@ -519,12 +535,14 @@ class ScheduleBroadcastService:
                 self._plans()[key] = plan
                 attempts[key] = {"status": "complete", "at": self._now().isoformat()}
                 self._save()
-                return {"status": "generated", "plan": plan}
+                return {"status": "generated", "plan": plan,
+                        "wallet_bypass_used": wallet_bypass_used}
             except Exception as exc:
                 self.last_error = str(exc) or type(exc).__name__
                 attempts[key] = {"status": "failed", "at": self._now().isoformat(), "error": self.last_error}
                 self._save()
-                return {"status": "failed", "reason": self.last_error}
+                return {"status": "failed", "reason": self.last_error,
+                        "wallet_bypass_used": wallet_bypass_used}
 
     async def refresh(self, force=False, now=None):
         """Rebuild delivery rows from persisted timelines without invoking an LLM."""
@@ -547,7 +565,7 @@ class ScheduleBroadcastService:
     def next_plan(self, now=None):
         return self.plan_for_start(self.next_life_day(now)["start"])
 
-    async def regenerate(self, which="current", now=None):
+    async def regenerate(self, which="current", now=None, *, allow_wallet_bypass=False):
         current = self.life_day(now)
         if which == "current":
             starts = [current["start"]]
@@ -557,7 +575,8 @@ class ScheduleBroadcastService:
             starts = [current["start"], current["end"]]
         else:
             return [{"status": "invalid", "reason": "expected current|next|cycle"}]
-        return [await self.generate_life_day(start, force=True) for start in starts]
+        return [await self.generate_life_day(
+            start, force=True, allow_wallet_bypass=allow_wallet_bypass) for start in starts]
 
     def reset(self, which="current", now=None):
         current = self.life_day(now)
@@ -641,7 +660,7 @@ class ScheduleBroadcastService:
                     if persist:
                         self._save()
                     continue
-                if local_now > trigger + timedelta(seconds=max(0, int(self._get("grace_seconds", 60)))):
+                if local_now > trigger + timedelta(seconds=self._int("grace_seconds", 60)):
                     event["expired"] = True
                     result["expired_event_ids"].append(event.get("id", ""))
                     if persist:
@@ -724,7 +743,7 @@ class ScheduleBroadcastService:
                 raise
             except Exception:
                 logger.warning("Life-day planner tick failed", exc_info=True)
-            await asyncio.sleep(max(1, int(self._get("poll_seconds", 15))))
+            await asyncio.sleep(self._int("poll_seconds", 15, 1))
 
     def start(self):
         if self._task is None or self._task.done():
@@ -744,6 +763,7 @@ class ScheduleBroadcastService:
         targets = await self.targets()
         provider = await self._provider(targets)
         current_input = await self.planner_input(current["start"], provider)
+        wallet_policy = self.fat_fish.get_wallet_policy(at=self._now(now), provider_id=provider)
         pending = sorted((event for plan in self._plans().values() for event in plan.get("deliveries", [])
                           if event.get("message") and not event.get("sent") and not event.get("expired")),
                          key=lambda row: row.get("trigger_at", ""))
@@ -757,6 +777,13 @@ class ScheduleBroadcastService:
                 current_input["calendar_days"]),
             "protected_windows": current_input["protected_windows"],
             "free_windows": current_input["free_windows"],
+            "peak_guard_before_minutes": self._int("peak_guard_before_minutes", 5),
+            "peak_guard_after_minutes": self._int("peak_guard_after_minutes", 5),
+            "admin_regenerate_bypass_fat_fish": bool(
+                self._get("admin_regenerate_bypass_fat_fish", True)),
+            "fat_fish_admins_bypass": bool(
+                wallet_policy.get("found") and wallet_policy.get("admins_bypass", False)),
+            "dry_run": bool(self._get("dry_run", False)),
             "current_plan_status": (self.current_plan(now) or {}).get("status", "missing"),
             "next_plan_status": (self.next_plan(now) or {}).get("status", "missing"),
             "next_broadcast": pending[0] if pending else None,
