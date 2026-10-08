@@ -7,7 +7,7 @@ desc: |
   自然语言路由由正常 LLM 处理；显式图库浏览命令由 Airi Gallery 处理。
   TimeAwareness 仅提供只读时钟、日历、世界观与传感器上下文；林小满拥有从动态生活日边界到次日边界的独立规划器和持久化时间线。
   本插件不负责 TTS、人格、记忆、好感度或图片生成。
-version: 0.8.5
+version: 0.8.6
 author: QHongboQ
 repo: https://github.com/QHongboQ/astrbot_plugin_xiaoman_personal_interface
 astrbot_version: ">=4.28.2"
