@@ -14,8 +14,13 @@ from astrbot.api import logger
 from .fat_fish_bridge import FatFishBridge
 from .time_awareness_adapter import TimeAwarenessAdapter
 
-PLANNER_VERSION = "0.8.2"
+PLANNER_VERSION = "0.8.4"
 SCHEMA_VERSION = 2
+DAILY_THEME_MAX_CHARS = 60
+DAILY_STYLE_MAX_CHARS = 40
+ENTRY_NAME_MAX_CHARS = 48
+NORMAL_STATE_MAX_CHARS = 120
+BRIDGE_STATE_MAX_CHARS = 240
 TIMELINE_CATEGORIES = {
     "sleep", "rest", "meal", "travel", "school", "creative", "social",
     "entertainment", "outdoor", "shopping", "errand", "mixed", "other",
@@ -467,14 +472,51 @@ class ScheduleBroadcastService:
             "在 free_window 内，较长睡眠通常应作为独立 category=sleep 的 NORMAL 事件，不要把补觉/回笼觉藏在其他事件的 state。protected_window 的 BRIDGE 必须保持一个不可拆分的顶层事件：若它跨越自然的睡眠→醒来→慢启动阶段，可在同一 state 中描述内部过程，通常使用 category=mixed；不得为了避免 mixed 而提前叫醒小满或把 BRIDGE 拆开。若整个 BRIDGE 确实都在睡觉，category=sleep 仍然合适。睡眠/休息是有效的低强度时段，无需替换为活动。"
             "只根据 continuity 和 recent_life_days 中明确提供的历史延续。若无可用历史，必须视为没有已知的前夜/前几日事件；不得编造‘昨晚通宵赶作业’等事实，只生成合理的起始状态。近期主要活动、类别、主题、风格和睡眠只用于避免重复及维持连续性。"
             "优先遵循 worldview、theme_pool、style_pool、天气和真实日历。不要每天塞满高强度活动。人物、地点、天气影响、消费和结果不得无依据编造。"
-            "只输出 JSON，不要 Markdown。字段：daily_theme,daily_style,timeline。时间为带时区 ISO 8601。"
+            "只输出紧凑 JSON，不要 Markdown、代码围栏、解释或 JSON 前后的文字，尽量避免无意义空白和冗长叙述。字段：daily_theme,daily_style,timeline。daily_theme 不超过60字符，daily_style 不超过40字符。时间为带时区 ISO 8601。"
             "timeline 每项都必须包含 category，且只能是 sleep,rest,meal,travel,school,creative,social,entertainment,outdoor,shopping,errand,mixed,other 之一。"
-            "NORMAL 项字段：id,kind=NORMAL,category,start_at,end_at,name,state,broadcast_message。"
-            "BRIDGE 项字段：id,kind=BRIDGE,category,start_at,end_at,name,state,source_peak_start,source_peak_end,enter_message,exit_message；source_peak_* 原样照抄对应窗口。"
+            "每项 name 不超过48字符。NORMAL 项字段：id,kind=NORMAL,category,start_at,end_at,name,state,broadcast_message。NORMAL state 不超过120字符，通常只写1句简洁连续性信息。"
+            "BRIDGE 项字段：id,kind=BRIDGE,category,start_at,end_at,name,state,source_peak_start,source_peak_end,enter_message,exit_message；source_peak_* 原样照抄对应窗口。BRIDGE state 不超过240字符，可写内部阶段，通常用2-4句或短阶段描述。"
+            "state 只保留后续规划需要的信息，不写小说式叙述；播报消息仍须自然、有个性。"
             f"每条消息不得超过 {self._int('max_message_chars', 80, 1)} 个字符。"
         )
         extra = str(self._get("planner_prompt", "") or "").strip()
         return guidance + (f"\n补充规划要求：{extra}" if extra else "") + "\nPLANNER_INPUT:\n" + json.dumps(planner_input, ensure_ascii=False, default=str)
+
+    @staticmethod
+    def _normalize_planner_json(raw):
+        """Strip whitespace and at most one complete outer Markdown fence."""
+        text = str(raw or "").strip()
+        if not (text.startswith("```") and text.endswith("```")):
+            return text
+        body = text[3:-3].strip()
+        if body[:4].lower() == "json" and (len(body) == 4 or body[4].isspace()):
+            body = body[4:].strip()
+        return body
+
+    @staticmethod
+    def _json_error_snippet(raw, start, end, limit=160):
+        text = str(raw or "")
+        start = max(0, min(len(text), start))
+        end = max(start, min(len(text), end))
+        if end - start > limit:
+            end = start + limit
+        return text[start:end].replace("\r", " ").replace("\n", " ")
+
+    @classmethod
+    def _log_planner_json_error(cls, raw, exc, response):
+        raw = str(raw or "")
+        near_start = max(0, exc.pos - 80)
+        near_end = min(len(raw), exc.pos + 80)
+        near_error = cls._json_error_snippet(raw, near_start, near_end)
+        raw_tail = cls._json_error_snippet(raw, max(0, len(raw) - 240), len(raw), 240)
+        usage = getattr(response, "usage", None)
+        output_tokens = getattr(usage, "output", None) if usage is not None else None
+        tokens = f" output_tokens={output_tokens}" if isinstance(output_tokens, int) else ""
+        logger.warning(
+            "planner JSON parse failed raw_length={} error_line={} error_column={} "
+            "error_pos={}{} near_error={!r} raw_tail={!r}",
+            len(raw), exc.lineno, exc.colno, exc.pos, tokens, near_error, raw_tail,
+        )
 
     def validate_timeline(self, planner_input, timeline):
         if not isinstance(timeline, list) or not timeline:
@@ -493,10 +535,16 @@ class ScheduleBroadcastService:
             ids.add(ident)
             if row.get("category") not in TIMELINE_CATEGORIES:
                 return False, f"{ident} missing or invalid category"
-            if not str(row.get("name", "")).strip():
+            name = str(row.get("name", "")).strip()
+            if not name:
                 return False, f"{ident} missing name"
+            if len(name) > ENTRY_NAME_MAX_CHARS:
+                return False, f"{ident} name exceeds {ENTRY_NAME_MAX_CHARS} characters"
             if not isinstance(row.get("state"), str):
                 return False, f"{ident} missing state"
+            state_limit = NORMAL_STATE_MAX_CHARS if row["kind"] == "NORMAL" else BRIDGE_STATE_MAX_CHARS
+            if len(row["state"]) > state_limit:
+                return False, f"{ident} state exceeds {state_limit} characters"
             if row["kind"] == "NORMAL":
                 messages = [row.get("broadcast_message")]
             else:
@@ -535,6 +583,18 @@ class ScheduleBroadcastService:
                 return False, f"free window {window['id']} not fully filled"
             if any(left[1] != right[0] for left, right in zip(rows, rows[1:])):
                 return False, f"free window {window['id']} has gap or overlap"
+        return True, ""
+
+    @staticmethod
+    def validate_daily_metadata(result):
+        theme = str(result.get("daily_theme", "") or "").strip()
+        style = str(result.get("daily_style", "") or "").strip()
+        if not theme or not style:
+            return False, "planner response missing daily_theme or daily_style"
+        if len(theme) > DAILY_THEME_MAX_CHARS:
+            return False, f"daily_theme exceeds {DAILY_THEME_MAX_CHARS} characters"
+        if len(style) > DAILY_STYLE_MAX_CHARS:
+            return False, f"daily_style exceeds {DAILY_STYLE_MAX_CHARS} characters"
         return True, ""
 
     @staticmethod
@@ -616,12 +676,21 @@ class ScheduleBroadcastService:
                     chat_provider_id=provider, prompt=prompt,
                     system_prompt=persona_prompt, tools=None)
                 raw = getattr(response, "completion_text", None) or getattr(response, "text", None) or str(response)
-                result = json.loads(raw)
+                normalized = self._normalize_planner_json(raw)
+                try:
+                    result = json.loads(normalized)
+                except json.JSONDecodeError as exc:
+                    self._log_planner_json_error(normalized, exc, response)
+                    raise ValueError(
+                        f"planner returned invalid JSON: {exc.msg} at line {exc.lineno} "
+                        f"column {exc.colno} position {exc.pos}"
+                    ) from exc
                 if not isinstance(result, dict):
                     raise ValueError("planner response must be a JSON object")
+                metadata_valid, metadata_reason = self.validate_daily_metadata(result)
+                if not metadata_valid:
+                    raise ValueError("planner output rejected: " + metadata_reason)
                 timeline = result.get("timeline")
-                if not str(result.get("daily_theme", "")).strip() or not str(result.get("daily_style", "")).strip():
-                    raise ValueError("planner response missing daily_theme or daily_style")
                 valid, reason = self.validate_timeline(planner_input, timeline)
                 if not valid:
                     raise ValueError("planner timeline rejected: " + reason)
