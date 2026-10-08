@@ -807,6 +807,9 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("free_window_plans", contract)
         self.assertIn("bridge_plans", contract)
         self.assertIn("不要给事件生成 ID 或 kind，也不要输出任何时间/高峰边界字段", contract)
+        self.assertIn("name、state、broadcast_message、enter_message、exit_message 不得声称依赖最终时间线的精确钟点或时长", contract)
+        self.assertIn("精确时间和时长只由 Python 的最终时间线决定", contract)
+        self.assertIn("上下文明确提供的外部固定事实不必回避", contract)
         self.assertNotIn("source_peak_* 原样照抄", contract)
 
     async def test_daily_theme_and_style_character_caps(self):

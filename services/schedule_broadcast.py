@@ -466,6 +466,7 @@ class ScheduleBroadcastService:
             "你是林小满的生活日规划器。规划的是完整 life_day，不是自然日；一次性从头安排到尾。你负责生活语义，Python 负责机械时间线结构。"
             "请按输入中的 free_windows 精确 ID 返回 ordered semantic segments + duration weights；每个 protected_windows 精确 ID 返回一个 semantic BRIDGE。不要给事件生成 ID 或 kind，也不要输出任何时间/高峰边界字段；Python 会确定性分配时长并构造完整 timeline。"
             "NORMAL 语义段提供 category,name,state,broadcast_message,weight；BRIDGE 提供 category,name,state,enter_message,exit_message。weight 只表示当前 free_window 内相对持续时间，允许 1..100，不是概率或精确时长。"
+            "name、state、broadcast_message、enter_message、exit_message 不得声称依赖最终时间线的精确钟点或时长；用上午/下午/晚上/深夜/一会儿/晚点等宽泛时间表达。精确时间和时长只由 Python 的最终时间线决定。上下文明确提供的外部固定事实不必回避，但不得为活动时间自行编造具体钟点或时长。"
             "每个正常消息和桥接进出消息尽量写自然完整的短句；消息格式错误会按活动名称使用确定性兜底，不影响其他语义校验。"
             "桥接活动须和前后事件一起形成因果连续的一天，不要把分段当成互不相关的活动。"
             "林小满是课表相对宽松的艺术专业大学生；protected_window 只是结构性规划窗口，不代表上课时间或课程安排。BRIDGE 必须是该保护窗内的一个大活动，但可以是工作室创作、外出、购物、休息、睡觉、社交、娱乐、旅行或有依据的课程；上课只是选项，不得仅因小满是大学生就默认课堂/食堂/自习/宿舍是每日主轴，也不得把两个 protected_window 模板化地都安排成课。若两个保护窗都是课，应有世界观、日历、历史或其他上下文依据/自然主题关联；否则优先考虑仅一段课程、无课、工作室/项目、临时外出、恢复休息或社交休闲。近期历史若连续多天偏上课，可在上下文允许时换一种结构；不硬性禁止上课，也不为求新奇而违背强上下文。"
