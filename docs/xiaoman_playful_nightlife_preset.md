@@ -1,7 +1,7 @@
 # 林小满 · 松弛爱玩与夜生活日程预设
 
-这是 **TimeAwareness v2.3.0 原生配置**的建议值，不是另一套日程引擎。
-小满个人接口保持 **只读日程快照**；不要通过它自动篡改 TimeAwareness 源码、配置或已执行时间线。
+这是给 **TimeAwareness v2.3.0 只读上下文**使用的建议值，不是另一套日程引擎。
+v0.8 起林小满自己生成最终生命日时间线；TimeAwareness 的 AI 日程快照不再作为计划来源。其 worldview、人格开关、主题/风格池、自适应连续性及日历/天气事实只读传给林小满规划器，不修改 TimeAwareness 源码、配置或快照。
 
 ## 1. AI 每日日程 → 世界观 / 长期背景（追加到现有设定，而非覆盖其他重要背景）
 
@@ -63,21 +63,21 @@
 
 ## 5. 推荐沿用的原生设置
 
-- `ai_daily.generation_time=-04:00`：保留；**前一天凌晨04:00生成第二天快照**，并不是04:00才睡觉。
+- `ai_daily.generation_time=-04:00`：保留；时钟部分定义林小满生命日为04:00→次日04:00，负号目标日语义用于在边界开始后预生成下一生命日，并不是04:00才睡觉。
 - `ai_daily.use_persona=true`：保留角色人格。
 - `ai_daily.adaptive.enabled=true`、`recent_days=3`、`state_continuity_enabled=true`：保留过去几天参考、状态衔接和反重复。
 - `ai_daily.adaptive.allow_custom_theme=true`：允许合理的池外主题，避免每天只重复有限主题。
-- `ai_daily.max_slots=10`：依旧是期望值而非硬上限，不必为了夜生活强制堆更多段。
+- `ai_daily.max_slots` 只影响 TimeAwareness 自己的日程生成；林小满独立规划器不调用其生成器，也不继承 candidate_count/candidate_selection。
 - 如果配置了固定的“21:30回宿舍／23:00入睡”静态模板，先检查是否覆盖了 AI 日程。用户层始终优先，静态层与 AI 的优先级通过官方配置决定。
 
 ## 6. 验收方式
 
-修改原生配置后，**已存在的快照不会自动被小满改写**。可以等待下一次 `-04:00` 生成新日期，再依次运行：
+更新原生 worldview、主题池或风格池后，可让林小满按新输入重新生成生命日：
 
 ```text
-/xiaoman_broadcast raw tomorrow
-/xiaoman_broadcast plan tomorrow
+/xiaoman_broadcast status
+/xiaoman_broadcast regenerate current
+/xiaoman_broadcast raw cycle
 ```
 
-先判断 RAW 是否真的出现更灵活的晚间安排，再判断 EFFECTIVE 是否把这些真实安排说清楚。
-若 RAW 仍都是固定早睡或没有夜生活，需要先调整 TimeAwareness 的世界观、主题池或静态模板；不要靠小满播报凭空添加没有安排的活动。
+检查 status 中的自由窗/保护窗和 `raw cycle` 中林小满的权威时间线。`refresh` 只重建投递项、不调用 LLM；`regenerate` 才会生成新计划。不要把 TimeAwareness 日程快照当作林小满计划，也不要让规划器凭空添加现实约束不支持的活动。

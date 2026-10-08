@@ -1,23 +1,22 @@
 {
   "schedule_broadcast": {
     "type": "object",
-    "description": "林小满日程广播（TimeAwareness）",
-    "hint": "广播只读取 TimeAwareness 快照；可选滚动生活日桥仅在运行时补充生成语义，不修改第三方源码或持久化配置。",
+    "description": "林小满生命日规划与主动播报",
+    "hint": "TimeAwareness 只提供只读日历、时区与世界观上下文；林小满独立规划并保存从配置边界到次日边界的完整时间线。",
     "items": {
       "enable": {"type": "bool", "description": "启用日程广播", "default": false},
-      "rolling_day_bridge_enabled": {"type": "bool", "description": "启用滚动24小时生活日桥", "hint": "读取 TimeAwareness 的 generation_time 作为生活日边界；例如 -04:00 → 04:00 到次日04:00。仅运行时补充生成提示，不改第三方源码/配置。", "default": true},
-      "schedule_source_umo": {"type": "string", "description": "定义日程人格的已存在会话 UMO；留空使用首个目标", "default": ""},
       "send_groups": {"type": "bool", "description": "发送到群聊", "default": true},
       "send_private": {"type": "bool", "description": "发送到私聊", "default": true},
       "allowlist_umos": {"type": "list", "description": "目标 UMO 允许列表（为空不额外限制）", "default": []},
       "denylist_umos": {"type": "list", "description": "拒绝的 UMO（始终优先）", "default": []},
       "provider_id": {"type": "string", "description": "模型提供商（留空则从首个会话解析）", "_special": "select_provider", "default": ""},
-      "event_offset_minutes": {"type": "int", "description": "广播时间偏移（分钟）", "default": 0},
+      "peak_guard_before_minutes": {"type": "int", "description": "Fat Fish 高峰前保护分钟数", "default": 5},
+      "peak_guard_after_minutes": {"type": "int", "description": "Fat Fish 高峰后保护分钟数", "default": 5},
       "poll_seconds": {"type": "int", "description": "日程检查间隔（秒）", "default": 15},
       "grace_seconds": {"type": "int", "description": "发送宽限期（秒）", "default": 60},
       "max_message_chars": {"type": "int", "description": "消息最大字符数", "default": 80},
       "dry_run": {"type": "bool", "description": "仅预览，不发送", "default": false},
-      "broadcast_prompt": {"type": "text", "description": "广播补充指令（不替代默认人格）", "default": "请按每个日程生成一句自然的第一人称聊天消息，只输出 JSON。忠于事项，不编造地点或同伴，不提日程、系统、AI。"}
+      "planner_prompt": {"type": "text", "description": "生活日规划补充指令", "default": "尊重给定世界观、主题池和近期生活日历史；一天要有真实变化，也允许休息和宅家。"}
     }
   }
 }

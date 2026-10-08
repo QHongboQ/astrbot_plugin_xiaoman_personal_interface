@@ -1,13 +1,54 @@
-"""Read-only adapter for active TimeAwareness v2.3.0 runtime APIs."""
+"""Read-only planner context from the active TimeAwareness runtime."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
-import asyncio
+from datetime import datetime, timedelta, time
+import inspect
 
 TIME_AWARENESS_NAME = "time_awareness"
 
 
+def _mapping(value):
+    if isinstance(value, dict):
+        return value
+    try:
+        return dict(value)
+    except Exception:
+        pass
+    converter = getattr(value, "to_dict", None)
+    if callable(converter):
+        try:
+            result = converter()
+            return result if isinstance(result, dict) else {}
+        except Exception:
+            return {}
+    getter = getattr(value, "get", None)
+    if callable(getter):
+        result = {}
+        for key in ("daily_schedule", "ai_daily", "adaptive", "weather_sensor", "random",
+                    "generation_time", "worldview", "use_persona", "theme_pool", "style_pool",
+                    "allow_custom_theme", "recent_days", "state_continuity_enabled", "enabled",
+                    "random_enabled", "random_weather_enabled", "random_weather"):
+            try:
+                item = getter(key, None)
+                if item is not None:
+                    result[key] = item
+            except Exception:
+                continue
+        return result
+    return {}
+
+
+def _pool(value):
+    if isinstance(value, str):
+        return [item.strip() for item in value.splitlines() if item.strip()]
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
 class TimeAwarenessAdapter:
+    """Read calendar, clock, worldview and sensor data without invoking generation."""
+
     def __init__(self, context):
         self.context = context
 
@@ -20,90 +61,46 @@ class TimeAwarenessAdapter:
 
     def current_time(self) -> datetime:
         plugin = self.discover()
-        if plugin is not None:
-            try:
-                now = plugin.time_context.now()
-                if isinstance(now, datetime):
-                    return now
-            except Exception:
-                pass
+        try:
+            now = plugin.time_context.now() if plugin else None
+            if isinstance(now, datetime):
+                return now
+        except Exception:
+            pass
         return datetime.now().astimezone()
 
-    def get_generation_boundary(self) -> dict:
-        """Read TimeAwareness ai_daily.generation_time without mutating its config."""
-        plugin = self.discover()
-        if plugin is None:
-            return {
-                "available": False,
-                "raw": "",
-                "hour": 0,
-                "minute": 5,
-                "clock": "00:05",
-                "target_day_offset": 0,
-            }
-        try:
-            service = plugin.daily_schedule_service
-            getter = getattr(service, "_daily_config", None)
-            config = getter() if callable(getter) else {}
-            if not isinstance(config, dict):
-                config = {}
-            raw = str(config.get("generation_time", "00:05") or "00:05").strip()
-            parser = getattr(service, "_parse_generation_time", None)
-            if callable(parser):
-                hour, minute, target_day_offset = parser(raw)
-            else:
-                normalized = raw[1:].strip() if raw.startswith("-") else raw
-                parsed = datetime.strptime(normalized, "%H:%M")
-                hour, minute = parsed.hour, parsed.minute
-                target_day_offset = 1 if raw.startswith("-") else 0
-            return {
-                "available": True,
-                "raw": raw,
-                "hour": int(hour),
-                "minute": int(minute),
-                "clock": f"{int(hour):02d}:{int(minute):02d}",
-                "target_day_offset": int(target_day_offset),
-            }
-        except Exception:
-            return {
-                "available": False,
-                "raw": "",
-                "hour": 0,
-                "minute": 5,
-                "clock": "00:05",
-                "target_day_offset": 0,
-            }
+    @staticmethod
+    def _config(plugin):
+        return _mapping(getattr(plugin, "config", None))
 
-    def rolling_day_window(self, at: datetime | None = None) -> dict:
-        """Return Xiaoman's 24h life-day window using TimeAwareness's configured clock."""
+    def get_generation_boundary(self) -> dict:
+        plugin = self.discover()
+        config = self._config(plugin) if plugin else {}
+        daily = _mapping(config.get("daily_schedule"))
+        ai_daily = _mapping(daily.get("ai_daily"))
+        raw = str(ai_daily.get("generation_time", "-04:00") or "-04:00").strip()
+        target_offset = 1 if raw.startswith("-") else 0
+        clock = raw[1:].strip() if raw[:1] in {"-", "+"} else raw
+        try:
+            parsed = time.fromisoformat(clock)
+        except ValueError:
+            return {"available": bool(plugin), "raw": raw, "clock": "04:00",
+                    "hour": 4, "minute": 0, "target_day_offset": target_offset}
+        return {"available": bool(plugin), "raw": raw,
+                "clock": f"{parsed.hour:02d}:{parsed.minute:02d}",
+                "hour": parsed.hour, "minute": parsed.minute,
+                "target_day_offset": target_offset}
+
+    def life_day_window(self, at: datetime | None = None) -> dict:
         now = at or self.current_time()
-        if not isinstance(now, datetime):
-            now = self.current_time()
-        if now.tzinfo is None:
-            now = now.astimezone()
+        now = now if now.tzinfo else now.astimezone()
         boundary = self.get_generation_boundary()
-        start = now.replace(
-            hour=int(boundary["hour"]),
-            minute=int(boundary["minute"]),
-            second=0,
-            microsecond=0,
-        )
+        start = now.replace(hour=boundary["hour"], minute=boundary["minute"], second=0, microsecond=0)
         if now < start:
             start -= timedelta(days=1)
-        return {
-            **boundary,
-            "start": start,
-            "end": start + timedelta(days=1),
-        }
-
-    def rolling_day_dates(self, at: datetime | None = None) -> list:
-        window = self.rolling_day_window(at)
-        day, last = window["start"].date(), (window["end"] - timedelta(microseconds=1)).date()
-        dates = []
-        while day <= last:
-            dates.append(day)
-            day += timedelta(days=1)
-        return dates
+        return {**boundary, "start": start, "end": start + timedelta(days=1),
+                "timezone": str(getattr(getattr(self.discover(), "time_context", None), "timezone", "")
+                                 or now.tzinfo)}
 
     def get_day_policy(self, at: datetime | None = None) -> dict:
         plugin = self.discover()
@@ -120,72 +117,53 @@ class TimeAwarenessAdapter:
         except Exception:
             return {"available": False, "kind": "unknown", "label": "", "evaluated_at": at}
 
-    @staticmethod
-    def _context_time(now: datetime, target_date):
-        return now if target_date == now.date() else datetime.combine(
-            target_date, datetime.min.time(), tzinfo=now.tzinfo
-        )
+    async def planner_context(self, start_at: datetime, end_at: datetime) -> dict:
+        plugin = self.discover()
+        if plugin is None:
+            return {"available": False, "calendar_days": [], "worldview": "", "persona": "",
+                    "theme_pool": [], "style_pool": [], "allow_custom_theme": True,
+                    "adaptive": {}, "weather": []}
+        config = self._config(plugin)
+        daily = _mapping(config.get("daily_schedule"))
+        ai_daily = _mapping(daily.get("ai_daily"))
+        adaptive = _mapping(ai_daily.get("adaptive"))
+        calendar_days = []
+        day = start_at.date()
+        last = (end_at - timedelta(microseconds=1)).date()
+        while day <= last:
+            at = datetime.combine(day, time(12), tzinfo=start_at.tzinfo)
+            policy = self.get_day_policy(at)
+            calendar_days.append({"date": day.isoformat(), "kind": policy.get("kind", "unknown"),
+                                  "label": policy.get("label", "")})
+            day += timedelta(days=1)
 
-    async def regenerate_date(self, session: str, target_date, *, timeout: float = 90.0) -> dict:
-        """Force generation through TimeAwareness and wait for its new ready snapshot."""
-        plugin = self.discover()
-        if plugin is None:
-            return {"date": target_date.isoformat(), "status": "failed", "reason": "TimeAwareness unavailable"}
-        try:
-            service = plugin.daily_schedule_service
-            now = plugin.time_context.now()
-            context_now = self._context_time(now, target_date)
-            persona_hash = await service.register_session_async(session, trigger=False)
-            if not persona_hash:
-                return {"date": target_date.isoformat(), "status": "failed", "reason": "Persona unavailable"}
-            old = service.get_snapshot_for_session(session, now=context_now)
-            old_id = str(old.get("snapshot_id", "")) if isinstance(old, dict) else ""
-            previous_failure = service.get_failure_for_session(session, now=context_now)
-            previous_failure = dict(previous_failure) if isinstance(previous_failure, dict) else None
-            queued = bool(service.queue_generation(session, force=True, target_date=target_date))
-            deadline = asyncio.get_running_loop().time() + max(0.0, timeout)
-            while asyncio.get_running_loop().time() < deadline:
-                snapshot = service.get_snapshot_for_session(session, now=context_now)
-                new_id = str(snapshot.get("snapshot_id", "")) if isinstance(snapshot, dict) else ""
-                if new_id and new_id != old_id and snapshot.get("status") == "ready":
-                    return {"date": target_date.isoformat(), "status": "regenerated", "old_id": old_id,
-                            "new_id": new_id, "slot_count": len(snapshot.get("slots", []))}
-                failure = service.get_failure_for_session(session, now=context_now)
-                if isinstance(failure, dict) and failure != previous_failure:
-                    return {"date": target_date.isoformat(), "status": "failed", "old_id": old_id,
-                            "reason": str(failure.get("error_type", "generation failed"))}
-                await asyncio.sleep(0.5)
-            return {"date": target_date.isoformat(), "status": "timeout", "old_id": old_id,
-                    "reason": (f"no new ready snapshot within {timeout:g}s" if queued else
-                               f"request was not queued and no in-flight result appeared within {timeout:g}s")}
-        except Exception as exc:
-            return {"date": target_date.isoformat(), "status": "failed", "reason": str(exc) or type(exc).__name__}
-    async def get_daily_schedule(self, session: str, *, at: datetime | None = None,
-                                 allow_generate: bool = False) -> dict | None:
-        if allow_generate or not session:
-            return None
-        plugin = self.discover()
-        if plugin is None:
-            return None
-        try:
-            service = plugin.daily_schedule_service
-            now = at or plugin.time_context.now()
-            persona_hash = await service.register_session_async(session, trigger=False)
-            if not persona_hash:
-                return None
-            snapshot = service.get_snapshot_for_session(session, now=now)
-            if not isinstance(snapshot, dict):
-                return None
-            detail = plugin.daily_schedule_admin.get_detail(
-                persona_hash, now.date(), str(snapshot.get("timezone", "")), now=now)
-            if not isinstance(detail, dict) or not isinstance(detail.get("slots"), list):
-                return None
-            result = {key: snapshot.get(key, detail.get(key, "")) for key in
-                      ("persona_hash", "snapshot_id", "local_date", "timezone", "generated_at", "manually_edited")}
-            result["source"] = "time_awareness"
-            result["slots"] = [{key: slot.get(key, "") for key in
-                                ("slot_ref", "start", "end", "name", "state", "origin", "source_origin")}
-                               for slot in detail["slots"] if isinstance(slot, dict)]
-            return result
-        except Exception:
-            return None
+        weather = []
+        weather_cfg = _mapping(config.get("weather_sensor"))
+        random_cfg = _mapping(weather_cfg.get("random"))
+        weather_enabled = bool(ai_daily.get("random_weather_enabled", random_cfg.get(
+            "enabled", weather_cfg.get("random_enabled", weather_cfg.get(
+                "random_weather_enabled", weather_cfg.get("random_weather", False))))))
+        sensor = getattr(plugin, "weather_sensor", None)
+        forecast = getattr(sensor, "daily_forecast", None)
+        if weather_enabled and callable(forecast):
+            for row in calendar_days:
+                try:
+                    value = forecast(datetime.fromisoformat(row["date"]).date())
+                    if inspect.isawaitable(value):
+                        value = await value
+                    weather.append({"date": row["date"], "forecast": value})
+                except Exception:
+                    continue
+
+        return {
+            "available": True,
+            "worldview": str(ai_daily.get("worldview", "") or ""),
+            "use_persona": bool(ai_daily.get("use_persona", True)),
+            "theme_pool": _pool(adaptive.get("theme_pool", [])),
+            "style_pool": _pool(adaptive.get("style_pool", [])),
+            "allow_custom_theme": bool(adaptive.get("allow_custom_theme", True)),
+            "adaptive": {key: adaptive.get(key) for key in
+                         ("recent_days", "state_continuity_enabled")},
+            "calendar_days": calendar_days,
+            "weather": weather,
+        }

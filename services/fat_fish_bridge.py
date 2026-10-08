@@ -1,7 +1,7 @@
-"""Small runtime bridge for Fat Fish 1.1.1 wallet policy."""
+"""Read-only Fat Fish policy and peak-period adapter."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone as datetime_timezone
+from datetime import datetime, timedelta, time
 from importlib import import_module
 from zoneinfo import ZoneInfo
 
@@ -9,12 +9,11 @@ FAT_FISH_NAME = "astrbot_plugin_fat_fish_wallet"
 
 
 class FatFishBridge:
+    """Consume the public wallet policy without patching Fat Fish runtime state."""
+
     def __init__(self, context, day_adapter):
         self.context = context
         self.day_adapter = day_adapter
-        self.instance = None
-        self._original_cfg = None
-        self._cfg_wrapper = None
 
     def discover(self):
         try:
@@ -23,133 +22,73 @@ class FatFishBridge:
         except Exception:
             return None
 
-    def install(self):
-        fish = self.discover()
-        if fish is None:
-            return False
-        self.instance = fish
-        if self._cfg_wrapper is not None and fish._cfg is self._cfg_wrapper:
-            return True
-        original = fish._cfg
-        bridge = self
-
-        def cfg_wrapper(key, *args, **kwargs):
-            value = original(key, *args, **kwargs)
-            if key != "manual_override" or value != "auto":
-                return value
-            day = bridge.day_adapter.get_day_policy()
-            if day.get("available") and day.get("kind") in {"holiday", "weekend"}:
-                return "always_allow"
-            return value
-
-        self._original_cfg = original
-        self._cfg_wrapper = cfg_wrapper
-        fish._cfg = cfg_wrapper
-        return True
-
-    def _config(self, key, default=None):
-        try:
-            return self._original_cfg(key, default)
-        except Exception:
-            return default
-
     def get_wallet_policy(self, *, at=None, provider_id=None):
         fish = self.discover()
-        if fish is None:
-            return {"found": False, "enabled": False, "allowed": False,
-                    "state": "missing", "day_kind": "unknown"}
-        if self.instance is not fish or self._original_cfg is None:
-            self.install()
-        self.instance = fish
-        now = at or datetime.now().astimezone()
-        day = self.day_adapter.get_day_policy(now)
-        enabled = bool(self._config("enabled", self._config("enable", True)))
-        override = str(self._config("manual_override", "auto") or "auto")
-        timezone = str(self._config("timezone", "Asia/Shanghai") or "Asia/Shanghai")
-        try:
-            local = now.replace(tzinfo=ZoneInfo(timezone)) if now.tzinfo is None else now.astimezone(ZoneInfo(timezone))
-        except Exception:
-            local = now
-
-        affected = True
-        matcher = getattr(fish, "_provider_affected", None)
-        if callable(matcher):
-            prov = None
-            if provider_id:
-                try:
-                    prov = self.context.get_provider_by_id(provider_id)
-                except Exception:
-                    prov = None
-            affected = bool(matcher(provider_id, prov))
-
-        if not enabled:
-            allowed, state = True, "disabled"
-        elif override == "always_allow":
-            allowed, state = True, "forced_allow"
-        elif override == "always_block":
-            allowed, state = False, "forced_block"
-        elif day.get("available") and day.get("kind") in {"holiday", "weekend"}:
-            allowed, state = True, "offpeak"
-        elif affected:
-            periods, weekdays = fish._periods(), fish._weekdays()
-            peak = getattr(fish, "_is_peak", None)
-            if not callable(peak):
-                module = import_module(fish.__class__.__module__.rsplit(".", 1)[0] + ".scheduler")
-                peak = module.is_peak
-            in_peak = peak(local, periods, weekdays)
-            allowed, state = (False, "peak") if in_peak else (True, "offpeak")
-        else:
-            allowed, state = True, "offpeak"
-
-        return {"found": True, "enabled": enabled, "allowed": allowed, "state": state,
-                "day_kind": day.get("kind", "unknown"), "day_label": day.get("label", ""),
-                "timezone": timezone, "manual_override": override,
-                "provider_affected": affected, "evaluated_at": local}
-
-    @staticmethod
-    def is_effective_peak(policy):
-        """Whether the existing wallet policy actually blocks at this instant."""
-        return bool(
-            policy.get("found") and policy.get("enabled")
-            and policy.get("provider_affected")
-            and policy.get("manual_override", "auto") == "auto"
-            and policy.get("state") == "peak"
-        )
-
-    def effective_peak_periods(self, at, *, provider_id=None):
-        """Return only active periods Fat Fish evaluates as peak for this date/provider."""
-        fish = self.discover()
-        if fish is None:
-            return []
-        if self.instance is not fish or self._original_cfg is None:
-            self.install()
-        try:
-            periods = fish._periods()
-            timezone = str(self._config("timezone", "Asia/Shanghai") or "Asia/Shanghai")
+        getter = getattr(fish, "get_wallet_policy", None)
+        if callable(getter):
             try:
-                zone = ZoneInfo(timezone)
+                return {"found": True, **getter(at=at, provider_id=provider_id)}
             except Exception:
-                if timezone not in {"Asia/Shanghai", "UTC", "Etc/UTC"}:
-                    return []
-                zone = datetime_timezone(timedelta(hours=8), "Asia/Shanghai") if timezone == "Asia/Shanghai" else datetime_timezone.utc
-            local = at.replace(tzinfo=zone) if at.tzinfo is None else at.astimezone(zone)
-        except Exception:
-            return []
-        midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
-        effective = []
-        for period in periods or []:
-            try:
-                start, end = int(period.start), int(period.end)
-            except (AttributeError, TypeError, ValueError):
-                continue
-            if start < 0 or end <= start:
-                continue
-            midpoint = midnight + timedelta(seconds=(start + end) / 2)
-            if self.is_effective_peak(self.get_wallet_policy(at=midpoint, provider_id=provider_id)):
-                effective.append((period, midpoint))
-        return effective
+                pass
+        return {"found": False, "enabled": False, "allowed": False,
+                "state": "missing", "manual_override": "auto", "provider_affected": False}
 
-    def uninstall(self):
-        fish = self.instance
-        if fish is not None and fish._cfg is self._cfg_wrapper:
-            fish._cfg = self._original_cfg
+    def effective_peak_windows(self, life_day_start, life_day_end, provider_id="", calendar_days=None):
+        """Return effective configured peak intervals intersecting a life day.
+
+        TimeAwareness's adjusted-workday classification is authoritative for the
+        date type. Fat Fish's public policy supplies enabled/override/provider and
+        peak settings; the official scheduler functions apply its weekday/period rules.
+        """
+        fish = self.discover()
+        getter = getattr(fish, "get_wallet_policy", None)
+        if not callable(getter):
+            return []
+        try:
+            initial_policy = getter(at=life_day_start, provider_id=provider_id)
+        except Exception:
+            initial_policy = {}
+        timezone_name = str(initial_policy.get("timezone") or
+                            getattr(life_day_start.tzinfo, "key", None) or life_day_start.tzinfo)
+        try:
+            zone = ZoneInfo(timezone_name)
+        except Exception:
+            zone = life_day_start.tzinfo
+            timezone_name = str(zone)
+        start = life_day_start.astimezone(zone)
+        end = life_day_end.astimezone(zone)
+        kinds = {row["date"]: row.get("kind", "unknown") for row in (calendar_days or [])}
+        scheduler = import_module(fish.__class__.__module__.rsplit(".", 1)[0] + ".scheduler")
+        windows = []
+        natural_day = start.date()
+        last_day = (end - timedelta(microseconds=1)).date()
+        while natural_day <= last_day:
+            kind = kinds.get(natural_day.isoformat(), "unknown")
+            if kind not in {"workday", "adjusted", "adjusted_workday"}:
+                natural_day += timedelta(days=1)
+                continue
+            noon = datetime.combine(natural_day, time(12), tzinfo=zone)
+            try:
+                policy = getter(at=noon, provider_id=provider_id)
+            except Exception:
+                policy = {}
+            if (not policy.get("enabled")
+                    or str(policy.get("manual_override", "auto")) != "auto"
+                    or not policy.get("provider_affected")):
+                natural_day += timedelta(days=1)
+                continue
+            periods = scheduler.parse_periods(str(policy.get("peak_periods", "") or ""))
+            weekdays = scheduler.parse_weekdays(str(policy.get("peak_weekdays", "") or ""))
+            if not weekdays or natural_day.weekday() in weekdays:
+                midnight = datetime.combine(natural_day, time.min, tzinfo=zone)
+                for period in periods:
+                    peak_start = midnight + timedelta(seconds=period.start)
+                    peak_end = midnight + timedelta(seconds=period.end)
+                    peak_start = max(peak_start, start)
+                    peak_end = min(peak_end, end)
+                    if peak_start < peak_end:
+                        windows.append({"start_at": peak_start, "end_at": peak_end,
+                                        "source_peak_start": midnight + timedelta(seconds=period.start),
+                                        "source_peak_end": midnight + timedelta(seconds=period.end)})
+            natural_day += timedelta(days=1)
+        return windows
