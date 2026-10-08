@@ -14,7 +14,7 @@ from astrbot.api import logger
 from .fat_fish_bridge import FatFishBridge
 from .time_awareness_adapter import TimeAwarenessAdapter
 
-PLANNER_VERSION = "0.9.0"
+PLANNER_VERSION = "0.9.1"
 SCHEMA_VERSION = 2
 DAILY_THEME_MAX_CHARS = 60
 DAILY_STYLE_MAX_CHARS = 40
