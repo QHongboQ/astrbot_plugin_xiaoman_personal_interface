@@ -14,7 +14,7 @@ from astrbot.api import logger
 from .fat_fish_bridge import FatFishBridge
 from .time_awareness_adapter import TimeAwarenessAdapter
 
-PLANNER_VERSION = "0.8.5"
+PLANNER_VERSION = "0.8.6"
 SCHEMA_VERSION = 2
 DAILY_THEME_MAX_CHARS = 60
 DAILY_STYLE_MAX_CHARS = 40
@@ -463,7 +463,6 @@ class ScheduleBroadcastService:
             "BRIDGE 内部阶段可以写在 state。最终 timeline 按时间排序、连续无缝、无重叠，覆盖 life_day 起止。"
             "每个 NORMAL 产生 broadcast_message；每个 BRIDGE 产生 enter_message 和 exit_message。"
             "桥接活动须和前后事件一起形成因果连续的一天，不要把分段当成互不相关的活动。"
-            "先在内部安排并核对完整 timeline，再为同一份最终 timeline 选择 daily_theme 和 daily_style；主题/风格必须忠实概括实际安排，不得与任一时段矛盾，也不得把一天中的一个小阶段夸大成整天。只有时间线确实支持时才可使用‘整天’、‘半天’、‘睡到中午’、‘通宵’、‘全天宅家’等说法。"
             "林小满是课表相对宽松的艺术专业大学生；protected_window 只是结构性规划窗口，不代表上课时间或课程安排。BRIDGE 必须是该保护窗内的一个大活动，但可以是工作室创作、外出、购物、休息、睡觉、社交、娱乐、旅行或有依据的课程；上课只是选项，不得仅因小满是大学生就默认课堂/食堂/自习/宿舍是每日主轴，也不得把两个 protected_window 模板化地都安排成课。若两个保护窗都是课，应有世界观、日历、历史或其他上下文依据/自然主题关联；否则优先考虑仅一段课程、无课、工作室/项目、临时外出、恢复休息或社交休闲。近期历史若连续多天偏上课，可在上下文允许时换一种结构；不硬性禁止上课，也不为求新奇而违背强上下文。"
             "activity_pool 是小满对具体活动的加权偏好，权重只表示相对偏好，不是精确概率；现实、天气、精力、睡眠和近期重复式样优先于权重。"
             "activity_pool_allow_custom=true 时可自然安排池外活动；为 false 时，主要休闲/社交活动应来自活动池，除非世界观、日历或既有连续性要求其他安排。不得重复实现 theme_pool：主题池决定日子是什么感觉，活动池提供具体可做的事。"
@@ -480,7 +479,7 @@ class ScheduleBroadcastService:
             "state 只保留后续规划需要的信息，不写小说式叙述；播报消息仍须自然、有个性。"
             "NORMAL 顶层事件代表有意义的生活阶段，而不是每个身体动作。只有主要目的、核心活动、社交对象/情境、地点/外出阶段、精力/状态阶段或睡眠休息阶段发生有意义变化时，才通常值得另开一项。相同目的、同一外出/地点链或连续过渡中的小动作应合并到一个 NORMAL 的 name/state；例如吃饭+买咖啡、回家换衣+吃饭再出门、打车回家+洗澡+躺床刷手机通常合并。买咖啡、换衣、打车、洗脸、洗澡、看手机、走到附近另一家店通常不单独成项，除非它本身构成有意义的独立阶段。不要过度合并不同的主要活动，例如电玩城和夜市宵夜可以分别成项。"
             "事件数量是软指导而非硬指标：balanced 时约2小时以内的短 free_window 通常1个 NORMAL；约2-5小时通常1-2个；约5-10小时通常2-4个。像18:05到次日04:00这样的长晚间 free_window，balanced 通常约3-5个顶层 NORMAL。relaxed 使用更少、更长的区块；busy 可稍多。不要为了命中数量而机械拆分，不得仅因数量拒绝或改写有效安排。"
-            "daily_theme / daily_style 必须概括本次返回的最终 timeline：先确定时间线，再选主题和风格；不得与实际时间线冲突，不要把一个阶段夸大成全天。除非时间线确实支持，不要声称‘睡到中午’、‘摆烂半天’或‘通宵’；例如时间线有早晚课程，就不能称‘摆烂半天’，有早间活动不能称‘睡到中午’，晚间有外出活动时，主题应体现该安排或保持中性。"
+            "daily_theme 概括整日主线、主导活动与整体走向；daily_style 概括情绪、精力与行为气质。先确定 timeline，再写主题/风格；精确时段和持续时长以 timeline 为准，主题/风格避免依赖精确边界或时长的说法，如睡到中午/下午、玩了一整天、摆烂半天、整天宅家、全天没出门、通宵、一夜没睡、从早玩到晚。上午、下午、晚上、深夜、熬夜后、夜生活等宽泛叙事词仍可自然使用。"
             f"每条消息不得超过 {self._int('max_message_chars', 80, 1)} 个字符。"
         )
         extra = str(self._get("planner_prompt", "") or "").strip()

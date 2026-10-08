@@ -404,11 +404,29 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不要因为晚睡就推断必须晚起", prompt)
         self.assertIn("不要因为上一生命日曾在睡觉就强制新生命日继续睡", prompt)
 
-    async def test_planner_prompt_themes_must_match_the_returned_timeline(self):
+    async def test_planner_prompt_theme_and_style_have_distinct_broad_semantics(self):
         prompt = self.service._planner_prompt(await self._input())
-        self.assertIn("先在内部安排并核对完整 timeline，再为同一份最终 timeline 选择 daily_theme 和 daily_style", prompt)
-        self.assertIn("主题/风格必须忠实概括实际安排", prompt)
-        self.assertIn("只有时间线确实支持时才可使用‘整天’、‘半天’、‘睡到中午’、‘通宵’、‘全天宅家’", prompt)
+        self.assertIn("daily_theme 概括整日主线、主导活动与整体走向", prompt)
+        self.assertIn("daily_style 概括情绪、精力与行为气质", prompt)
+        self.assertIn("精确时段和持续时长以 timeline 为准", prompt)
+        for brittle_claim in ("睡到中午/下午", "玩了一整天", "摆烂半天", "整天宅家",
+                              "全天没出门", "通宵", "一夜没睡", "从早玩到晚"):
+            self.assertIn(brittle_claim, prompt)
+        self.assertIn("上午、下午、晚上、深夜、熬夜后、夜生活等宽泛叙事词仍可自然使用", prompt)
+        self.assertIn("NORMAL 顶层事件代表有意义的生活阶段", prompt)
+        self.assertIn("保护窗不是课程表", prompt)
+        self.assertIn("不要计算或补偿前一日睡眠时长", prompt)
+
+    async def test_generated_theme_and_style_are_not_semantically_rewritten(self):
+        response = valid_response_for(await self._input())
+        response["daily_theme"] = "睡到中午的画画日"
+        response["daily_style"] = "低能量但随性"
+        self.context.output_factory = lambda prompt: response
+        result = await self.service.generate_life_day(self.start)
+        self.assertEqual(result["status"], "generated")
+        plan = self.service.current_plan(self.start)
+        self.assertEqual(plan["daily_theme"], response["daily_theme"])
+        self.assertEqual(plan["daily_style"], response["daily_style"])
 
     async def test_planner_prompt_groups_minor_support_actions_into_meaningful_phases(self):
         prompt = self.service._planner_prompt(await self._input())
