@@ -12,7 +12,9 @@ from unittest.mock import patch
 
 from test_photo_tool import MAIN_MODULE
 from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.fat_fish_bridge import FatFishBridge
-from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.schedule_broadcast import ScheduleBroadcastService
+from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.schedule_broadcast import (
+    PLANNER_VERSION, ScheduleBroadcastService,
+)
 from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.time_awareness_adapter import TimeAwarenessAdapter
 
 TZ = timezone(timedelta(hours=8), "Asia/Shanghai")
@@ -390,7 +392,7 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         result = await self.service.generate_life_day(self.start)
         self.assertEqual(result["status"], "generated")
         self.assertEqual(len(self.context.llm_calls), 1)
-        self.assertEqual(result["plan"]["planner_version"], "0.9.0")
+        self.assertEqual(result["plan"]["planner_version"], "0.9.1")
         self.assertEqual(result["plan"]["schema_version"], 2)
         for row in result["plan"]["timeline"]:
             self.assertTrue({"id", "kind", "category", "start_at", "end_at", "name", "state"}.issubset(row))
@@ -1259,6 +1261,14 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AdapterAndBridgeTests(unittest.TestCase):
+    def test_planner_version_matches_plugin_metadata(self):
+        metadata_version = next(
+            line.partition(":")[2].strip()
+            for line in (ROOT / "metadata.yaml").read_text(encoding="utf-8").splitlines()
+            if line.startswith("version:")
+        )
+        self.assertEqual(PLANNER_VERSION, metadata_version)
+
     def test_xiaoman_gear_schema_exposes_owned_settings_and_defaults(self):
         schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
         items = schema["schedule_broadcast"]["items"]
