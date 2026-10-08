@@ -371,6 +371,11 @@ class ScheduleBroadcastService:
             names = [row.get("name", "") for row in timeline if row.get("name")]
             categorized = [(row, self._history_category(row, legacy=legacy_categories))
                            for row in timeline]
+            bridge_activities = [
+                {"category": self._history_category(row, legacy=legacy_categories),
+                 "name": row.get("name", ""), "start_at": row.get("start_at"),
+                 "end_at": row.get("end_at")}
+                for row in timeline if row.get("kind") == "BRIDGE"]
             tail = [{"category": category, "name": row.get("name", ""),
                      "start_at": row.get("start_at"), "end_at": row.get("end_at"),
                      "state": row.get("state", "")}
@@ -388,6 +393,7 @@ class ScheduleBroadcastService:
                               "daily_theme": plan.get("daily_theme", ""),
                               "daily_style": plan.get("daily_style", ""),
                               "major_activities": names,
+                              "bridge_activities": bridge_activities,
                               "categories_used": sorted({category for _row, category in categorized}),
                               "previous_tail": tail,
                               "previous_final_category": final_category,
@@ -473,7 +479,7 @@ class ScheduleBroadcastService:
             "只根据 continuity 和 recent_life_days 中明确提供的历史延续。若无可用历史，必须视为没有已知的前夜/前几日事件；不得编造‘昨晚通宵赶作业’等事实，只生成合理的起始状态。用其中的 daily_theme/style、major_activities、categories_used、previous_tail、late_night_behavior、previous_final_events 记得昨天，但不要重演昨天。"
             "跨日规划优先级是硬结构/日历/天气/强上下文 > 连续性 > 多样性 > activity_pool 权重。最近生命日的主要休闲/社交活动进入软冷却：如 KTV、密室、夜市、电玩城、购物、Livehouse、酒吧、电影、海边或短途出游；近期重复应降低高权重活动的相对倾向，但不是禁令。只有明确持续的计划/活动、同一趟旅行或假期、强叙事连续性或上下文强烈暗示时才自然重复。"
             "优先改变整日形状和活动链，而不只是把昨天的场所换个名字。避免连续复刻‘娱乐地点→夜市/宵夜→KTV→打车回家→刷手机→睡觉’；例如昨天‘密室→夜市→KTV’，今天即使改成‘电玩城→夜市→KTV’仍是重复。可改成工作室/项目→晚餐→回家游戏/早休、逛店→电影→晚餐、朋友家做饭/游戏、户外活动→咖啡/回家、宅家游戏/视频或只安排一个夜间主要活动。近期反复呈现同一日型时，合理地换成恢复日、项目日、外出日、居家日、社交日、夜生活日或随性混合日；不追求每天最大新奇。昨天的活动可作为聊天回忆，但不要因此重演整条活动链。"
-            "若最近一天两个 protected_window 都主要是上课/课程/工作室学业，今天在上下文允许时应考虑不同 BRIDGE 结构，如无课/一节课、个人项目创作、购物外出、休息恢复、社交、办事、旅行或娱乐；课程在日历、世界观或强上下文支持时仍完全允许。目标是打破默认重复，不是编造变化。"
+            "规划保护窗的跨日变化时，比较 recent_life_days[].bridge_activities 中的 category、name 和时间段；若最近一天两个 protected_window 都主要是上课/课程/工作室学业，今天在上下文允许时应考虑不同 BRIDGE 结构，如无课/一节课、个人项目创作、购物外出、休息恢复、社交、办事、旅行或娱乐；课程在日历、世界观或强上下文支持时仍完全允许。目标是打破默认重复，不是编造变化。"
             "优先遵循 worldview、theme_pool、style_pool、天气和真实日历。不要每天塞满高强度活动。人物、地点、天气影响、消费和结果不得无依据编造。"
             "只输出紧凑 JSON，不要 Markdown、代码围栏、解释或 JSON 前后的文字，尽量避免无意义空白和冗长叙述。字段：daily_theme,daily_style,timeline。daily_theme 不超过60字符，daily_style 不超过40字符。时间为带时区 ISO 8601。"
             "timeline 每项都必须包含 category，且只能是 sleep,rest,meal,travel,school,creative,social,entertainment,outdoor,shopping,errand,mixed,other 之一。"

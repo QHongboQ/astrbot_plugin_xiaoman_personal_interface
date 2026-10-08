@@ -371,6 +371,53 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(forbidden.intersection(data))
         self.assertFalse(forbidden.intersection(data["continuity"]))
 
+    async def test_history_bridge_activities_include_bridges_in_timeline_order(self):
+        previous_start = self.start - timedelta(days=1)
+        self.service._plans()[previous_start.isoformat()] = {
+            "status": "complete", "planner_version": "0.8.6",
+            "life_day_start": previous_start.isoformat(), "life_day_end": self.start.isoformat(),
+            "timeline": [
+                {"kind": "NORMAL", "category": "sleep", "name": "睡觉",
+                 "start_at": "2026-10-08T04:00:00+08:00", "end_at": "2026-10-08T08:55:00+08:00"},
+                {"kind": "BRIDGE", "category": "school", "name": "上午课程",
+                 "start_at": "2026-10-08T08:55:00+08:00", "end_at": "2026-10-08T12:05:00+08:00"},
+                {"kind": "NORMAL", "category": "meal", "name": "午饭",
+                 "start_at": "2026-10-08T12:05:00+08:00", "end_at": "2026-10-08T13:55:00+08:00"},
+                {"kind": "BRIDGE", "category": "creative", "name": "工作室创作",
+                 "start_at": "2026-10-08T13:55:00+08:00", "end_at": "2026-10-08T18:05:00+08:00"},
+            ],
+        }
+        history = self.service._history(self.start, 5, True)
+        self.assertEqual(history[0]["bridge_activities"], [
+            {"category": "school", "name": "上午课程",
+             "start_at": "2026-10-08T08:55:00+08:00", "end_at": "2026-10-08T12:05:00+08:00"},
+            {"category": "creative", "name": "工作室创作",
+             "start_at": "2026-10-08T13:55:00+08:00", "end_at": "2026-10-08T18:05:00+08:00"},
+        ])
+
+    async def test_history_bridge_activities_exclude_normal_rows(self):
+        previous_start = self.start - timedelta(days=1)
+        self.service._plans()[previous_start.isoformat()] = {
+            "status": "complete", "planner_version": "0.8.6",
+            "life_day_start": previous_start.isoformat(), "life_day_end": self.start.isoformat(),
+            "timeline": [{"kind": "NORMAL", "category": "school", "name": "自习"}],
+        }
+        history = self.service._history(self.start, 5, True)
+        self.assertEqual(history[0]["bridge_activities"], [])
+
+    async def test_legacy_categoryless_bridge_history_uses_compatibility_path(self):
+        previous_start = self.start - timedelta(days=1)
+        self.service._plans()[previous_start.isoformat()] = {
+            "status": "complete", "planner_version": "0.8.1",
+            "life_day_start": previous_start.isoformat(), "life_day_end": self.start.isoformat(),
+            "timeline": [{"kind": "BRIDGE", "name": "个人创作",
+                          "start_at": "2026-10-08T08:55:00+08:00",
+                          "end_at": "2026-10-08T12:05:00+08:00"}],
+        }
+        history = self.service._history(self.start, 5, True)
+        self.assertEqual(history[0]["bridge_activities"][0]["category"], "other")
+        self.assertEqual(history[0]["bridge_activities"][0]["name"], "个人创作")
+
     async def test_sleep_history_does_not_change_exact_protected_window(self):
         previous_start = self.start - timedelta(days=1)
         self.service._plans()[previous_start.isoformat()] = {
@@ -426,6 +473,7 @@ class LifeDayPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("昨天‘密室→夜市→KTV’，今天即使改成‘电玩城→夜市→KTV’仍是重复", prompt)
         self.assertIn("近期反复呈现同一日型时，合理地换成恢复日、项目日、外出日、居家日、社交日、夜生活日或随性混合日", prompt)
         self.assertIn("两个 protected_window 都主要是上课/课程/工作室学业", prompt)
+        self.assertIn("recent_life_days[].bridge_activities", prompt)
         self.assertIn("课程在日历、世界观或强上下文支持时仍完全允许", prompt)
         self.assertIn("近期重复应降低高权重活动的相对倾向，但不是禁令", prompt)
         self.assertIn("记得昨天，但不要重演昨天", prompt)
