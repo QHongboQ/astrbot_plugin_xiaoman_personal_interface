@@ -1,12 +1,11 @@
-"""Date-scoped proactive messages derived from existing TimeAwareness snapshots."""
+"""Xiaoman-owned rolling life-day planner and deterministic message executor."""
 from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
 import json
 import re
-from datetime import date, datetime, time, timedelta, timezone as datetime_timezone
+from datetime import datetime, timedelta, time, timezone as datetime_timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -15,41 +14,54 @@ from astrbot.api import logger
 from .fat_fish_bridge import FatFishBridge
 from .time_awareness_adapter import TimeAwarenessAdapter
 
-DEFAULT_PROMPT = (
-    "请按每个日程生成一句自然的第一人称聊天消息，只输出 JSON。"
-    "忠于事项，不编造地点或同伴，不提日程、系统、AI。"
-)
+PLANNER_VERSION = "0.8.0"
+SCHEMA_VERSION = 2
 
 
 def _zone(name):
-    """Resolve IANA zones, with fixed-offset fallbacks for Windows test hosts."""
     try:
         return ZoneInfo(str(name))
     except Exception:
-        fixed = {
-            "UTC": datetime_timezone.utc,
-            "Etc/UTC": datetime_timezone.utc,
-            "Asia/Shanghai": datetime_timezone(timedelta(hours=8), "Asia/Shanghai"),
-        }
-        if str(name) in fixed:
-            return fixed[str(name)]
+        fixed_name = str(name).removeprefix("UTC")
+        if re.fullmatch(r"[+-]\d{2}:\d{2}", fixed_name):
+            sign = 1 if fixed_name[0] == "+" else -1
+            hours, minutes = map(int, fixed_name[1:].split(":"))
+            return datetime_timezone(sign * timedelta(hours=hours, minutes=minutes))
+        if str(name) in {"UTC", "Etc/UTC"}:
+            return datetime_timezone.utc
+        if str(name) == "Asia/Shanghai":
+            return datetime_timezone(timedelta(hours=8), "Asia/Shanghai")
         raise
 
 
+def _absolute(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        result = datetime.fromisoformat(value)
+        return result if result.tzinfo else None
+    except ValueError:
+        return None
+
+
 class ScheduleBroadcastService:
-    def __init__(self, context, config, data_dir, *, time_awareness=None, fat_fish=None,
-                 rolling_day_bridge=None):
+    """Own one complete life-day timeline; send only its persisted messages."""
+
+    def __init__(self, context, config, data_dir, *, time_awareness=None, fat_fish=None):
         self.context = context
         self.config = config or {}
         self.cfg = self.config.get("schedule_broadcast", {}) or {}
-        self.path = Path(data_dir) / "schedule_broadcast_state.json"
-        self.state = {"plans": {}}
+        self.path = Path(data_dir) / "life_day_plans.json"
+        self.legacy_path = Path(data_dir) / "schedule_broadcast_state.json"
+        self.state = {"schema_version": SCHEMA_VERSION, "plans": {}, "generation_attempts": {}}
         self.day_adapter = time_awareness or TimeAwarenessAdapter(context)
         self.fat_fish = fat_fish or FatFishBridge(context, self.day_adapter)
-        self.rolling_day_bridge = rolling_day_bridge
-        self._task = None
-        self.last_schedules = {}
         self.last_error = ""
+        self._task = None
+        self._generation_lock = asyncio.Lock()
+        self._target_delivery = {}
         self._load()
 
     def _get(self, key, default=None):
@@ -58,15 +70,23 @@ class ScheduleBroadcastService:
     def _load(self):
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and isinstance(data.get("plans"), dict):
+            if (isinstance(data, dict) and data.get("schema_version") == SCHEMA_VERSION
+                    and isinstance(data.get("plans"), dict)):
                 self.state = data
-            elif isinstance(data, dict) and isinstance(data.get("entries"), list):
-                # Preserve legacy state for inspection; its date cannot be inferred safely.
-                self.state = {"plans": {}, "legacy_state": data}
+                self.state.setdefault("generation_attempts", {})
+                failed = [row for row in self.state["generation_attempts"].values()
+                          if isinstance(row, dict) and row.get("status") == "failed"]
+                if failed:
+                    failed.sort(key=lambda row: row.get("at", ""), reverse=True)
+                    self.last_error = str(failed[0].get("error", ""))
+                return
         except FileNotFoundError:
             pass
         except Exception:
-            logger.warning("Schedule broadcast state load failed", exc_info=True)
+            logger.warning("Life-day plan store load failed", exc_info=True)
+        # Never interpret 0.7.x natural-date plans as v0.8 life-day plans.
+        if self.legacy_path.exists():
+            self.state["legacy_state_path"] = str(self.legacy_path)
 
     def _save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -75,12 +95,7 @@ class ScheduleBroadcastService:
         tmp.replace(self.path)
 
     def _now(self, value=None):
-        now = value
-        if now is None:
-            current = getattr(self.day_adapter, "current_time", None)
-            now = current() if callable(current) else datetime.now().astimezone()
-        if not isinstance(now, datetime):
-            now = datetime.now().astimezone()
+        now = value or self.day_adapter.current_time()
         return now if now.tzinfo else now.astimezone()
 
     def _plans(self):
@@ -89,14 +104,26 @@ class ScheduleBroadcastService:
             self.state["plans"] = {}
         return self.state["plans"]
 
+    @staticmethod
+    def _plan_key(start_at):
+        return start_at.isoformat()
+
+    def life_day(self, at=None):
+        return self.day_adapter.life_day_window(self._now(at))
+
+    def next_life_day(self, at=None):
+        current = self.life_day(at)
+        start = current["end"]
+        return {**current, "start": start, "end": start + timedelta(days=1)}
+
     async def targets(self):
         try:
             rows = self.context.conversation_manager.get_conversations()
             rows = await rows
         except Exception:
             return []
-        allow = set(self._get("allowlist_umos", []))
-        deny = set(self._get("denylist_umos", []))
+        allow = set(self._get("allowlist_umos", []) or [])
+        deny = set(self._get("denylist_umos", []) or [])
         candidates = []
         for row in rows:
             umo = getattr(row, "user_id", None)
@@ -109,45 +136,39 @@ class ScheduleBroadcastService:
             if message_type == "FriendMessage" and not self._get("send_private", True):
                 continue
             platform_id = str(getattr(row, "platform_id", "") or platform_name)
-            is_qq_group = message_type == "GroupMessage" and self._is_aiocqhttp(platform_id)
-            group_id = self._qq_group_id(session_id) if is_qq_group else None
+            group_id = (self._qq_group_id(session_id)
+                        if message_type == "GroupMessage" and self._is_aiocqhttp(platform_id) else None)
             identity = ("qq-group", platform_id, group_id) if group_id else ("umo", umo)
             candidates.append({"umo": umo, "identity": identity, "group_id": group_id,
                                "platform_name": platform_name})
 
-        # Resolve list entries against all aliases before deduplication. A deny on
-        # any alias suppresses the physical QQ group, even if another alias is allowed.
-        def configured_matches(candidate, values):
+        def matches(candidate, values):
             if candidate["umo"] in values:
                 return True
-            if candidate["group_id"] is None:
-                return False
-            return any(
-                self._configured_group_id(value, candidate["platform_name"]) == candidate["group_id"]
-                for value in values
-            )
+            group_id = candidate["group_id"]
+            return bool(group_id and any(
+                self._configured_group_id(value, candidate["platform_name"]) == group_id
+                for value in values))
 
-        grouped = {}
-        qq_instances = {}
+        grouped, qq_instances = {}, {}
         for candidate in candidates:
             grouped.setdefault(candidate["identity"], []).append(candidate)
-            if candidate["group_id"] is not None:
-                signature = (candidate["platform_name"], candidate["group_id"])
-                qq_instances.setdefault(signature, set()).add(candidate["identity"][1])
-        selected = []
-        self._target_delivery = {}
+            if candidate["group_id"]:
+                sig = (candidate["platform_name"], candidate["group_id"])
+                qq_instances.setdefault(sig, set()).add(candidate["identity"][1])
+        selected, self._target_delivery = [], {}
         for identity, aliases in grouped.items():
-            if any(configured_matches(alias, deny) for alias in aliases):
+            if any(matches(alias, deny) for alias in aliases):
                 continue
-            if allow and not any(configured_matches(alias, allow) for alias in aliases):
+            if allow and not any(matches(alias, allow) for alias in aliases):
                 continue
             target = min(aliases, key=lambda item: item["umo"])
             signature = (target["platform_name"], target["group_id"])
             selected.append((target["umo"], identity, {
                 "key": self._delivery_key(identity),
                 "aliases": {alias["umo"] for alias in aliases},
-                "legacy_group_signature": signature if target["group_id"] is not None else None,
-                "legacy_group_unambiguous": target["group_id"] is not None and len(qq_instances[signature]) == 1,
+                "legacy_group_signature": signature if target["group_id"] else None,
+                "legacy_group_unambiguous": bool(target["group_id"] and len(qq_instances[signature]) == 1),
             }))
         selected.sort(key=lambda item: (item[0], item[1]))
         targets = []
@@ -178,10 +199,8 @@ class ScheduleBroadcastService:
 
     @staticmethod
     def _qq_group_id(session_id):
-        # AstrBot's aiocqhttp adapter uses sender_group for unique sessions and
-        # sends to the final underscore-delimited component.
-        group_id = str(session_id).rsplit("_", 1)[-1]
-        return group_id if re.fullmatch(r"\d+", group_id) else None
+        value = str(session_id).rsplit("_", 1)[-1]
+        return value if re.fullmatch(r"\d+", value) else None
 
     @classmethod
     def _configured_group_id(cls, umo, platform_name):
@@ -192,9 +211,7 @@ class ScheduleBroadcastService:
 
     @staticmethod
     def _delivery_key(identity):
-        if identity[0] == "qq-group":
-            return f"physical-qq-group:{identity[1]}:{identity[2]}"
-        return identity[1]
+        return f"physical-qq-group:{identity[1]}:{identity[2]}" if identity[0] == "qq-group" else identity[1]
 
     @classmethod
     def _was_delivered(cls, delivered, umo, target_state):
@@ -205,734 +222,499 @@ class ScheduleBroadcastService:
         signature = target_state.get("legacy_group_signature")
         if not signature or not target_state.get("legacy_group_unambiguous"):
             return False
-        platform_name, group_id = signature
-        return any(cls._configured_group_id(old_umo, platform_name) == group_id for old_umo in delivered)
-
-    async def read_schedule(self, targets, *, at=None):
-        session = self.schedule_source_session(targets)
-        if not session:
-            return None
-        return await self.day_adapter.get_daily_schedule(session, at=at, allow_generate=False)
-
-    def schedule_source_session(self, targets):
-        """Resolve the shared TimeAwareness Persona source, not the invoking admin chat."""
-        configured = str(self._get("schedule_source_umo", "") or "").strip()
-        return configured or (targets[0] if targets else "")
-
-    async def regeneration_source_session(self, admin_umo=None):
-        # Deliberately ignore admin_umo: raw/read_schedule uses the configured source
-        # or first eligible target, so regeneration must target that same Persona.
-        return self.schedule_source_session(await self.targets())
+        return any(cls._configured_group_id(old, signature[0]) == signature[1] for old in delivered)
 
     async def _provider(self, targets):
         provider = str(self._get("provider_id", "") or "")
         if provider or not targets:
             return provider
         try:
-            return await self.context.get_current_chat_provider_id(targets[0])
+            return str(await self.context.get_current_chat_provider_id(umo=targets[0]) or "")
         except Exception:
-            return None
+            return ""
 
-    def _date_at(self, local_now, target_date):
-        return local_now.replace(
-            year=target_date.year, month=target_date.month, day=target_date.day
-        )
-
-    async def _read_date(self, target_date, targets, now):
-        schedule = await self.read_schedule(targets, at=self._date_at(now, target_date))
-        if schedule is not None:
-            self.last_schedules[target_date.isoformat()] = schedule
-        else:
-            self.last_schedules.pop(target_date.isoformat(), None)
-        return schedule
+    def _calendar_days(self, planner_context):
+        return planner_context.get("calendar_days", []) if isinstance(planner_context, dict) else []
 
     @staticmethod
-    def _clock(value):
-        text = str(value or "").strip()
-        if text == "24:00":
-            return time(0, 0), True
-        try:
-            return time.fromisoformat(text), False
-        except (ValueError, TypeError):
-            return None, False
+    def _merge_protected(windows, life_start, life_end, before, after):
+        expanded = []
+        for source in windows:
+            start = max(source["start_at"] - timedelta(minutes=before), life_start)
+            end = min(source["end_at"] + timedelta(minutes=after), life_end)
+            if start < end:
+                expanded.append({"start_at": start, "end_at": end,
+                                 "source_peak_start": source["source_peak_start"],
+                                 "source_peak_end": source["source_peak_end"]})
+        expanded.sort(key=lambda item: item["start_at"])
+        merged = []
+        for window in expanded:
+            if merged and window["start_at"] <= merged[-1]["end_at"]:
+                merged[-1]["end_at"] = max(merged[-1]["end_at"], window["end_at"])
+                merged[-1]["source_peak_start"] = min(merged[-1]["source_peak_start"], window["source_peak_start"])
+                merged[-1]["source_peak_end"] = max(merged[-1]["source_peak_end"], window["source_peak_end"])
+            else:
+                merged.append(dict(window))
+        for index, item in enumerate(merged, 1):
+            item["id"] = f"P{index:02d}"
+            for key in ("start_at", "end_at", "source_peak_start", "source_peak_end"):
+                item[key] = item[key].isoformat()
+        return merged
 
     @staticmethod
-    def _parse_absolute(value, timezone):
-        try:
-            result = datetime.fromisoformat(str(value))
-            return result if result.tzinfo else result.replace(tzinfo=_zone(timezone))
-        except (TypeError, ValueError, KeyError):
-            return None
+    def _free_complement(life_start, life_end, protected):
+        free, cursor = [], life_start
+        for index, item in enumerate(protected, 1):
+            start, end = _absolute(item["start_at"]), _absolute(item["end_at"])
+            if cursor < start:
+                free.append({"id": f"F{len(free)+1:02d}", "start_at": cursor.isoformat(), "end_at": start.isoformat()})
+            cursor = max(cursor, end)
+        if cursor < life_end:
+            free.append({"id": f"F{len(free)+1:02d}", "start_at": cursor.isoformat(), "end_at": life_end.isoformat()})
+        return free
 
-    @staticmethod
-    def _stable_jitter(local_date, period, snapshot_id):
-        seed = f"{local_date}|{period}|{snapshot_id}".encode("utf-8")
-        digest = hashlib.sha256(seed).digest()
-        return 1 + digest[0] % 5, digest[1] % 6
-
-    @staticmethod
-    def _is_peak_state(policy):
-        return FatFishBridge.is_effective_peak(policy)
-
-    def _peak_windows(self, local_date, timezone, day_kind, provider_id):
-        if day_kind not in {"workday", "adjusted"}:
+    def _history(self, life_start, recent_days, enabled):
+        if not enabled or recent_days <= 0:
             return []
-        fish = self.fat_fish.discover()
-        if fish is None:
-            return []
-        try:
-            periods = fish._periods()
-        except Exception:
-            return []
-        windows = []
-        for index, period in enumerate(periods or [], 1):
+        completed = []
+        for plan in self._plans().values():
+            end = _absolute(plan.get("life_day_end", ""))
+            if plan.get("status") != "complete" or not end or end > life_start:
+                continue
+            timeline = plan.get("timeline", [])
+            names = [row.get("name", "") for row in timeline if row.get("name")]
+            sleep = [row for row in timeline if any(word in str(row.get("name", "")).lower()
+                                                     for word in ("sleep", "睡", "补觉", "赖床"))]
+            late_night = []
+            for row in timeline:
+                name = str(row.get("name", ""))
+                starts = _absolute(row.get("start_at", ""))
+                if (starts and (starts.hour >= 22 or starts.hour < 4)) or any(
+                        word in name.lower() for word in ("night", "夜", "凌晨", "宵夜")):
+                    late_night.append(name)
+            completed.append({"life_day_start": plan.get("life_day_start"),
+                              "daily_theme": plan.get("daily_theme", ""),
+                              "daily_style": plan.get("daily_style", ""),
+                              "major_activities": names,
+                              "sleep_period": [{"start_at": row.get("start_at"), "end_at": row.get("end_at")}
+                                               for row in sleep],
+                              "late_night_behavior": late_night,
+                              "previous_final_events": names[-3:]})
+        completed.sort(key=lambda row: row.get("life_day_start", ""), reverse=True)
+        return completed[:recent_days]
+
+    async def planner_input(self, start_at, provider_id=""):
+        end_at = start_at + timedelta(days=1)
+        planner_context = await self.day_adapter.planner_context(start_at, end_at)
+        boundary = self.day_adapter.get_generation_boundary()
+        window = self.day_adapter.life_day_window(start_at)
+        timezone_name = (window.get("timezone") or getattr(start_at.tzinfo, "key", None)
+                         or str(start_at.tzinfo))
+        days = self._calendar_days(planner_context)
+        source_peaks = self.fat_fish.effective_peak_windows(
+            start_at, end_at, provider_id, days)
+        protected = self._merge_protected(
+            source_peaks, start_at, end_at,
+            max(0, int(self._get("peak_guard_before_minutes", 5))),
+            max(0, int(self._get("peak_guard_after_minutes", 5))))
+        free = self._free_complement(start_at, end_at, protected)
+        adaptive = planner_context.get("adaptive", {})
+        history = self._history(start_at, int(adaptive.get("recent_days") or 0),
+                                bool(adaptive.get("state_continuity_enabled", True)))
+        persona = ""
+        if planner_context.get("use_persona", True):
             try:
-                seconds_start = int(period.start)
-                seconds_end = int(period.end)
-            except (AttributeError, TypeError, ValueError):
-                continue
-            if seconds_start < 0 or seconds_end <= seconds_start:
-                continue
-            zone = _zone(timezone)
-            midnight = datetime.combine(local_date, time.min, tzinfo=zone)
-            peak_start = midnight + timedelta(seconds=seconds_start)
-            peak_end = midnight + timedelta(seconds=seconds_end)
-            midpoint = peak_start + (peak_end - peak_start) / 2
-            policy = self.fat_fish.get_wallet_policy(at=midpoint, provider_id=provider_id)
-            if not self._is_peak_state(policy):
-                continue
-            start_jitter, end_jitter = self._stable_jitter(
-                local_date.isoformat(), f"{seconds_start}-{seconds_end}",
-                str(getattr(self, "_building_snapshot_id", "")),
-            )
-            windows.append({
-                "index": index,
-                "peak_start": peak_start,
-                "peak_end": peak_end,
-                "cover_start": peak_start - timedelta(minutes=start_jitter),
-                "cover_end": peak_end + timedelta(minutes=end_jitter),
-                "start_jitter_minutes": start_jitter,
-                "end_jitter_minutes": end_jitter,
-            })
-        return windows
+                value = await self.context.persona_manager.get_default_persona_v3()
+                persona = str(value.get("prompt", "") or "") if isinstance(value, dict) else str(getattr(value, "prompt", "") or "")
+            except Exception:
+                persona = ""
+        return {
+            "life_day": {"start_at": start_at.isoformat(), "end_at": end_at.isoformat(),
+                         "boundary_clock": boundary["clock"]},
+            "timezone": str(timezone_name),
+            "calendar_days": days,
+            "free_windows": free,
+            "protected_windows": protected,
+            "worldview": planner_context.get("worldview", ""),
+            "persona": persona,
+            "theme_pool": planner_context.get("theme_pool", []),
+            "style_pool": planner_context.get("style_pool", []),
+            "allow_custom_theme": planner_context.get("allow_custom_theme", True),
+            "weather": planner_context.get("weather", []),
+            "recent_life_days": history,
+        }
+
+    def _planner_prompt(self, planner_input):
+        guidance = (
+            "你是林小满的生活日规划器。规划的是完整 life_day，不是自然日；一次性从头安排到尾。"
+            "NORMAL 事件只能位于一个 free_window 内，且全部 NORMAL 须首尾相接完整填满每个 free_window。"
+            "每个 protected_window 恰好一个 BRIDGE，start_at/end_at 必须精确照抄保护窗边界，不能拆分顶层事件。"
+            "BRIDGE 内部阶段可以写在 state。最终 timeline 按时间排序、连续无缝、无重叠，覆盖 life_day 起止。"
+            "每个 NORMAL 产生 broadcast_message；每个 BRIDGE 产生 enter_message 和 exit_message。"
+            "桥接活动须和前后事件一起形成因果连续的一天，不要把分段当成互不相关的活动。"
+            "林小满是课表相对宽松的艺术专业大学生；上课只是可能选项，不得默认课堂/食堂/自习/宿舍是每日主轴，也允许整天不上课。"
+            "优先遵循给定 worldview、theme_pool、style_pool 与近期 Xiaoman 历史；主动避免重复近期主题和咖啡/奶茶/设计展/文创店/拍照的安全循环。"
+            "夜生活、晚电影、夜市、聚会、短途活动、宅家和恢复日都可按天气、精力、睡眠、交通与连续性合理选择；24:00 不是默认睡觉时间。"
+            "列出的活动示例只是灵感，不是清单；不要每天塞满高强度活动。人物、地点、天气影响和结果不得无依据编造。"
+            "只输出 JSON，不要 Markdown。字段：daily_theme,daily_style,timeline。时间为带时区 ISO 8601。"
+            "NORMAL 项字段：id,kind=NORMAL,start_at,end_at,name,state,broadcast_message。"
+            "BRIDGE 项字段：id,kind=BRIDGE,start_at,end_at,name,state,source_peak_start,source_peak_end,enter_message,exit_message；source_peak_* 原样照抄对应窗口。"
+            f"每条消息不得超过 {int(self._get('max_message_chars', 80))} 个字符。"
+        )
+        extra = str(self._get("planner_prompt", "") or "").strip()
+        return guidance + (f"\n补充规划要求：{extra}" if extra else "") + "\nPLANNER_INPUT:\n" + json.dumps(planner_input, ensure_ascii=False, default=str)
+
+    def validate_timeline(self, planner_input, timeline):
+        if not isinstance(timeline, list) or not timeline:
+            return False, "timeline missing"
+        life = planner_input["life_day"]
+        start, end = _absolute(life["start_at"]), _absolute(life["end_at"])
+        protected, free = planner_input["protected_windows"], planner_input["free_windows"]
+        ids, parsed, max_chars = set(), [], max(1, int(self._get("max_message_chars", 80)))
+        for row in timeline:
+            if not isinstance(row, dict) or row.get("kind") not in {"NORMAL", "BRIDGE"}:
+                return False, "unknown timeline entry"
+            ident = str(row.get("id", ""))
+            a, b = _absolute(row.get("start_at")), _absolute(row.get("end_at"))
+            if not ident or ident in ids or not a or not b or a >= b:
+                return False, "invalid timeline id or interval"
+            ids.add(ident)
+            if not str(row.get("name", "")).strip():
+                return False, f"{ident} missing name"
+            if not isinstance(row.get("state"), str):
+                return False, f"{ident} missing state"
+            if row["kind"] == "NORMAL":
+                messages = [row.get("broadcast_message")]
+            else:
+                messages = [row.get("enter_message"), row.get("exit_message")]
+            if any(not isinstance(message, str) or not message.strip() or len(message) > max_chars
+                   for message in messages):
+                return False, f"{ident} missing or oversized broadcast message"
+            parsed.append((a, b, row))
+        if parsed != sorted(parsed, key=lambda item: item[0]):
+            return False, "timeline is not sorted"
+        if parsed[0][0] != start or parsed[-1][1] != end:
+            return False, "timeline does not cover life-day boundaries"
+        for previous, current in zip(parsed, parsed[1:]):
+            if previous[1] != current[0]:
+                return False, "timeline has gap or overlap"
+        for a, b, row in parsed:
+            if row["kind"] == "NORMAL":
+                if not any(a >= _absolute(window["start_at"]) and b <= _absolute(window["end_at"])
+                           for window in free):
+                    return False, f"{row['id']} NORMAL crosses a protected window"
+            else:
+                matching = [window for window in protected
+                            if a == _absolute(window["start_at"]) and b == _absolute(window["end_at"])]
+                if len(matching) != 1:
+                    return False, f"{row['id']} BRIDGE does not exactly match one protected window"
+                source = matching[0]
+                if row.get("source_peak_start") != source.get("source_peak_start") or row.get("source_peak_end") != source.get("source_peak_end"):
+                    return False, f"{row['id']} source peak boundaries mismatch"
+        bridges = [row for _a, _b, row in parsed if row["kind"] == "BRIDGE"]
+        if len(bridges) != len(protected):
+            return False, "each protected window must have exactly one BRIDGE"
+        for window in free:
+            a, b = _absolute(window["start_at"]), _absolute(window["end_at"])
+            rows = [(x, y, row) for x, y, row in parsed if row["kind"] == "NORMAL" and x >= a and y <= b]
+            if not rows or rows[0][0] != a or rows[-1][1] != b:
+                return False, f"free window {window['id']} not fully filled"
+            if any(left[1] != right[0] for left, right in zip(rows, rows[1:])):
+                return False, f"free window {window['id']} has gap or overlap"
+        return True, ""
 
     @staticmethod
-    def _overlaps_cover(slot, local_date, timezone, windows):
-        start, start_next_day = ScheduleBroadcastService._clock(slot.get("start"))
-        end, end_next_day = ScheduleBroadcastService._clock(slot.get("end"))
-        if start is None:
-            return False
-        zone = _zone(timezone)
-        event_start = datetime.combine(local_date + timedelta(days=int(start_next_day)), start, tzinfo=zone)
-        if end is None:
-            event_end = event_start
-        else:
-            event_end = datetime.combine(local_date + timedelta(days=int(end_next_day)), end, tzinfo=zone)
-            if not end_next_day and event_end <= event_start:
-                event_end += timedelta(days=1)
-        for window in windows:
-            left, right = window["cover_start"], window["cover_end"]
-            if event_start == event_end:
-                if left <= event_start <= right:
-                    return True
-            elif event_start < right and event_end > left:
-                return True
-        return False
-
-    def _effective_entries(self, schedule, local_date, timezone, day_kind, provider_id, now):
-        self._building_snapshot_id = str(schedule.get("snapshot_id", ""))
-        windows = self._peak_windows(local_date, timezone, day_kind, provider_id)
-        entries = []
-        offset = timedelta(minutes=int(self._get("event_offset_minutes", 0)))
-        for index, slot in enumerate(schedule.get("slots", []), 1):
-            if not isinstance(slot, dict):
-                continue
-            if not (str(slot.get("name", "")).strip() or str(slot.get("state", "")).strip()):
-                continue
-            if self._overlaps_cover(slot, local_date, timezone, windows):
-                continue
-            start, next_day = self._clock(slot.get("start"))
-            if start is None:
-                continue
-            trigger = datetime.combine(local_date + timedelta(days=int(next_day)), start, tzinfo=_zone(timezone)) + offset
-            if trigger + timedelta(seconds=int(self._get("grace_seconds", 60))) < now.astimezone(_zone(timezone)):
-                continue
-            if any(window["cover_start"] <= trigger <= window["cover_end"] for window in windows):
-                continue
-            entries.append({
-                "id": f"{local_date.isoformat()}-N{index:02d}",
-                "kind": "NORMAL",
-                "trigger_at": trigger.isoformat(),
-                "message": "",
-                "sent": False,
-                "delivered_umos": [],
-                "name": str(slot.get("name", "")),
-                "state": str(slot.get("state", "")),
-                "slot_start": str(slot.get("start", "")),
-                "slot_end": str(slot.get("end", "")),
-            })
-
-        for window in windows:
-            cover_id = f"{local_date.isoformat()}-P{window['index']:02d}"
-            peak_duration = int((window["peak_end"] - window["peak_start"]).total_seconds() // 60)
-            primary_activity = self._primary_peak_activity(
-                schedule, local_date, timezone, window["peak_start"], window["peak_end"]
-            )
-            context = {
-                "activity_id": cover_id,
-                "peak_duration_minutes": peak_duration,
-                "peak_start": window["peak_start"].isoformat(),
-                "peak_end": window["peak_end"].isoformat(),
-                "primary_activity": primary_activity,
-                # Keep a concise ordered itinerary when a long single activity is absent.
-                # This is sourced entirely from TimeAwareness's existing raw slots.
-                "activity_outline": self._peak_activity_outline(
-                    schedule, local_date, timezone, window["peak_start"], window["peak_end"]
-                ),
-            }
-            for kind, trigger in (("PEAK_START", window["cover_start"]), ("PEAK_END", window["cover_end"])):
-                if trigger + timedelta(seconds=int(self._get("grace_seconds", 60))) < now.astimezone(_zone(timezone)):
+    def _derive_deliveries(timeline, old_deliveries=None):
+        old = {(row.get("id"), row.get("trigger_at")): row for row in old_deliveries or []}
+        old_by_id = {row.get("id"): row for row in old_deliveries or []}
+        bridge_ends = {row["end_at"] for row in timeline if row["kind"] == "BRIDGE"}
+        events = []
+        for row in timeline:
+            if row["kind"] == "NORMAL":
+                if row["start_at"] in bridge_ends:
                     continue
-                event_context = dict(context)
-                event_context["trigger_at"] = trigger.isoformat()
-                event_context.update(self._peak_temporal_context(
-                    schedule, local_date, timezone, trigger,
-                    window["peak_start"], window["peak_end"], kind,
-                ))
-                entries.append({
-                    "id": f"{cover_id}-{kind}",
-                    "kind": kind,
-                    "activity_id": cover_id,
-                    "activity_duration_minutes": (
-                        primary_activity["duration_minutes"] if primary_activity else None
-                    ),
-                    "trigger_at": trigger.isoformat(),
-                    "message": "",
-                    "sent": False,
-                    "delivered_umos": [],
-                    "activity_context": event_context,
-                })
-        entries.sort(key=lambda item: item["trigger_at"])
-        return entries
+                events.append({"id": row["id"], "kind": "NORMAL", "timeline_id": row["id"],
+                               "trigger_at": row["start_at"], "message": row["broadcast_message"]})
+            else:
+                events.extend([
+                    {"id": row["id"] + "-ENTER", "kind": "BRIDGE_ENTER", "timeline_id": row["id"],
+                     "trigger_at": row["start_at"], "message": row["enter_message"]},
+                    {"id": row["id"] + "-EXIT", "kind": "BRIDGE_EXIT", "timeline_id": row["id"],
+                     "trigger_at": row["end_at"], "message": row["exit_message"]},
+                ])
+        for event in events:
+            previous = old.get((event["id"], event["trigger_at"]))
+            if previous is None:
+                candidate = old_by_id.get(event["id"], {})
+                previous = candidate if candidate.get("sent") or candidate.get("delivered_umos") else {}
+            previous = previous or {}
+            for key in ("sent", "expired", "delivered_umos", "dry_run_logged"):
+                if key in previous:
+                    event[key] = copy.deepcopy(previous[key])
+            event.setdefault("sent", False)
+            event.setdefault("expired", False)
+            event.setdefault("delivered_umos", [])
+        return events
 
-    def _primary_peak_activity(self, schedule, local_date, timezone, peak_start, peak_end):
-        candidates = []
-        zone = _zone(timezone)
-        peak_duration = peak_end - peak_start
-        minimum_overlap = max(timedelta(minutes=30), peak_duration / 2)
-        for index, slot in enumerate(schedule.get("slots", [])):
-            if not isinstance(slot, dict):
-                continue
-            start, start_next_day = self._clock(slot.get("start"))
-            end, end_next_day = self._clock(slot.get("end"))
-            name, state = str(slot.get("name", "")).strip(), str(slot.get("state", "")).strip()
-            if start is None or not (name or state):
-                continue
-            activity_start = datetime.combine(local_date + timedelta(days=int(start_next_day)), start, tzinfo=zone)
-            if end is None:
-                continue
-            activity_end = datetime.combine(local_date + timedelta(days=int(end_next_day)), end, tzinfo=zone)
-            if not end_next_day and activity_end <= activity_start:
-                activity_end += timedelta(days=1)
-            overlap = min(activity_end, peak_end) - max(activity_start, peak_start)
-            activity_duration = activity_end - activity_start
-            if overlap < minimum_overlap:
-                continue
-            candidates.append((overlap, -index, {
-                "name": name, "state": state,
-                "start": str(slot.get("start", "")), "end": str(slot.get("end", "")),
-                "duration_minutes": int(activity_duration.total_seconds() // 60),
-            }))
-        return max(candidates, key=lambda item: (item[0], item[1]))[2] if candidates else None
-
-    def _peak_activity_outline(self, schedule, local_date, timezone, peak_start, peak_end, limit=6):
-        """Return a small chronological itinerary of real slots overlapping a peak."""
-        zone = _zone(timezone)
-        candidates = []
-        for index, slot in enumerate(schedule.get("slots", [])):
-            if not isinstance(slot, dict):
-                continue
-            start, start_next_day = self._clock(slot.get("start"))
-            end, end_next_day = self._clock(slot.get("end"))
-            name, state = str(slot.get("name", "")).strip(), str(slot.get("state", "")).strip()
-            if start is None or end is None or not (name or state):
-                continue
-            activity_start = datetime.combine(
-                local_date + timedelta(days=int(start_next_day)), start, tzinfo=zone
-            )
-            activity_end = datetime.combine(
-                local_date + timedelta(days=int(end_next_day)), end, tzinfo=zone
-            )
-            if not end_next_day and activity_end <= activity_start:
-                activity_end += timedelta(days=1)
-            overlap_seconds = (
-                min(activity_end, peak_end) - max(activity_start, peak_start)
-            ).total_seconds()
-            if overlap_seconds <= 0:
-                continue
-            candidates.append((overlap_seconds, index, {
-                "name": name, "state": state,
-                "start": str(slot.get("start", "")),
-                "end": str(slot.get("end", "")),
-                "start_at": activity_start.isoformat(),
-                "end_at": activity_end.isoformat(),
-                "overlap_minutes": max(1, int(overlap_seconds // 60)),
-            }))
-
-        # Prefer substantial overlaps, then keep their original time order.
-        chosen = sorted(candidates, key=lambda item: (-item[0], item[1]))[:limit]
-        chosen.sort(key=lambda item: item[1])
-        return [item[2] for item in chosen]
-
-    def _peak_temporal_context(self, schedule, local_date, timezone, trigger, peak_start, peak_end, kind):
-        """Classify source schedule slots relative to this message's actual trigger."""
-        zone = _zone(timezone)
-        active, completed, upcoming = [], [], []
-        for slot in schedule.get("slots", []):
-            if not isinstance(slot, dict):
-                continue
-            start, start_next_day = self._clock(slot.get("start"))
-            end, end_next_day = self._clock(slot.get("end"))
-            if start is None or end is None:
-                continue
-            start_at = datetime.combine(local_date + timedelta(days=int(start_next_day)), start, tzinfo=zone)
-            end_at = datetime.combine(local_date + timedelta(days=int(end_next_day)), end, tzinfo=zone)
-            if not end_next_day and end_at <= start_at:
-                end_at += timedelta(days=1)
-            if end_at <= start_at:
-                continue
-            item = {
-                "name": str(slot.get("name", "")), "state": str(slot.get("state", "")),
-                "start": str(slot.get("start", "")), "end": str(slot.get("end", "")),
-                "start_at": start_at.isoformat(), "end_at": end_at.isoformat(),
-            }
-            if start_at <= trigger < end_at:
-                active.append(item)
-            if start_at < peak_end and end_at > peak_start and end_at <= trigger:
-                completed.append(item)
-            if start_at > trigger and start_at < peak_end:
-                upcoming.append(item)
-
-        # At peak end, offer only the nearest upcoming real slot outside this peak.
-        if kind == "PEAK_END" and not upcoming:
-            later = []
-            for slot in schedule.get("slots", []):
-                if not isinstance(slot, dict):
-                    continue
-                start, next_day = self._clock(slot.get("start"))
-                if start is None:
-                    continue
-                start_at = datetime.combine(local_date + timedelta(days=int(next_day)), start, tzinfo=zone)
-                if start_at > trigger:
-                    later.append((start_at, slot))
-            if later:
-                start_at, slot = min(later, key=lambda item: item[0])
-                end, end_next_day = self._clock(slot.get("end"))
-                end_at = (datetime.combine(local_date + timedelta(days=int(end_next_day)), end, tzinfo=zone)
-                          if end is not None else None)
-                upcoming.append({
-                    "name": str(slot.get("name", "")), "state": str(slot.get("state", "")),
-                    "start": str(slot.get("start", "")), "end": str(slot.get("end", "")),
-                    "start_at": start_at.isoformat(), "end_at": end_at.isoformat() if end_at else "",
-                })
-        return {
-            "active_at_trigger": active,
-            "completed_before_trigger": completed,
-            "upcoming_after_trigger": upcoming[:3],
-        }
-
-    def _prompt_lines(self, entries, schedule, day_kind):
-        lines = []
-        for entry in entries:
-            item = {
-                "id": entry["id"],
-                "kind": entry["kind"],
-                "trigger_at": entry["trigger_at"],
-                "name": entry.get("name", ""),
-                "state": entry.get("state", ""),
-                "time_segment": [entry.get("slot_start", ""), entry.get("slot_end", "")],
-                "activity_context": entry.get("activity_context", {}),
-            }
-            lines.append(json.dumps(item, ensure_ascii=False))
-        instructions = (
-            f"目标日期 {schedule.get('local_date', '')}，日期性质 {day_kind}。"
-            "为所有 ID 一次性生成消息，输出 JSON 对象且键为 ID。"
-            "保留默认 Persona 的活泼、随性、吐槽和情绪变化，像本人随口发消息，不要写成通知或固定模板。"
-            "每条都必须独立可懂：没看过前文的群友也要能知道具体在做什么；不要只写情绪、去/回/结束等空泛结论。"
-            "NORMAL 必须依据给出的 name、state 和 time_segment 明确说出原日程中的事情；可自然表达情绪，但不得补造地点、人物、原因、结果或与日程矛盾。"
-            "晚间和凌晨遇到真实的看电影、夜市、演出、宵夜、朋友聚会、游戏等活动时，可更兴奋、好奇、爱玩一点；"
-            "不要默认23点就必须睡觉，也绝不能为制造夜生活而补造日程中没有的活动。"
-            "PEAK 消息的时间基准是各自 activity_context.trigger_at，不是高峰窗口结束时间，也不是整份日程的事后总结。"
-            "时间事实权威顺序：active_at_trigger、completed_before_trigger、upcoming_after_trigger 最高；primary_activity 与 activity_outline 只是次级背景。若背景与这三类触发时刻分类冲突，必须服从触发时刻分类。"
-            "active_at_trigger 表示该时段在 trigger_at 仍持续，应用当前/进行时描述整体场景。state 只是整个时段的概述，不是内部动作的时间顺序；不能仅因 state 提到某动作，就断言该动作已完成。"
-            "只有 RAW 明确表明某个内部动作在 trigger_at 之前已完成，才可使用完成时；否则活动仍在进行时，不得说吃完了、买好了、看完了、逛完了或已经去了。"
-            "upcoming_after_trigger 严格属于未来；其中的活动、地点及其细节只能用明确将来时表达，不能写成当前正在做、已经发生或已经到达。即使 activity_outline 提到它们，也不得改变其未来属性。"
-            "PEAK_START 先依据 trigger_at 描述 active_at_trigger 中的当前现实，再从 upcoming_after_trigger 预告1–3件相关真实安排；若当前仍在睡觉，应明确还在睡/暂时不在线。"
-            "PEAK_END 只可将 completed_before_trigger 中的事项描述为完成；active_at_trigger 仍在进行，必须保持进行时；upcoming_after_trigger 仍是未来。不得笼统声称整个 activity_id 或高峰活动已经结束。"
-            "严格区分浏览、看、逛与购买：日程写翻看/浏览贴纸或耳饰，绝不表示买了；看展不能补成展览评价，逛完不能擅自说准备回家。"
-            "primary_activity 的 duration_minutes 必须与 peak_duration_minutes 相称，不要把短暂子活动说成覆盖整个高峰；它不能覆盖或改写触发时刻分类。"
-            "activity_outline 仅用于理解高峰背景和活动之间的关联，绝不能用来推断某件事已完成，也不能覆盖 active_at_trigger、completed_before_trigger 或 upcoming_after_trigger。"
-            "若 outline 展示先上课后看展，可以说是两件相连的事，不要假装成一项持续数小时的活动；每条具体表述仍必须符合该事件自己的 trigger_at 分类。"
-            "PEAK_START 是离开聊天前的生活分享：当前场景说清楚，再挑 upcoming_after_trigger 中1–3件相关安排作未来预告；不要把刷手机、发呆、普通吃饭这类短暂过渡误说成整段高峰已完成的主活动。"
-            "PEAK_END 可简短回扣同一段行程，但只能把 completed_before_trigger 的内容说成已完成，不能把活动仍在进行的 slot 或尚未开始的 slot 总结成做完了。"
-            "若 trigger_at 缺少可识别的当前或相关安排，只能用不添加事实的简短状态表达，不得自行补造忙碌、完成或离开等结果。"
-            "所有情况下都不得猜测或虚构事实，不能只写溜了、回来了、忙一阵等无背景的空话。"
-            "不要为了交代背景而过度解释；保持口语、简短、有变化。"
-        )
-        return f"{self._get('broadcast_prompt', DEFAULT_PROMPT)}\n{instructions}\n" + "\n".join(lines)
-
-    def _preserve_delivery(self, old_plan, entries):
-        if not isinstance(old_plan, dict):
-            return entries
-        previous = {
-            (entry.get("id"), entry.get("trigger_at")): entry
-            for entry in old_plan.get("entries", []) if isinstance(entry, dict)
-        }
-        for entry in entries:
-            old = previous.get((entry["id"], entry["trigger_at"]))
-            if old:
-                for key in ("message", "sent", "expired", "delivered_umos", "dry_run_logged"):
-                    if key in old:
-                        entry[key] = old[key]
-        return entries
-
-    async def _build_plan(self, schedule, now, provider, targets, *, force=False):
-        local_date = date.fromisoformat(str(schedule.get("local_date", "")))
-        snapshot_id = str(schedule.get("snapshot_id", ""))
-        digest = hashlib.sha256(
-            json.dumps(schedule, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        ).hexdigest()
-        plans = self._plans()
-        old_plan = plans.get(local_date.isoformat())
-        if (not force and old_plan and old_plan.get("schedule_hash") == digest
-                and old_plan.get("plan_complete")):
-            return False
-
-        initial_policy = self.fat_fish.get_wallet_policy(at=now, provider_id=provider)
-        fish_timezone = str(initial_policy.get("timezone") or schedule.get("timezone") or "Asia/Shanghai")
-        try:
-            _zone(fish_timezone)
-        except Exception:
-            fish_timezone = str(schedule.get("timezone") or "Asia/Shanghai")
-        day_timezone = str(schedule.get("timezone") or fish_timezone)
-        day_at = datetime.combine(local_date, time(12, 0), tzinfo=_zone(day_timezone))
-        day_policy = self.day_adapter.get_day_policy(day_at)
-        day_kind = str(day_policy.get("kind", "unknown")) if day_policy.get("available") else "unknown"
-
-        zone = _zone(fish_timezone)
-        effective_entries = self._effective_entries(
-            schedule, local_date, fish_timezone, day_kind, provider, now
-        )
-        effective_entries = self._preserve_delivery(old_plan, effective_entries)
-        plan = {
-            "local_date": local_date.isoformat(),
-            "snapshot_id": snapshot_id,
-            "schedule_hash": digest,
-            "timezone": fish_timezone,
-            "day_kind": day_kind,
-            "entries": effective_entries,
-            "generated_at": datetime.now(zone).isoformat(),
-            "plan_complete": False,
-        }
-        plans[local_date.isoformat()] = plan
-
-        if not targets:
-            self.last_error = "no eligible targets"
-            self._save()
-            return False
-        if not initial_policy.get("found") or not initial_policy.get("allowed"):
-            self.last_error = "Fat Fish unavailable or current wallet policy blocked"
-            plan["pending"] = True
-            self._save()
-            return False
-        if not effective_entries:
-            plan["plan_complete"] = True
-            plan.pop("pending", None)
-            self._save()
+    async def generate_life_day(self, life_day_start, *, force=False):
+        if isinstance(life_day_start, str):
+            life_day_start = datetime.fromisoformat(life_day_start)
+        if not life_day_start.tzinfo:
+            life_day_start = life_day_start.astimezone()
+        key = self._plan_key(life_day_start)
+        async with self._generation_lock:
+            old = self._plans().get(key)
+            if old and old.get("status") == "complete" and not force:
+                return {"status": "exists", "start_at": key}
+            attempts = self.state.setdefault("generation_attempts", {})
+            attempt = attempts.get(key, {})
+            if (not force and attempt.get("status") == "failed"
+                    and (self._now() - datetime.fromisoformat(attempt["at"])).total_seconds() < 1800):
+                return {"status": "throttled", "reason": attempt.get("error", "recent planner failure")}
             self.last_error = ""
-            return True
-
-        persona = await self.context.persona_manager.get_default_persona_v3()
-        system = str(persona.get("prompt", "") or "") if isinstance(persona, dict) else str(getattr(persona, "prompt", "") or "")
-        prompt = self._prompt_lines(effective_entries, schedule, day_kind)
-        prompt += f"\n每条消息最多{int(self._get('max_message_chars', 80))}字。"
-        response = await self.context.llm_generate(
-            chat_provider_id=provider, prompt=prompt, system_prompt=system, tools=None
-        )
-        raw = getattr(response, "completion_text", None) or getattr(response, "text", None) or str(response)
-        try:
-            output = json.loads(raw)
-        except Exception:
-            self.last_error = "invalid batch JSON"
-            self._save()
-            return False
-        maximum = int(self._get("max_message_chars", 80))
-        for entry in effective_entries:
-            text = output.get(entry["id"], "") if isinstance(output, dict) else ""
-            if isinstance(text, str):
-                entry["message"] = text.replace("\n", " ").strip()[:maximum]
-        if any(not entry.get("message") for entry in effective_entries):
-            self.last_error = "incomplete batch JSON"
-            plan["pending"] = True
-            self._save()
-            return False
-        plan["plan_complete"] = True
-        plan.pop("pending", None)
-        self._save()
-        self.last_error = ""
-        return True
+            try:
+                targets = await self.targets()
+                provider = await self._provider(targets)
+                if not provider:
+                    raise RuntimeError("provider unavailable")
+                planner_input = await self.planner_input(life_day_start, provider)
+                planner_input = json.loads(json.dumps(planner_input, ensure_ascii=False, default=str))
+                persona_prompt = planner_input.get("persona", "")
+                prompt = self._planner_prompt(planner_input)
+                # Fat Fish gates message events, not this internal planner call.
+                # Recheck its read-only policy at call time; force regeneration
+                # must not bypass an active wallet block either.
+                wallet_policy = self.fat_fish.get_wallet_policy(
+                    at=self._now(), provider_id=provider)
+                if wallet_policy.get("found") and not wallet_policy.get("allowed", True):
+                    return {"status": "deferred", "reason": "blocked_by_fat_fish",
+                            "policy": wallet_policy}
+                response = await self.context.llm_generate(
+                    chat_provider_id=provider, prompt=prompt,
+                    system_prompt=persona_prompt, tools=None)
+                raw = getattr(response, "completion_text", None) or getattr(response, "text", None) or str(response)
+                result = json.loads(raw)
+                if not isinstance(result, dict):
+                    raise ValueError("planner response must be a JSON object")
+                timeline = result.get("timeline")
+                if not str(result.get("daily_theme", "")).strip() or not str(result.get("daily_style", "")).strip():
+                    raise ValueError("planner response missing daily_theme or daily_style")
+                valid, reason = self.validate_timeline(planner_input, timeline)
+                if not valid:
+                    raise ValueError("planner timeline rejected: " + reason)
+                old_deliveries = old.get("deliveries", []) if old else []
+                plan = {
+                    "schema_version": SCHEMA_VERSION,
+                    "planner_version": PLANNER_VERSION,
+                    "life_day_start": planner_input["life_day"]["start_at"],
+                    "life_day_end": planner_input["life_day"]["end_at"],
+                    "timezone": planner_input.get("timezone", str(life_day_start.tzinfo)),
+                    "daily_theme": str(result.get("daily_theme", "")).strip(),
+                    "daily_style": str(result.get("daily_style", "")).strip(),
+                    "timeline": timeline,
+                    "deliveries": self._derive_deliveries(timeline, old_deliveries),
+                    "status": "complete",
+                    "generated_at": self._now().isoformat(),
+                }
+                self._plans()[key] = plan
+                attempts[key] = {"status": "complete", "at": self._now().isoformat()}
+                self._save()
+                return {"status": "generated", "plan": plan}
+            except Exception as exc:
+                self.last_error = str(exc) or type(exc).__name__
+                attempts[key] = {"status": "failed", "at": self._now().isoformat(), "error": self.last_error}
+                self._save()
+                return {"status": "failed", "reason": self.last_error}
 
     async def refresh(self, force=False, now=None):
-        now = self._now(now)
-        targets = await self.targets()
-        provider = await self._provider(targets)
-        dates = (now.date(), now.date() + timedelta(days=1))
-        self.last_schedules = {}
+        """Rebuild delivery rows from persisted timelines without invoking an LLM."""
         changed = False
-        for target_date in dates:
-            schedule = await self._read_date(target_date, targets, now)
-            if schedule is None:
-                continue
-            if not provider:
-                self.last_error = "provider unavailable"
-                continue
-            changed = await self._build_plan(schedule, now, provider, targets, force=force) or changed
-        if not self.last_schedules:
-            self.last_error = "TimeAwareness unavailable or no existing today/tomorrow snapshot"
+        for plan in self._plans().values():
+            derived = self._derive_deliveries(plan.get("timeline", []), plan.get("deliveries", []))
+            if derived != plan.get("deliveries"):
+                plan["deliveries"] = derived
+                changed = True
+        if changed:
+            self._save()
         return changed
 
-    async def raw_schedule(self, target_date, now=None):
-        now = self._now(now)
-        targets = await self.targets()
-        return await self._read_date(target_date, targets, now)
+    def plan_for_start(self, start_at):
+        return self._plans().get(self._plan_key(start_at))
 
-    async def raw_cycle(self, now=None):
-        """Stitch TimeAwareness natural-day snapshots into Xiaoman's rolling 24h life day."""
-        now = self._now(now)
-        window = self.day_adapter.rolling_day_window(now)
-        start = window["start"]
-        end = window["end"]
-        targets = await self.targets()
-        dates = [start.date()]
-        if end.date() != start.date():
-            dates.append(end.date())
+    def current_plan(self, now=None):
+        return self.plan_for_start(self.life_day(now)["start"])
 
-        snapshots = []
-        slots = []
-        for target_date in dates:
-            schedule = await self._read_date(target_date, targets, now)
-            if schedule is None:
-                continue
-            snapshot_id = str(schedule.get("snapshot_id", "") or "")
-            if snapshot_id:
-                snapshots.append(snapshot_id)
-            timezone = str(schedule.get("timezone") or "Asia/Shanghai")
-            zone = _zone(timezone)
-            local_date = date.fromisoformat(str(schedule.get("local_date") or target_date.isoformat()))
-            for slot in schedule.get("slots", []):
-                if not isinstance(slot, dict):
-                    continue
-                slot_start, start_next_day = self._clock(slot.get("start"))
-                slot_end, end_next_day = self._clock(slot.get("end"))
-                if slot_start is None or slot_end is None:
-                    continue
-                absolute_start = datetime.combine(
-                    local_date + timedelta(days=int(start_next_day)),
-                    slot_start,
-                    tzinfo=zone,
-                )
-                absolute_end = datetime.combine(
-                    local_date + timedelta(days=int(end_next_day)),
-                    slot_end,
-                    tzinfo=zone,
-                )
-                if not end_next_day and absolute_end <= absolute_start:
-                    absolute_end += timedelta(days=1)
-                if absolute_start >= end or absolute_end <= start:
-                    continue
-                clipped_start = max(absolute_start, start.astimezone(zone))
-                clipped_end = min(absolute_end, end.astimezone(zone))
-                copied = dict(slot)
-                copied["start_at"] = clipped_start.isoformat(timespec="minutes")
-                copied["end_at"] = clipped_end.isoformat(timespec="minutes")
-                copied["calendar_date"] = local_date.isoformat()
-                slots.append(copied)
+    def next_plan(self, now=None):
+        return self.plan_for_start(self.next_life_day(now)["start"])
 
-        slots.sort(key=lambda item: item.get("start_at", ""))
-        return {
-            "generation_time": window.get("raw", ""),
-            "boundary_clock": window.get("clock", ""),
-            "window_start": start.isoformat(timespec="minutes"),
-            "window_end": end.isoformat(timespec="minutes"),
-            "snapshots": snapshots,
-            "complete": len(snapshots) == len(dates),
-            "slots": slots,
-        }
+    async def regenerate(self, which="current", now=None):
+        current = self.life_day(now)
+        if which == "current":
+            starts = [current["start"]]
+        elif which == "next":
+            starts = [current["end"]]
+        elif which == "cycle":
+            starts = [current["start"], current["end"]]
+        else:
+            return [{"status": "invalid", "reason": "expected current|next|cycle"}]
+        return [await self.generate_life_day(start, force=True) for start in starts]
 
-    async def build_date(self, target_date, now=None):
-        now = self._now(now)
-        targets = await self.targets()
-        schedule = await self._read_date(target_date, targets, now)
-        if schedule is None:
-            return False, "No existing TimeAwareness snapshot."
-        provider = await self._provider(targets)
-        if not provider:
-            return False, "Provider unavailable."
-        result = await self._build_plan(schedule, now, provider, targets, force=True)
-        return result, "Plan rebuilt from existing snapshot." if result else self.last_error
-
-    def reset_date(self, target_date):
-        removed = self._plans().pop(target_date.isoformat(), None) is not None
+    def reset(self, which="current", now=None):
+        current = self.life_day(now)
+        starts = [current["start"]] if which == "current" else [current["end"]] if which == "next" else []
+        removed = False
+        for start in starts:
+            key = self._plan_key(start)
+            removed = self._plans().pop(key, None) is not None or removed
+            self.state.setdefault("generation_attempts", {}).pop(key, None)
         if removed:
             self._save()
         return removed
 
-    def plan_for_date(self, target_date):
-        return self._plans().get(target_date.isoformat())
-
-    async def test_entry(self, entry_id, umo):
-        if not isinstance(umo, str) or not umo:
-            return False, "当前会话不可用。"
-        entry = next((entry for plan in self._plans().values()
-                      for entry in plan.get("entries", [])
-                      if entry.get("id") == entry_id and entry.get("message")), None)
-        if entry is None:
-            return False, "未找到已生成且可测试的 entry_id。"
-        try:
-            from astrbot.api.event import MessageChain
-            await self.context.send_message(umo, MessageChain().message(entry["message"]))
-            return True, f"测试操作：已向当前会话发送 {entry_id}。"
-        except Exception:
-            logger.warning("Schedule broadcast admin test send failed", exc_info=True)
-            return False, "测试操作失败，消息未确认发送。"
+    async def raw_cycle(self, now=None):
+        window = self.life_day(now)
+        plan = self.plan_for_start(window["start"])
+        return {"life_day": window, "plan": plan,
+                "timeline": plan.get("timeline", []) if plan else []}
 
     async def simulate_time(self, hhmm, now=None):
-        """Run the normal due-send path against an isolated copy of today's plan."""
         current = self._now(now)
-        if (not isinstance(hhmm, str) or len(hhmm) != 5 or hhmm[2] != ":"
-                or not hhmm[:2].isdigit() or not hhmm[3:].isdigit()):
+        if not isinstance(hhmm, str) or not re.fullmatch(r"\d{2}:\d{2}", hhmm):
             return None, "时间格式应为 HH:MM。"
         try:
-            simulated_clock = time.fromisoformat(hhmm)
+            clock = time.fromisoformat(hhmm)
         except ValueError:
             return None, "无效的模拟时间。"
-        plan = self.plan_for_date(current.date())
+        window = self.life_day(current)
+        start = window["end"].date() if clock < time(window["hour"], window["minute"]) else window["start"].date()
+        simulated = datetime.combine(start, clock, tzinfo=window["start"].tzinfo)
+        plan = self.plan_for_start(window["start"])
         if not plan:
-            return None, "当天没有已生成的 EFFECTIVE 日程。"
-        timezone = str(plan.get("timezone") or "Asia/Shanghai")
-        simulated_now = datetime.combine(current.date(), simulated_clock, tzinfo=_zone(timezone))
-        isolated_plan = copy.deepcopy(plan)
-        result = await self.send_due(simulated_now, plans=[isolated_plan], force_send=True)
-        result["simulated_at"] = simulated_now.isoformat()
+            return None, "当前 life day 没有已生成计划。"
+        isolated = copy.deepcopy(plan)
+        result = await self.send_due(simulated, plans=[isolated], force_send=True)
+        result["simulated_at"] = simulated.isoformat()
         if not result["hit_event_ids"] and not result["expired_event_ids"]:
             result["reason"] = "该时间没有到期事件。"
         elif not result["hit_event_ids"] and result["expired_event_ids"]:
             result["reason"] = "事件已超过宽限期，未发送。"
         elif not result["target_count"]:
-            result["reason"] = "没有符合群聊/私聊、允许名单和拒绝名单配置的投递目标。"
+            result["reason"] = "没有符合投递配置的目标。"
         elif result["failures"]:
             result["reason"] = "部分目标发送失败；详见失败明细。"
         return result, ""
 
+    async def test_entry(self, entry_id, umo):
+        event = next((entry for plan in self._plans().values()
+                      for entry in plan.get("deliveries", [])
+                      if entry.get("id") == entry_id), None)
+        if not event or not event.get("message"):
+            return False, "未找到可测试的 entry_id。"
+        try:
+            from astrbot.api.event import MessageChain
+            result = await self.context.send_message(umo, MessageChain().message(event["message"]))
+            if result is False:
+                return False, f"测试操作失败：AstrBot 未确认发送 {entry_id}。"
+            return True, f"测试操作：已向当前会话发送 {entry_id}。"
+        except Exception as exc:
+            return False, f"测试操作失败：{exc or type(exc).__name__}"
+
     async def send_due(self, now=None, *, plans=None, force_send=False):
         persist = plans is None
-        targets = await self.targets()
+        target_umos = await self.targets()
         now = self._now(now)
-        active_plans = self._plans().values() if persist else plans
-        result = {
-            "hit_event_ids": [], "expired_event_ids": [], "target_count": len(targets),
-            "success_count": 0, "failures": [],
-        }
-        if targets:
+        active = self._plans().values() if persist else plans
+        result = {"hit_event_ids": [], "expired_event_ids": [], "target_count": len(target_umos),
+                  "success_count": 0, "failures": []}
+        if target_umos:
             from astrbot.api.event import MessageChain
-        for plan in active_plans:
-            timezone = str(plan.get("timezone") or "Asia/Shanghai")
-            try:
-                local_now = now.astimezone(_zone(timezone))
-            except Exception:
-                local_now = now
-            for entry in plan.get("entries", []):
-                if entry.get("sent") or entry.get("expired") or not entry.get("message"):
+        for plan in active:
+            zone = _zone(plan.get("timezone", "Asia/Shanghai"))
+            local_now = now.astimezone(zone)
+            for event in plan.get("deliveries", []):
+                if event.get("sent") or event.get("expired") or not event.get("message"):
                     continue
-                trigger = self._parse_absolute(entry.get("trigger_at"), timezone)
-                if trigger is None:
-                    entry["expired"] = True
-                    result["expired_event_ids"].append(entry.get("id", ""))
+                trigger = _absolute(event.get("trigger_at", ""))
+                if not trigger:
+                    event["expired"] = True
+                    result["expired_event_ids"].append(event.get("id", ""))
                     if persist:
                         self._save()
                     continue
-                if local_now > trigger + timedelta(seconds=int(self._get("grace_seconds", 60))):
-                    entry["expired"] = True
-                    result["expired_event_ids"].append(entry.get("id", ""))
+                if local_now > trigger + timedelta(seconds=max(0, int(self._get("grace_seconds", 60)))):
+                    event["expired"] = True
+                    result["expired_event_ids"].append(event.get("id", ""))
                     if persist:
                         self._save()
                     continue
                 if local_now < trigger:
                     continue
-                result["hit_event_ids"].append(entry.get("id", ""))
-                if not targets:
+                result["hit_event_ids"].append(event.get("id", ""))
+                if not target_umos:
                     continue
                 if self._get("dry_run", False) and not force_send:
-                    if not entry.get("dry_run_logged"):
-                        logger.info("Schedule broadcast dry-run %s: %s", entry["id"], entry["message"])
-                        entry["dry_run_logged"] = True
-                        if persist:
-                            self._save()
+                    if not event.get("dry_run_logged"):
+                        logger.info("Life-day broadcast dry-run %s: %s", event["id"], event["message"])
+                        event["dry_run_logged"] = True
+                    if persist:
+                        self._save()
                     continue
-                delivered = set(entry.get("delivered_umos", []))
-                target_occurrences = {}
-                for umo in targets:
-                    occurrence = target_occurrences.get(umo, 0)
-                    target_occurrences[umo] = occurrence + 1
+                delivered = set(event.get("delivered_umos", []))
+                occurrences = {}
+                for umo in target_umos:
+                    n = occurrences.get(umo, 0)
+                    occurrences[umo] = n + 1
                     states = self._target_delivery.get(umo, [])
-                    target_state = states[occurrence] if occurrence < len(states) else {}
-                    # Old states stored raw UMOs. Match any current alias of a
-                    # physical target so unique_session history remains valid.
+                    target_state = states[n] if n < len(states) else {}
                     if self._was_delivered(delivered, umo, target_state):
                         continue
                     try:
-                        sent = await self.context.send_message(umo, MessageChain().message(entry["message"]))
+                        sent = await self.context.send_message(umo, MessageChain().message(event["message"]))
                         if sent is False:
-                            result["failures"].append({
-                                "entry_id": entry.get("id", ""), "umo": umo,
-                                "reason": "send_message returned False",
-                            })
+                            result["failures"].append({"entry_id": event.get("id", ""), "umo": umo,
+                                                       "reason": "send_message returned False"})
                             continue
                         result["success_count"] += 1
                         delivered.add(target_state.get("key", umo))
-                        entry["delivered_umos"] = sorted(delivered)
+                        event["delivered_umos"] = sorted(delivered)
                         if persist:
                             self._save()
                     except Exception as exc:
-                        result["failures"].append({
-                            "entry_id": entry.get("id", ""), "umo": umo,
-                            "reason": str(exc) or type(exc).__name__,
-                        })
-                        logger.warning("Schedule broadcast send failed", exc_info=True)
-                target_occurrences = {}
-                all_delivered = bool(targets)
-                for umo in targets:
-                    occurrence = target_occurrences.get(umo, 0)
-                    target_occurrences[umo] = occurrence + 1
+                        result["failures"].append({"entry_id": event.get("id", ""), "umo": umo,
+                                                   "reason": str(exc) or type(exc).__name__})
+                        logger.warning("Life-day broadcast send failed", exc_info=True)
+                occurrences, all_delivered = {}, bool(target_umos)
+                for umo in target_umos:
+                    n = occurrences.get(umo, 0)
+                    occurrences[umo] = n + 1
                     states = self._target_delivery.get(umo, [])
-                    target_state = states[occurrence] if occurrence < len(states) else {}
+                    target_state = states[n] if n < len(states) else {}
                     if not self._was_delivered(delivered, umo, target_state):
                         all_delivered = False
                         break
-                entry["sent"] = all_delivered
+                event["sent"] = all_delivered
                 if persist:
                     self._save()
         result["failure_count"] = len(result["failures"])
         return result
 
+    async def _maybe_generate(self, start_at):
+        key = self._plan_key(start_at)
+        if self.plan_for_start(start_at):
+            return
+        await self.generate_life_day(start_at)
+
     async def tick(self):
-        if (
-            self.rolling_day_bridge is not None
-            and self._get("rolling_day_bridge_enabled", True)
-        ):
-            self.rolling_day_bridge.ensure_installed()
+        now = self._now()
+        window = self.life_day(now)
+        await self._maybe_generate(window["start"])
+        # A negative TimeAwareness generation clock means pre-generate the next
+        # life day. This also catches up once if the service started before its
+        # boundary and the prior day's scheduled pre-generation was missed.
+        if window["target_day_offset"] > 0:
+            await self._maybe_generate(window["end"])
         await self.refresh()
-        await self.send_due()
+        await self.send_due(now)
 
     async def run(self):
         while True:
@@ -941,13 +723,12 @@ class ScheduleBroadcastService:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.warning("Schedule broadcast tick failed", exc_info=True)
+                logger.warning("Life-day planner tick failed", exc_info=True)
             await asyncio.sleep(max(1, int(self._get("poll_seconds", 15))))
 
     def start(self):
-        self.fat_fish.install()
         if self._task is None or self._task.done():
-            self._task = asyncio.create_task(self.run(), name="xiaoman-schedule-broadcast")
+            self._task = asyncio.create_task(self.run(), name="xiaoman-life-day-planner")
 
     async def stop(self):
         if self._task:
@@ -957,34 +738,27 @@ class ScheduleBroadcastService:
             except asyncio.CancelledError:
                 pass
             self._task = None
-        self.fat_fish.uninstall()
 
-    @staticmethod
-    def _plan_status(plan):
-        if not plan:
-            return "missing"
-        if plan.get("plan_complete"):
-            return "complete"
-        return "pending"
-
-    def status(self, now=None):
-        now = self._now(now)
-        today = now.date()
-        tomorrow = today + timedelta(days=1)
-        fish = self.fat_fish.get_wallet_policy(provider_id=self._get("provider_id", ""))
-        due = [entry for plan in self._plans().values() for entry in plan.get("entries", [])
-               if entry.get("message") and not entry.get("sent") and not entry.get("expired")]
-        due.sort(key=lambda entry: entry.get("trigger_at", ""))
+    async def status(self, now=None):
+        current, following = self.life_day(now), self.next_life_day(now)
+        targets = await self.targets()
+        provider = await self._provider(targets)
+        current_input = await self.planner_input(current["start"], provider)
+        pending = sorted((event for plan in self._plans().values() for event in plan.get("deliveries", [])
+                          if event.get("message") and not event.get("sent") and not event.get("expired")),
+                         key=lambda row: row.get("trigger_at", ""))
         return {
-            "enabled": bool(self._get("enable", False)),
-            "dry_run": bool(self._get("dry_run", False)),
-            "time_awareness_found": self.day_adapter.discover() is not None,
-            "fat_fish_found": fish.get("found", False),
-            "day_kind": fish.get("day_kind", "unknown"),
-            "today_snapshot": self.last_schedules.get(today.isoformat()),
-            "tomorrow_snapshot": self.last_schedules.get(tomorrow.isoformat()),
-            "today_plan_status": self._plan_status(self.plan_for_date(today)),
-            "tomorrow_plan_status": self._plan_status(self.plan_for_date(tomorrow)),
-            "next": due[0] if due else None,
-            "last_error": self.last_error,
+            "planner_version": PLANNER_VERSION,
+            "boundary_clock": current["clock"],
+            "current_life_day": current,
+            "time_awareness_available": self.day_adapter.discover() is not None,
+            "fat_fish_peaks": self.fat_fish.effective_peak_windows(
+                current["start"], current["end"], provider,
+                current_input["calendar_days"]),
+            "protected_windows": current_input["protected_windows"],
+            "free_windows": current_input["free_windows"],
+            "current_plan_status": (self.current_plan(now) or {}).get("status", "missing"),
+            "next_plan_status": (self.next_plan(now) or {}).get("status", "missing"),
+            "next_broadcast": pending[0] if pending else None,
+            "last_planner_error": self.last_error,
         }

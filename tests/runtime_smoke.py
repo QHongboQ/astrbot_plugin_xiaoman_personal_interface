@@ -168,63 +168,61 @@ async def verify_schedule_bridge_public_contract():
     assert hasattr(PersonaManager, "get_default_persona_v3")
     assert isinstance(MessageChain().message("probe"), MessageChain)
 
-    from datetime import datetime
+    from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
-    from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.fat_fish_bridge import FAT_FISH_NAME
     from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.schedule_broadcast import ScheduleBroadcastService
 
-    clock = datetime.now(ZoneInfo("Asia/Shanghai")).replace(second=0, microsecond=0)
-    stamp = clock.strftime("%H:%M")
+    clock = datetime(2026, 10, 9, 4, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
 
-    class DailyScheduleService:
-        async def register_session_async(self, session, *, trigger=True):
-            assert session == "qq:GroupMessage:runtime-broadcast" and trigger is False
-            return "persona-hash"
-        def get_snapshot_for_session(self, session, *, now):
-            return {"persona_hash":"persona-hash","snapshot_id":"snapshot","local_date":now.date().isoformat(),"timezone":"Asia/Shanghai","generated_at":"now","manually_edited":False}
-    class DailyScheduleAdmin:
-        def get_detail(self, *args, **kwargs):
-            return {"slots":[{"slot_ref":"ref","start":stamp,"end":"23:59","name":"上午课程","state":"准备上课","origin":"ai","source_origin":"ai"}]}
-    class TimeAwareness:
-        daily_schedule_service = DailyScheduleService()
-        daily_schedule_admin = DailyScheduleAdmin()
+    class RuntimeTimeAwareness:
+        config = {"daily_schedule": {"ai_daily": {"generation_time": "-04:00", "worldview": "runtime worldview",
+                  "use_persona": True, "adaptive": {"theme_pool": ["creative"], "style_pool": ["natural"],
+                  "allow_custom_theme": True, "recent_days": 3, "state_continuity_enabled": True}}}}
         time_context = types.SimpleNamespace(
             now=lambda: clock,
             facts=types.SimpleNamespace(collect=lambda **kwargs: types.SimpleNamespace(
-                workday=types.SimpleNamespace(kind="unknown", available=False, value=""),
+                workday=types.SimpleNamespace(kind="workday", available=True, value="workday"),
                 now=kwargs["now"])),
         )
 
-    class FatFish111:
-        config = {"enabled": True, "manual_override": "auto", "timezone": "Asia/Shanghai"}
-        def _cfg(self, key, default=None): return self.config.get(key, default)
-        def _periods(self): return [("09:00", "12:00")]
-        def _weekdays(self): return list(range(7))
-        def _provider_affected(self, provider_id, prov): return provider_id == "runtime-provider"
-        @staticmethod
-        def _is_peak(local, periods, weekdays): return False
+    class RuntimeDayAdapter:
+        def __init__(self): self.plugin = RuntimeTimeAwareness()
+        def current_time(self): return clock
+        def discover(self): return self.plugin
+        def get_generation_boundary(self):
+            return {"available": True, "raw": "-04:00", "clock": "04:00", "hour": 4,
+                    "minute": 0, "target_day_offset": 1}
+        def life_day_window(self, at=None):
+            start = (at or clock).replace(hour=4, minute=0, second=0, microsecond=0)
+            if (at or clock) < start: start -= timedelta(days=1)
+            return {**self.get_generation_boundary(), "start": start, "end": start+timedelta(days=1),
+                    "timezone": "Asia/Shanghai"}
+        async def planner_context(self, start, end):
+            return {"available": True, "calendar_days": [{"date": start.date().isoformat(),
+                    "kind": "workday", "label": "workday"}], "worldview": "runtime worldview",
+                    "use_persona": True, "theme_pool": ["creative"], "style_pool": ["natural"],
+                    "allow_custom_theme": True, "adaptive": {"recent_days": 3,
+                    "state_continuity_enabled": True}, "weather": []}
+
+    class RuntimeFish:
+        # Same public shape as Fat Fish Wallet v1.1.1: configuration only.
+        config = {"enabled": False, "timezone": "Asia/Shanghai", "manual_override": "auto",
+                  "peak_periods": "09:00-12:00,14:00-18:00", "peak_weekdays": "0,1,2,3,4,5,6",
+                  "affected_providers": "deepseek", "gate_when_provider_unknown": True}
 
     class PublicContextFixture:
         def __init__(self):
             self.get_all_stars_called = 0
             self.llm_calls = []
             self.sent = []
+            self.fish = RuntimeFish()
             self.persona_manager = types.SimpleNamespace(
                 get_default_persona_v3=self.get_persona
             )
-            self.conversation_manager = types.SimpleNamespace(
-                get_conversations=self.get_conversations
-            )
-
-        def get_all_stars(self):
-            self.get_all_stars_called += 1
-            return [
-                StarMetadata(name="time_awareness", activated=True, star_cls=TimeAwareness()),
-                StarMetadata(name=FAT_FISH_NAME, activated=True, config={}, star_cls=FatFish111()),
-            ]
+            self.conversation_manager = types.SimpleNamespace(get_conversations=self.get_conversations)
 
         async def get_conversations(self):
-            return [types.SimpleNamespace(user_id="qq:GroupMessage:runtime-broadcast")]
+            return [types.SimpleNamespace(user_id="qq:GroupMessage:runtime-broadcast", platform_id="qq")]
 
         async def get_current_chat_provider_id(self, umo):
             assert umo == "qq:GroupMessage:runtime-broadcast"
@@ -232,40 +230,50 @@ async def verify_schedule_bridge_public_contract():
 
         def get_provider_by_id(self, provider_id):
             assert provider_id == "runtime-provider"
-            return object()
+            return types.SimpleNamespace(meta=lambda: types.SimpleNamespace(
+                id=provider_id, model="deepseek-chat", type="llm"))
+
+        def get_all_stars(self):
+            return [types.SimpleNamespace(name="astrbot_plugin_fat_fish_wallet",
+                                          activated=True, star_cls=self.fish)]
 
         async def get_persona(self):
             return {"name": "runtime", "prompt": "runtime dict persona"}
 
         async def llm_generate(self, *, chat_provider_id, prompt=None, tools=None, system_prompt=None, **kwargs):
             self.llm_calls.append((chat_provider_id, prompt, tools, system_prompt))
-            event_ids = re.findall(r'"id":\s*"([^"]+)"', prompt or "")
-            return types.SimpleNamespace(completion_text=json.dumps(
-                {event_id: "上午还是去学校上课啦，虽然有点想翘课，但先去露个脸再说。"
-                 for event_id in event_ids},
-                ensure_ascii=False,
-            ))
+            planner_input = json.loads(prompt.split("PLANNER_INPUT:\n", 1)[1])
+            free = planner_input["free_windows"][0]
+            return types.SimpleNamespace(completion_text=json.dumps({
+                "daily_theme": "runtime theme", "daily_style": "runtime style",
+                "timeline": [{"id": "N01", "kind": "NORMAL", "start_at": free["start_at"],
+                    "end_at": free["end_at"], "name": "休息", "state": "在家休息",
+                    "broadcast_message": "今天先按自己的节奏休息。"}]}, ensure_ascii=False))
 
         async def send_message(self, session, message_chain):
             assert isinstance(message_chain, MessageChain)
             self.sent.append((session, message_chain))
 
     runtime_context = PublicContextFixture()
+    from data.plugins.astrbot_plugin_xiaoman_personal_interface.services.fat_fish_bridge import FatFishBridge
     config = {"schedule_broadcast": {"enable": True}}
-    service = ScheduleBroadcastService(runtime_context, config, ".")
+    service = ScheduleBroadcastService(runtime_context, config, ".",
+                                       time_awareness=RuntimeDayAdapter(),
+                                       fat_fish=FatFishBridge(runtime_context, RuntimeDayAdapter()))
     service._save = lambda: None
-    await service.refresh(now=clock)
-    assert len(runtime_context.llm_calls) == len(service.state["plans"]) == 2
+    result = await service.generate_life_day(clock)
+    assert result["status"] == "generated"
+    assert len(runtime_context.llm_calls) == 1
     assert runtime_context.llm_calls[0][0] == "runtime-provider"
     assert runtime_context.llm_calls[0][2] is None
     assert runtime_context.llm_calls[0][3] == "runtime dict persona"
-    assert all(call[3] == "runtime dict persona" for call in runtime_context.llm_calls)
+    assert service.current_plan(clock)["timeline"][0]["name"] == "休息"
+    call_count = len(runtime_context.llm_calls)
+    await service.refresh()
     await service.send_due(clock)
+    assert len(runtime_context.llm_calls) == call_count
     assert len(runtime_context.sent) == 1
-    plan = service.plan_for_date(clock.date())
-    assert plan is not None and len(plan["entries"]) == 1
-    assert plan["entries"][0]["id"].endswith("-N01")
-    assert plan["entries"][0]["sent"] is True
+    assert service.current_plan(clock)["deliveries"][0]["sent"] is True
 
     await verify_schedule_broadcast_routes_by_real_platform_id()
 
@@ -304,11 +312,11 @@ async def verify_schedule_broadcast_routes_by_real_platform_id() -> None:
     service = ScheduleBroadcastService(context, {"schedule_broadcast": {}}, ".",
                                        time_awareness=object(), fat_fish=object())
     service._save = lambda: None
-    service.state = {"plans": {now.date().isoformat(): {
-        "timezone": str(now.tzinfo),
-        "entries": [{"id": "route-smoke", "trigger_at": now.isoformat(), "message": "route check",
-                     "sent": False, "expired": False, "delivered_umos": []}],
-    }}}
+    service.state = {"schema_version": 2, "generation_attempts": {}, "plans": {
+        now.isoformat(): {"timezone": "Asia/Shanghai", "deliveries": [
+            {"id": "route-smoke", "trigger_at": now.isoformat(), "message": "route check",
+             "sent": False, "expired": False, "delivered_umos": []}],
+        }}}
     result = await service.send_due(now)
     assert result["target_count"] == result["success_count"] == 2
     assert result["failure_count"] == 0
@@ -512,4 +520,4 @@ async def run(official_airi_root: Path | None = None) -> None:
 if __name__ == "__main__":
     root = Path(sys.argv[1]).resolve() if len(sys.argv) == 2 else None
     asyncio.run(run(root))
-    print("AstrBot 4.28.2 photo-tool, schedule-bridge, admin-bypass, AngelHeart, and Airi smoke passed")
+    print("AstrBot 4.28.2 photo-tool, life-day planner, admin-bypass, AngelHeart, and Airi smoke passed")

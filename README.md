@@ -31,36 +31,30 @@ send_xiaoman_photo()
 
 本版本不包含任何 TTS、语音提示、表演标签或 MiMo 逻辑。
 
-## 可选：TimeAwareness 日程广播（v0.6.0）
+## 可选：林小满生命日规划器（v0.8.0）
 
-默认关闭。启用前请安装并启用官方 `time_awareness`。广播层仍只读取已存在快照，并由 TimeAwareness 自己的详情 API 提供合并后的有效时间线；不读取其文件/数据库，不写入 AI、用户、静态或已执行层，也不会由广播循环主动触发日程生成。没有可用快照时不广播。
+默认关闭。启用前请安装并启用 `time_awareness`，并配置可用的 LLM provider。**林小满拥有最终的生命日时间线**；TimeAwareness 仅作为只读时钟、动态生命日边界、工作日/节假日、世界观、人设开关、主题/风格池和可用天气等上下文来源。林小满不会读取或依赖 TimeAwareness 日程快照，不调用它的 AI 日程生成器，也不会修改其源码、配置或快照。
 
-v0.6.0 新增可选 `rolling_day_bridge_enabled`：启用时仅在内存中可逆包装 TimeAwareness 当前生成器的 Step1/Step2 prompt builder，动态读取其 `ai_daily.generation_time` 时刻作为林小满的生活日边界。例如 `-04:00` 会把规划语义解释为 `04:00 → 次日04:00`；TimeAwareness 的持久化格式仍保持官方 `00:00–24:00` 自然日协议。桥接不修改 TimeAwareness 源码、配置文件或快照数据，卸载时只恢复自己仍持有的 wrapper。
+每次生命日规划是一个全局 LLM 请求：先依据 `daily_schedule.ai_daily.generation_time` 生成从边界时刻到下一日同一边界的完整时间线，并在同一次响应中生成主题、风格和所有 NORMAL/高峰桥接消息。Fat Fish 仅提供只读有效高峰政策；规划器按 `peak_guard_before_minutes` / `peak_guard_after_minutes` 扩展保护窗口，再把完整自由窗与保护窗一起交给规划器。保护窗恰好对应一个 BRIDGE 活动。计划通过无缺口、无重叠及消息完整性验证后，保存到 Xiaoman 独立的 `life_day_plans.json`。刷新与到点投递均不调用 LLM；发送失败目标在宽限期内重试，成功目标不会重复发送。
 
-快照变化后，Xiaoman 对未来且非空的时段进行一次批量消息生成，使用当前默认 Persona prompt；到点时只发送已保存消息，不调用 LLM。消息投递记录按 UMO 持久化，失败目标可在宽限期内重试，成功目标不重复发送。
+启用配置包括 `enable`、`provider_id`、`peak_guard_before_minutes`（默认5）、`peak_guard_after_minutes`（默认5）、`send_groups`、`send_private`、`allowlist_umos`、`denylist_umos`、`poll_seconds`、`grace_seconds`、`max_message_chars`、`dry_run` 和可选的 `planner_prompt`。只使用 AstrBot 已有会话，不枚举 QQ 群/好友。旧的 `schedule_broadcast_state.json` 会保留为 legacy 文件，不会被误当成 v0.8 生命日计划迁移。
 
-配置项：`enable`、`rolling_day_bridge_enabled`、`schedule_source_umo`（日程 Persona 所属的现存会话；留空使用第一个合格目标）、`send_groups`、`send_private`、`allowlist_umos`、`denylist_umos`、`provider_id`、`event_offset_minutes`、`poll_seconds`、`grace_seconds`、`max_message_chars`、`dry_run` 与 `broadcast_prompt`。仅使用 AstrBot 已有会话，不枚举 QQ 群/好友。
-
-### Fat Fish 策略兼容
-
-Xiaoman 为官方 Fat Fish 1.1.1 提供自己的钱包策略接口，并仅对活动实例安装可逆的运行时 `_cfg("manual_override")` 包装。TimeAwareness 是工作日/假日唯一来源：假日和周末在自动模式视为非高峰；调休工作日继续走 Fat Fish 原有高峰规则；TimeAwareness 不可用/未知时不臆造节假日。`always_block` 和 `always_allow` 优先级不变。
-
-兼容桥仅在内存中包装活动实例 `_cfg("manual_override")` 的读取，不改 Fat Fish 配置文件或已保存的 `manual_override`，卸载时仅在 wrapper 仍由 Xiaoman 持有时恢复。Fat Fish 官方文件与 TimeAwareness 官方文件均不修改。
-
-管理员命令：`/xiaoman_broadcast status` 查看运行诊断，`refresh` 读取快照并按变化生成，`test` 预览已生成消息。状态不会显示密钥或插件配置全文。
+Fat Fish 通过其公开 `get_wallet_policy()` 只读接口提供 enabled、manual override、provider 范围和高峰配置。仅在自动模式、启用且 provider 受影响，并且 TimeAwareness 当日类型为工作日或调休工作日时生成保护窗；周末/节假日、`always_allow` 和 `always_block` 都不生成自动高峰保护窗。Xiaoman 不包装或替换 Fat Fish `_cfg`，不改 Fat Fish 配置。
 
 管理员命令：
 
 ```text
 /xiaoman_broadcast status
 /xiaoman_broadcast raw cycle
+/xiaoman_broadcast plan current|next
+/xiaoman_broadcast regenerate current|next|cycle
 /xiaoman_broadcast refresh
-/xiaoman_broadcast test
+/xiaoman_broadcast simulate HH:MM
+/xiaoman_broadcast reset current|next
+/xiaoman_broadcast test <entry_id>
 ```
 
-`status` 查看服务状态与滚动生活日边界；`raw cycle` 将相邻两张自然日快照按当前 generation_time 拼成24小时生活日用于验收；`refresh` 立即重新读取日程（相同哈希不重复花费生成调用）；`test` 只在当前管理员会话预览或发送一条已经生成的待发送消息，且不会把正式日程标记为已发送。`dry_run` 模式下 `test` 只预览。
-
-解析支持形如 `08:55｜地点：学校｜事项：上午课程｜细节：今天第一节课有点困` 的中英文管道符格式；错误行会跳过。日程内容是事实来源，本插件不会向对话历史写入主动消息。
+`status` 展示生命日边界、有效高峰/保护窗/自由窗、当前与下一生命日计划状态、下一条播报和最近规划错误。`raw cycle`/`plan` 查看 Xiaoman 权威时间线。`regenerate` 才会重新调用规划 LLM；`refresh` 只从已有时间线重建投递项；`simulate` 使用隔离状态走真实发送路径，遵守名单设置；`test` 只测试指定已生成消息。`dry_run` 不自动发送，管理员明确运行 `simulate` 时允许一次真实投递。
 
 ## 管理员测试模式
 
