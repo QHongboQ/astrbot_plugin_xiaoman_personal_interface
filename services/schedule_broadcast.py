@@ -14,8 +14,12 @@ from astrbot.api import logger
 from .fat_fish_bridge import FatFishBridge
 from .time_awareness_adapter import TimeAwarenessAdapter
 
-PLANNER_VERSION = "0.8.1"
+PLANNER_VERSION = "0.8.2"
 SCHEMA_VERSION = 2
+TIMELINE_CATEGORIES = {
+    "sleep", "rest", "meal", "travel", "school", "creative", "social",
+    "entertainment", "outdoor", "shopping", "errand", "mixed", "other",
+}
 
 
 def _zone(name):
@@ -73,6 +77,60 @@ class ScheduleBroadcastService:
         except (TypeError, ValueError, OverflowError):
             value = default
         return max(minimum, value)
+
+    def _bool(self, key, default):
+        value = self._get(key, default)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"false", "0", "no", "off", "否"}:
+                return False
+            if normalized in {"true", "1", "yes", "on", "是"}:
+                return True
+        return bool(value)
+
+    def _activity_pool(self):
+        configured = self._get("activity_pool", []) or []
+        if isinstance(configured, str):
+            configured = [configured]
+        result = []
+        seen = set()
+        for item in configured:
+            if isinstance(item, dict):
+                name = str(item.get("name", "") or "").strip()
+                weight = item.get("weight", 1)
+            else:
+                text = str(item or "").strip()
+                if not text:
+                    continue
+                if "," in text:
+                    name, raw_weight = text.rsplit(",", 1)
+                    name = name.strip()
+                    try:
+                        weight = int(raw_weight.strip())
+                    except (TypeError, ValueError, OverflowError):
+                        name, weight = text, 1
+                else:
+                    name, weight = text, 1
+            if not name or name in seen:
+                continue
+            try:
+                weight = int(weight)
+            except (TypeError, ValueError, OverflowError):
+                weight = 1
+            result.append({"name": name, "weight": max(1, min(10, weight))})
+            seen.add(name)
+        return result
+
+    def _activity_density(self):
+        value = str(self._get("activity_density", "balanced") or "balanced").strip().lower()
+        return value if value in {"relaxed", "balanced", "busy"} else "balanced"
+
+    def _sleep_target_hours(self):
+        try:
+            value = int(self._get("sleep_target_hours", 8))
+        except (TypeError, ValueError, OverflowError):
+            value = 8
+        return max(4, min(12, value))
 
     def _load(self):
         try:
@@ -280,6 +338,33 @@ class ScheduleBroadcastService:
             free.append({"id": f"F{len(free)+1:02d}", "start_at": cursor.isoformat(), "end_at": life_end.isoformat()})
         return free
 
+    @staticmethod
+    def _legacy_category(row):
+        """Name fallback is only for persisted plans written before category existed."""
+        name = str(row.get("name", "")).lower()
+        if any(word in name for word in ("sleep", "睡", "补觉", "赖床")):
+            return "sleep"
+        if any(word in name for word in ("休息", "发呆", "躺", "什么都不")):
+            return "rest"
+        if any(word in name for word in ("吃", "饭", "餐", "宵夜")):
+            return "meal"
+        return "other"
+
+    @classmethod
+    def _history_category(cls, row, *, legacy=False):
+        category = row.get("category")
+        if category in TIMELINE_CATEGORIES:
+            return category
+        if legacy and not category:
+            return cls._legacy_category(row)
+        return "other"
+
+    @staticmethod
+    def _minutes(start, end):
+        if not start or not end or end <= start:
+            return 0
+        return int((end - start).total_seconds() // 60)
+
     def _history(self, life_start, recent_days, enabled):
         if not enabled or recent_days <= 0:
             return []
@@ -289,9 +374,19 @@ class ScheduleBroadcastService:
             if plan.get("status") != "complete" or not end or end > life_start:
                 continue
             timeline = plan.get("timeline", [])
+            planner_version = str(plan.get("planner_version", ""))
+            legacy_categories = planner_version in {"", "0.8.0", "0.8.1"}
             names = [row.get("name", "") for row in timeline if row.get("name")]
-            sleep = [row for row in timeline if any(word in str(row.get("name", "")).lower()
-                                                     for word in ("sleep", "睡", "补觉", "赖床"))]
+            categorized = [(row, self._history_category(row, legacy=legacy_categories))
+                           for row in timeline]
+            sleep = [(row, category) for row, category in categorized if category == "sleep"]
+            sleep_minutes = sum(self._minutes(_absolute(row.get("start_at")),
+                                              _absolute(row.get("end_at")))
+                                for row, _category in sleep)
+            tail = [{"category": category, "name": row.get("name", ""),
+                     "start_at": row.get("start_at"), "end_at": row.get("end_at"),
+                     "state": row.get("state", "")}
+                    for row, category in categorized[-3:]]
             late_night = []
             for row in timeline:
                 name = str(row.get("name", ""))
@@ -299,12 +394,56 @@ class ScheduleBroadcastService:
                 if (starts and (starts.hour >= 22 or starts.hour < 4)) or any(
                         word in name.lower() for word in ("night", "夜", "凌晨", "宵夜")):
                     late_night.append(name)
+            previous_end = _absolute(plan.get("life_day_end", ""))
+            final = categorized[-1] if categorized else (None, "other")
+            ended_awake = bool(final[1] != "sleep")
+            ended_awake_at_boundary = bool(
+                ended_awake and previous_end
+                and _absolute(final[0].get("end_at")) == previous_end)
+            continuous_sleep_rows = []
+            cursor = previous_end
+            for row, category in reversed(categorized):
+                row_start, row_end = _absolute(row.get("start_at")), _absolute(row.get("end_at"))
+                if category != "sleep" or not cursor or row_end != cursor:
+                    break
+                continuous_sleep_rows.append(row)
+                cursor = row_start
+            continuous_sleep_start = cursor if continuous_sleep_rows else None
+            sleep_before_boundary = self._minutes(continuous_sleep_start, previous_end)
+            target_minutes = self._sleep_target_hours() * 60
+            suggested_wake = None
+            if continuous_sleep_start:
+                suggested_wake = continuous_sleep_start + timedelta(minutes=target_minutes)
+            elif ended_awake_at_boundary and previous_end:
+                suggested_wake = previous_end + timedelta(minutes=target_minutes)
             completed.append({"life_day_start": plan.get("life_day_start"),
                               "daily_theme": plan.get("daily_theme", ""),
                               "daily_style": plan.get("daily_style", ""),
                               "major_activities": names,
-                              "sleep_period": [{"start_at": row.get("start_at"), "end_at": row.get("end_at")}
-                                               for row in sleep],
+                              "categories_used": sorted({category for _row, category in categorized}),
+                              "sleep_period": [{"start_at": row.get("start_at"), "end_at": row.get("end_at"),
+                                                "minutes": self._minutes(_absolute(row.get("start_at")),
+                                                                         _absolute(row.get("end_at")))}
+                                               for row, _category in sleep],
+                              "previous_sleep_minutes": sleep_minutes,
+                              "sleep_debt_minutes": max(0, target_minutes - sleep_minutes),
+                              "previous_tail": tail,
+                              "sleep_continuity": {
+                                  "target_sleep_hours": self._sleep_target_hours(),
+                                  "previous_sleep_minutes": sleep_minutes,
+                                  "previous_life_day_ended_awake": ended_awake,
+                                  "ended_awake_at_boundary": ended_awake_at_boundary,
+                                  "continuous_sleep_at_boundary": bool(continuous_sleep_rows),
+                                  "continuous_sleep_start_at": continuous_sleep_start.isoformat()
+                                  if continuous_sleep_start else None,
+                                  "sleep_minutes_before_boundary": sleep_before_boundary,
+                                  "suggested_wake_not_before": suggested_wake.isoformat()
+                                  if suggested_wake else None,
+                                  "recovery_sleep_needed": bool(
+                                      sleep_before_boundary < target_minutes
+                                      if continuous_sleep_rows else ended_awake_at_boundary
+                                      or sleep_minutes < target_minutes),
+                              },
                               "late_night_behavior": late_night,
                               "previous_final_events": names[-3:]})
         completed.sort(key=lambda row: row.get("life_day_start", ""), reverse=True)
@@ -328,6 +467,27 @@ class ScheduleBroadcastService:
         adaptive = planner_context.get("adaptive", {})
         history = self._history(start_at, int(adaptive.get("recent_days") or 0),
                                 bool(adaptive.get("state_continuity_enabled", True)))
+        latest = history[0] if history else None
+        sleep_continuity = (latest.get("sleep_continuity") if latest else None) or {
+            "target_sleep_hours": self._sleep_target_hours(),
+            "previous_sleep_minutes": None,
+            "previous_life_day_ended_awake": None,
+            "ended_awake_at_boundary": None,
+            "continuous_sleep_at_boundary": False,
+            "continuous_sleep_start_at": None,
+            "sleep_minutes_before_boundary": 0,
+            "suggested_wake_not_before": None,
+            "recovery_sleep_needed": False,
+        }
+        continuity = {
+            "has_previous_life_day": bool(latest),
+            "previous_tail": latest.get("previous_tail", []) if latest else [],
+            "accumulated_sleep_debt_minutes": sum(
+                row.get("sleep_debt_minutes", 0) for row in history),
+            "sleep_continuity": sleep_continuity,
+            "history_note": ("按可用的既往生命日延续；没有依据的过往事件不得当作事实。"
+                             if latest else "没有可用的既往小满生命日历史；不得编造昨晚/前几天发生过的事实。"),
+        }
         persona = ""
         if planner_context.get("use_persona", True):
             try:
@@ -349,6 +509,11 @@ class ScheduleBroadcastService:
             "allow_custom_theme": planner_context.get("allow_custom_theme", True),
             "weather": planner_context.get("weather", []),
             "recent_life_days": history,
+            "activity_pool": self._activity_pool(),
+            "activity_pool_allow_custom": self._bool("activity_pool_allow_custom", True),
+            "activity_density": self._activity_density(),
+            "sleep_policy": {"target_hours": self._sleep_target_hours()},
+            "continuity": continuity,
         }
 
     def _planner_prompt(self, planner_input):
@@ -360,12 +525,17 @@ class ScheduleBroadcastService:
             "每个 NORMAL 产生 broadcast_message；每个 BRIDGE 产生 enter_message 和 exit_message。"
             "桥接活动须和前后事件一起形成因果连续的一天，不要把分段当成互不相关的活动。"
             "林小满是课表相对宽松的艺术专业大学生；上课只是可能选项，不得默认课堂/食堂/自习/宿舍是每日主轴，也允许整天不上课。"
-            "优先遵循给定 worldview、theme_pool、style_pool 与近期 Xiaoman 历史；主动避免重复近期主题和咖啡/奶茶/设计展/文创店/拍照的安全循环。"
-            "夜生活、晚电影、夜市、聚会、短途活动、宅家和恢复日都可按天气、精力、睡眠、交通与连续性合理选择；24:00 不是默认睡觉时间。"
-            "列出的活动示例只是灵感，不是清单；不要每天塞满高强度活动。人物、地点、天气影响和结果不得无依据编造。"
+            "activity_pool 是小满对具体活动的加权偏好，权重只表示相对偏好，不是精确概率；现实、天气、精力、睡眠和近期重复式样优先于权重。"
+            "activity_pool_allow_custom=true 时可自然安排池外活动；为 false 时，主要休闲/社交活动应来自活动池，除非世界观、日历或既有连续性要求其他安排。不得重复实现 theme_pool：主题池决定日子是什么感觉，活动池提供具体可做的事。"
+            "activity_density 是软目标：relaxed 约1-2项主要活动并留大量自由/休息时间；balanced 约2-3项；busy 约3-4项。不得为凑数量制造活动。完整覆盖24小时不代表必须保持忙碌。睡觉、躺着、打游戏、看视频、发呆、休息、聊天、通勤和慢慢吃饭都可以是长 NORMAL 区块。"
+            "sleep_policy.target_hours 是一般睡眠目标，不是硬性医学规则；偶尔可少睡或多睡，但既往睡眠不足会降低次日活动强度。较长睡眠必须作为独立 sleep 类时间线事件，不要把补觉/回笼觉藏在其他事件的 state。"
+            "如果上一生命日以睡眠结束，且边界前连续睡眠尚未达到目标，通常应把同一睡眠延续到新生命日；不得仅为了腾出活动时间而早起，也不得编造早课、作业、预约或截止日期来解释中断睡眠。若前一生命日很晚仍清醒/在边界时清醒，下一日通常先安排睡眠或恢复。上一日睡眠明显不足时降低活动密度；continuity.accumulated_sleep_debt_minutes 汇总近期睡眠缺口，累积缺口也必须影响后续恢复与活动强度。保护窗 BRIDGE 可以继续同一段睡眠/休息/慢启动，不要为了保护窗凭空制造早课或外出活动。"
+            "只根据 continuity 和 recent_life_days 中明确提供的历史延续。若无可用历史，必须视为没有已知的前夜/前几日事件；不得编造‘昨晚通宵赶作业’等事实，只生成合理的起始状态。近期主要活动、类别、主题、风格和睡眠只用于避免重复及维持连续性。"
+            "优先遵循 worldview、theme_pool、style_pool、天气和真实日历。不要每天塞满高强度活动。人物、地点、天气影响、消费和结果不得无依据编造。"
             "只输出 JSON，不要 Markdown。字段：daily_theme,daily_style,timeline。时间为带时区 ISO 8601。"
-            "NORMAL 项字段：id,kind=NORMAL,start_at,end_at,name,state,broadcast_message。"
-            "BRIDGE 项字段：id,kind=BRIDGE,start_at,end_at,name,state,source_peak_start,source_peak_end,enter_message,exit_message；source_peak_* 原样照抄对应窗口。"
+            "timeline 每项都必须包含 category，且只能是 sleep,rest,meal,travel,school,creative,social,entertainment,outdoor,shopping,errand,mixed,other 之一。"
+            "NORMAL 项字段：id,kind=NORMAL,category,start_at,end_at,name,state,broadcast_message。"
+            "BRIDGE 项字段：id,kind=BRIDGE,category,start_at,end_at,name,state,source_peak_start,source_peak_end,enter_message,exit_message；source_peak_* 原样照抄对应窗口。"
             f"每条消息不得超过 {self._int('max_message_chars', 80, 1)} 个字符。"
         )
         extra = str(self._get("planner_prompt", "") or "").strip()
@@ -386,6 +556,8 @@ class ScheduleBroadcastService:
             if not ident or ident in ids or not a or not b or a >= b:
                 return False, "invalid timeline id or interval"
             ids.add(ident)
+            if row.get("category") not in TIMELINE_CATEGORIES:
+                return False, f"{ident} missing or invalid category"
             if not str(row.get("name", "")).strip():
                 return False, f"{ident} missing name"
             if not isinstance(row.get("state"), str):
