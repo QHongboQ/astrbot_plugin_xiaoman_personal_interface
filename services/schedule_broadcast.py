@@ -125,13 +125,6 @@ class ScheduleBroadcastService:
         value = str(self._get("activity_density", "balanced") or "balanced").strip().lower()
         return value if value in {"relaxed", "balanced", "busy"} else "balanced"
 
-    def _sleep_target_hours(self):
-        try:
-            value = int(self._get("sleep_target_hours", 8))
-        except (TypeError, ValueError, OverflowError):
-            value = 8
-        return max(4, min(12, value))
-
     def _load(self):
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -359,12 +352,6 @@ class ScheduleBroadcastService:
             return cls._legacy_category(row)
         return "other"
 
-    @staticmethod
-    def _minutes(start, end):
-        if not start or not end or end <= start:
-            return 0
-        return int((end - start).total_seconds() // 60)
-
     def _history(self, life_start, recent_days, enabled):
         if not enabled or recent_days <= 0:
             return []
@@ -379,10 +366,6 @@ class ScheduleBroadcastService:
             names = [row.get("name", "") for row in timeline if row.get("name")]
             categorized = [(row, self._history_category(row, legacy=legacy_categories))
                            for row in timeline]
-            sleep = [(row, category) for row, category in categorized if category == "sleep"]
-            sleep_minutes = sum(self._minutes(_absolute(row.get("start_at")),
-                                              _absolute(row.get("end_at")))
-                                for row, _category in sleep)
             tail = [{"category": category, "name": row.get("name", ""),
                      "start_at": row.get("start_at"), "end_at": row.get("end_at"),
                      "state": row.get("state", "")}
@@ -394,56 +377,19 @@ class ScheduleBroadcastService:
                 if (starts and (starts.hour >= 22 or starts.hour < 4)) or any(
                         word in name.lower() for word in ("night", "夜", "凌晨", "宵夜")):
                     late_night.append(name)
-            previous_end = _absolute(plan.get("life_day_end", ""))
             final = categorized[-1] if categorized else (None, "other")
-            ended_awake = bool(final[1] != "sleep")
-            ended_awake_at_boundary = bool(
-                ended_awake and previous_end
-                and _absolute(final[0].get("end_at")) == previous_end)
-            continuous_sleep_rows = []
-            cursor = previous_end
-            for row, category in reversed(categorized):
-                row_start, row_end = _absolute(row.get("start_at")), _absolute(row.get("end_at"))
-                if category != "sleep" or not cursor or row_end != cursor:
-                    break
-                continuous_sleep_rows.append(row)
-                cursor = row_start
-            continuous_sleep_start = cursor if continuous_sleep_rows else None
-            sleep_before_boundary = self._minutes(continuous_sleep_start, previous_end)
-            target_minutes = self._sleep_target_hours() * 60
-            suggested_wake = None
-            if continuous_sleep_start:
-                suggested_wake = continuous_sleep_start + timedelta(minutes=target_minutes)
-            elif ended_awake_at_boundary and previous_end:
-                suggested_wake = previous_end + timedelta(minutes=target_minutes)
+            final_category = final[1] if final[0] else None
             completed.append({"life_day_start": plan.get("life_day_start"),
                               "daily_theme": plan.get("daily_theme", ""),
                               "daily_style": plan.get("daily_style", ""),
                               "major_activities": names,
                               "categories_used": sorted({category for _row, category in categorized}),
-                              "sleep_period": [{"start_at": row.get("start_at"), "end_at": row.get("end_at"),
-                                                "minutes": self._minutes(_absolute(row.get("start_at")),
-                                                                         _absolute(row.get("end_at")))}
-                                               for row, _category in sleep],
-                              "previous_sleep_minutes": sleep_minutes,
-                              "sleep_debt_minutes": max(0, target_minutes - sleep_minutes),
                               "previous_tail": tail,
-                              "sleep_continuity": {
-                                  "target_sleep_hours": self._sleep_target_hours(),
-                                  "previous_sleep_minutes": sleep_minutes,
-                                  "previous_life_day_ended_awake": ended_awake,
-                                  "ended_awake_at_boundary": ended_awake_at_boundary,
-                                  "continuous_sleep_at_boundary": bool(continuous_sleep_rows),
-                                  "continuous_sleep_start_at": continuous_sleep_start.isoformat()
-                                  if continuous_sleep_start else None,
-                                  "sleep_minutes_before_boundary": sleep_before_boundary,
-                                  "suggested_wake_not_before": suggested_wake.isoformat()
-                                  if suggested_wake else None,
-                                  "recovery_sleep_needed": bool(
-                                      sleep_before_boundary < target_minutes
-                                      if continuous_sleep_rows else ended_awake_at_boundary
-                                      or sleep_minutes < target_minutes),
-                              },
+                              "previous_final_category": final_category,
+                              "previous_life_day_ended_awake": (
+                                  False if final_category == "sleep"
+                                  else True if final_category and final_category != "mixed"
+                                  else None),
                               "late_night_behavior": late_night,
                               "previous_final_events": names[-3:]})
         completed.sort(key=lambda row: row.get("life_day_start", ""), reverse=True)
@@ -468,23 +414,12 @@ class ScheduleBroadcastService:
         history = self._history(start_at, int(adaptive.get("recent_days") or 0),
                                 bool(adaptive.get("state_continuity_enabled", True)))
         latest = history[0] if history else None
-        sleep_continuity = (latest.get("sleep_continuity") if latest else None) or {
-            "target_sleep_hours": self._sleep_target_hours(),
-            "previous_sleep_minutes": None,
-            "previous_life_day_ended_awake": None,
-            "ended_awake_at_boundary": None,
-            "continuous_sleep_at_boundary": False,
-            "continuous_sleep_start_at": None,
-            "sleep_minutes_before_boundary": 0,
-            "suggested_wake_not_before": None,
-            "recovery_sleep_needed": False,
-        }
         continuity = {
             "has_previous_life_day": bool(latest),
             "previous_tail": latest.get("previous_tail", []) if latest else [],
-            "accumulated_sleep_debt_minutes": sum(
-                row.get("sleep_debt_minutes", 0) for row in history),
-            "sleep_continuity": sleep_continuity,
+            "previous_final_category": latest.get("previous_final_category") if latest else None,
+            "previous_life_day_ended_awake": (
+                latest.get("previous_life_day_ended_awake") if latest else None),
             "history_note": ("按可用的既往生命日延续；没有依据的过往事件不得当作事实。"
                              if latest else "没有可用的既往小满生命日历史；不得编造昨晚/前几天发生过的事实。"),
         }
@@ -512,7 +447,6 @@ class ScheduleBroadcastService:
             "activity_pool": self._activity_pool(),
             "activity_pool_allow_custom": self._bool("activity_pool_allow_custom", True),
             "activity_density": self._activity_density(),
-            "sleep_policy": {"target_hours": self._sleep_target_hours()},
             "continuity": continuity,
         }
 
@@ -528,9 +462,9 @@ class ScheduleBroadcastService:
             "activity_pool 是小满对具体活动的加权偏好，权重只表示相对偏好，不是精确概率；现实、天气、精力、睡眠和近期重复式样优先于权重。"
             "activity_pool_allow_custom=true 时可自然安排池外活动；为 false 时，主要休闲/社交活动应来自活动池，除非世界观、日历或既有连续性要求其他安排。不得重复实现 theme_pool：主题池决定日子是什么感觉，活动池提供具体可做的事。"
             "activity_density 是软目标：relaxed 约1-2项主要活动并留大量自由/休息时间；balanced 约2-3项；busy 约3-4项。不得为凑数量制造活动。完整覆盖24小时不代表必须保持忙碌。睡觉、躺着、打游戏、看视频、发呆、休息、聊天、通勤和慢慢吃饭都可以是长 NORMAL 区块。"
-            "在 free_window 内，较长睡眠通常应作为独立 category=sleep 的 NORMAL 事件，不要把补觉/回笼觉藏在其他事件的 state。protected_window 的 BRIDGE 必须保持一个不可拆分的顶层事件，因此是睡眠事件独立成项规则的例外：若 BRIDGE 跨越自然的睡眠→醒来→慢启动，可在同一 BRIDGE.state 中写明内部阶段，并通常使用 category=mixed；不要为了避免 mixed 而提前叫醒小满，也不得把一个 BRIDGE 拆成多个顶层事件。如果整个 BRIDGE 确实都在睡觉，category=sleep 仍然合适。"
-            "sleep_policy.target_hours 是一般睡眠目标，不是硬性医学规则；偶尔可少睡或多睡，但既往睡眠不足会降低次日活动强度。"
-            "如果上一生命日以睡眠结束，且边界前连续睡眠尚未达到目标，通常应把同一睡眠延续到新生命日；不得仅为了腾出活动时间而早起，也不得编造早课、作业、预约或截止日期来解释中断睡眠。若前一生命日很晚仍清醒/在边界时清醒，下一日通常先安排睡眠或恢复。上一日睡眠明显不足时降低活动密度；continuity.accumulated_sleep_debt_minutes 汇总近期睡眠缺口，累积缺口也必须影响后续恢复与活动强度。保护窗 BRIDGE 可以继续同一段睡眠/休息/慢启动，不要为了保护窗凭空制造早课或外出活动。"
+            "正常生命日通常应包含一些睡眠或休息，避免24小时连续高强度活动；睡眠只是普通生活事件，睡多久、何时醒来由规划器结合整日主题和上下文自由安排。不要计算或补偿前一日睡眠时长，不要推导睡眠债、恢复时长或必须起床时间，也不要因为晚睡就推断必须晚起，更不要为了证明早起合理而编造早课或截止日期。不要因为上一生命日曾在睡觉就强制新生命日继续睡。"
+            "protected_windows 是结构性的规划锚点，优先级高于睡眠历史；睡眠历史绝不能占用、改变或使保护窗失效。保护 BRIDGE 可按整日主题与上下文安排上课、游乐园、工作室创作、购物、密室、慢启动、休息、睡觉或混合活动，不存在睡眠推导出的起床时间。"
+            "在 free_window 内，较长睡眠通常应作为独立 category=sleep 的 NORMAL 事件，不要把补觉/回笼觉藏在其他事件的 state。protected_window 的 BRIDGE 必须保持一个不可拆分的顶层事件：若它跨越自然的睡眠→醒来→慢启动阶段，可在同一 state 中描述内部过程，通常使用 category=mixed；不得为了避免 mixed 而提前叫醒小满或把 BRIDGE 拆开。若整个 BRIDGE 确实都在睡觉，category=sleep 仍然合适。睡眠/休息是有效的低强度时段，无需替换为活动。"
             "只根据 continuity 和 recent_life_days 中明确提供的历史延续。若无可用历史，必须视为没有已知的前夜/前几日事件；不得编造‘昨晚通宵赶作业’等事实，只生成合理的起始状态。近期主要活动、类别、主题、风格和睡眠只用于避免重复及维持连续性。"
             "优先遵循 worldview、theme_pool、style_pool、天气和真实日历。不要每天塞满高强度活动。人物、地点、天气影响、消费和结果不得无依据编造。"
             "只输出 JSON，不要 Markdown。字段：daily_theme,daily_style,timeline。时间为带时区 ISO 8601。"
