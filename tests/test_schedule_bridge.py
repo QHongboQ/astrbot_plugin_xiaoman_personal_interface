@@ -22,14 +22,15 @@ class Fish:
         self.config = {"manual_override": override, "enabled": enabled}
         self.provider_calls = []
         self.unknown_provider_affected = True
+        self.provider_is_affected = True
     def _cfg(self, key, default=None): return self.config.get(key, default)
     def _periods(self): return [types.SimpleNamespace(start=9 * 3600, end=18 * 3600)]
     def _weekdays(self): return list(range(7))
     def _provider_affected(self, provider_id, prov):
         self.provider_calls.append((provider_id, prov))
-        return self.unknown_provider_affected if prov is None else True
+        return self.unknown_provider_affected if prov is None else self.provider_is_affected
     @staticmethod
-    def _is_peak(local, periods, weekdays): return local.hour >= 9 and local.hour < 18
+    def _is_peak(local, periods, weekdays): return local.weekday() in weekdays and 9 <= local.hour < 18
 
 class Fixture:
     def __init__(self, kind="holiday", fish=None):
@@ -120,12 +121,50 @@ class RollingDayBridgeTests(unittest.TestCase):
                 prompt = plugin.daily_schedule_service.generation._build_prompt(
                     now=datetime(2026,10,7,8), persona_prompt="", sensors={}, policy=None, enhanced=None, anti_repeat=None)
                 self.assertEqual("<XIAOMAN_FAT_FISH_PEAK_BLOCKS>" in prompt, expected)
+                boundary = plugin.daily_schedule_service.generation._build_boundary_prompt(now=datetime(2026,10,7,8))
+                self.assertNotIn("XIAOMAN_FAT_FISH_PEAK_BLOCKS", boundary)
                 if expected:
                     self.assertIn("09:00-12:00、14:00-18:30", prompt)
                     fish._periods = lambda: [types.SimpleNamespace(start=10*3600, end=13*3600)]
                     self.assertIn("10:00-13:00", plugin.daily_schedule_service.generation._build_prompt(
                         now=datetime(2026,10,7,8)))
                 bridge.uninstall()
+
+    def test_peak_prompt_uses_effective_fatfish_policy(self):
+        from datetime import timezone, timedelta
+        for label, day_kind, weekday_set, override, enabled, affected, expected in (
+            ("enabled workday", "workday", list(range(7)), "auto", True, True, True),
+            ("adjusted weekday", "adjusted", list(range(7)), "auto", True, True, True),
+            ("adjusted Saturday excluded by Fat Fish", "adjusted", list(range(5)), "auto", True, True, False),
+            ("holiday", "holiday", list(range(7)), "auto", True, True, False),
+            ("weekend", "weekend", list(range(7)), "auto", True, True, False),
+            ("disabled", "workday", list(range(7)), "auto", False, True, False),
+            ("manual allow", "workday", list(range(7)), "always_allow", True, True, False),
+            ("manual block", "workday", list(range(7)), "always_block", True, True, False),
+            ("provider unaffected", "workday", list(range(7)), "auto", True, False, False),
+            ("provider explicitly unaffected", "workday", list(range(7)), "auto", True, True, False),
+        ):
+            with self.subTest(label=label):
+                ctx, plugin, _ = self._fixture()
+                ctx.day = Day(day_kind)
+                plugin.time_context = types.SimpleNamespace(
+                    now=lambda: datetime(2026,10,7,8,tzinfo=timezone(timedelta(hours=8))),
+                    facts=types.SimpleNamespace(collect=lambda **kw: types.SimpleNamespace(
+                        workday=types.SimpleNamespace(kind=day_kind, available=True, value=day_kind), now=kw["now"])))
+                fish=Fish(override, enabled)
+                fish._weekdays=lambda:weekday_set
+                fish.unknown_provider_affected=affected
+                ctx.stars.append(meta(FF,fish))
+                adapter=TimeAwarenessAdapter(ctx)
+                fat_bridge=FatFishBridge(ctx,adapter); fat_bridge.install()
+                provider_id = "deepseek" if label == "provider explicitly unaffected" else ""
+                if provider_id:
+                    ctx.providers[provider_id]=object()
+                    fish.provider_is_affected=False
+                bridge=RollingDayBridge(ctx,adapter,fat_bridge,provider_id=provider_id)
+                at=datetime(2026,10,10,8,tzinfo=timezone(timedelta(hours=8))) if label == "adjusted Saturday excluded by Fat Fish" else datetime(2026,10,7,8,tzinfo=timezone(timedelta(hours=8)))
+                self.assertEqual(bool(bridge._peak_instruction(at)), expected)
+                bridge.uninstall(); fat_bridge.uninstall()
 
 class BridgeTests(unittest.TestCase):
     def setup_bridge(self, kind="holiday", override="auto", enabled=True):
@@ -252,7 +291,26 @@ class AdapterScheduleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(timeout["status"],"timeout")
         svc.queue_generation=lambda *args,**kwargs:False
         rejected=await adapter.regenerate_date("umo",date(2026,10,8),timeout=1)
-        self.assertEqual(rejected["status"],"failed")
+        self.assertEqual(rejected["status"],"timeout")
+        self.assertIn("not queued",rejected["reason"])
+
+    async def test_regeneration_waits_when_queue_reports_already_running(self):
+        from datetime import date
+        plugin=self.ctx.stars[0].star_cls
+        svc=plugin.daily_schedule_service
+        svc.register_session_async=lambda session,*,trigger=False: __import__("asyncio").sleep(0,result="ph")
+        snapshots=[{"snapshot_id":"old","status":"ready"}]
+        svc.get_snapshot_for_session=lambda session,*,now:snapshots[0]
+        svc.get_failure_for_session=lambda session,*,now:None
+        def queue(*args,**kwargs):
+            async def publish():
+                await __import__("asyncio").sleep(0.02)
+                snapshots[0]={"snapshot_id":"new","status":"ready","slots":[{}]}
+            __import__("asyncio").create_task(publish())
+            return False  # TimeAwareness uses False for an existing persona/date task.
+        svc.queue_generation=queue
+        result=await TimeAwarenessAdapter(self.ctx).regenerate_date("umo",date(2026,10,8),timeout=1)
+        self.assertEqual((result["status"],result["new_id"]),("regenerated","new"))
 
     async def test_regeneration_reports_new_terminal_failure(self):
         from datetime import date
@@ -342,9 +400,37 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
                         "evaluated_at":at,"timezone":"Asia/Shanghai","manual_override":"auto",
                         "provider_affected":True,"day_kind":kind,"day_label":kind}
         self.policy=Policy()
-        self.service=ScheduleBroadcastService(self.ctx,{"schedule_broadcast":{"enable":True,"provider_id":"provider"}},".",fat_fish=self.policy)
+        self.state_dir=tempfile.TemporaryDirectory()
+        self.addCleanup(self.state_dir.cleanup)
+        self.service=ScheduleBroadcastService(self.ctx,{"schedule_broadcast":{"enable":True,"provider_id":"provider"}},self.state_dir.name,fat_fish=self.policy)
         self.saved=[]
         self.service._save=lambda:self.saved.append(json.loads(json.dumps(self.service.state)))
+
+    async def test_admin_regeneration_uses_broadcast_schedule_source_not_admin_umo(self):
+        configured="configured-bot:GroupMessage:persona-source"
+        fallback="qq:GroupMessage:eligible-target"
+        self.service.cfg["schedule_source_umo"]=configured
+        async def targets(): return [fallback]
+        self.service.targets=targets
+        self.assertEqual(await self.service.regeneration_source_session("admin:GroupMessage:other-chat"),configured)
+        self.assertEqual(self.service.schedule_source_session([fallback]),configured)
+        source_reads=[]
+        class Reader:
+            async def get_daily_schedule(_self,session,*,at,allow_generate):
+                source_reads.append((session,allow_generate)); return {"local_date":"2026-10-08"}
+        self.service.day_adapter=Reader()
+        await self.service.read_schedule([fallback])
+        self.assertEqual(source_reads,[(configured,False)])
+        regenerated=[]
+        async def regenerate(session,target_date):
+            regenerated.append((session,target_date)); return {"status":"regenerated"}
+        main=object.__new__(MAIN_MODULE.Main)
+        main._time_awareness=types.SimpleNamespace(regenerate_date=regenerate)
+        await MAIN_MODULE.Main._regenerate_schedule_dates(
+            main,self.service,"admin:GroupMessage:other-chat",[self.now.date()])
+        self.assertEqual(regenerated,[(configured,self.now.date())])
+        self.service.cfg.pop("schedule_source_umo")
+        self.assertEqual(await self.service.regeneration_source_session("admin:GroupMessage:other-chat"),fallback)
 
     async def test_raw_cycle_stitches_two_natural_days_at_configured_boundary(self):
         from datetime import timezone, timedelta
@@ -795,7 +881,7 @@ class BroadcastTests(unittest.IsolatedAsyncioTestCase):
         entries=self.service.plan_for_date(self.now.date())["entries"]
         self.assertTrue(entries[0]["sent"])
         self.assertEqual(len(self.sent),2)
-        reloaded=ScheduleBroadcastService(self.ctx,{"schedule_broadcast":{"enable":True}},".")
+        reloaded=ScheduleBroadcastService(self.ctx,{"schedule_broadcast":{"enable":True}},self.state_dir.name)
         reloaded.state=self.saved[-1]
         self.assertEqual(reloaded.state["plans"][self.now.date().isoformat()]["entries"][0]["delivered_umos"],["qq:FriendMessage:u1","qq:GroupMessage:g1"])
     async def test_partial_delivery_retries_only_failed_target(self):

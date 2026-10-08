@@ -142,9 +142,7 @@ class TimeAwarenessAdapter:
             old_id = str(old.get("snapshot_id", "")) if isinstance(old, dict) else ""
             previous_failure = service.get_failure_for_session(session, now=context_now)
             previous_failure = dict(previous_failure) if isinstance(previous_failure, dict) else None
-            if not service.queue_generation(session, force=True, target_date=target_date):
-                return {"date": target_date.isoformat(), "status": "failed", "old_id": old_id,
-                        "reason": "TimeAwareness rejected generation request (possibly already running)"}
+            queued = bool(service.queue_generation(session, force=True, target_date=target_date))
             deadline = asyncio.get_running_loop().time() + max(0.0, timeout)
             while asyncio.get_running_loop().time() < deadline:
                 snapshot = service.get_snapshot_for_session(session, now=context_now)
@@ -158,7 +156,8 @@ class TimeAwarenessAdapter:
                             "reason": str(failure.get("error_type", "generation failed"))}
                 await asyncio.sleep(0.5)
             return {"date": target_date.isoformat(), "status": "timeout", "old_id": old_id,
-                    "reason": f"no new ready snapshot within {timeout:g}s"}
+                    "reason": (f"no new ready snapshot within {timeout:g}s" if queued else
+                               f"request was not queued and no in-flight result appeared within {timeout:g}s")}
         except Exception as exc:
             return {"date": target_date.isoformat(), "status": "failed", "reason": str(exc) or type(exc).__name__}
     async def get_daily_schedule(self, session: str, *, at: datetime | None = None,

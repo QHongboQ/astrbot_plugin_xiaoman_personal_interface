@@ -13,10 +13,12 @@ from .time_awareness_adapter import TimeAwarenessAdapter
 class RollingDayBridge:
     """Treat TimeAwareness generation_time clock as Xiaoman's life-day boundary."""
 
-    def __init__(self, context, adapter: TimeAwarenessAdapter | None = None, fat_fish=None):
+    def __init__(self, context, adapter: TimeAwarenessAdapter | None = None, fat_fish=None,
+                 provider_id: str = ""):
         self.context = context
         self.adapter = adapter or TimeAwarenessAdapter(context)
         self.fat_fish = fat_fish
+        self.provider_id = provider_id
         self._generation = None
         self._original_plan_prompt = None
         self._original_boundary_prompt = None
@@ -45,17 +47,17 @@ class RollingDayBridge:
             "\n</XIAOMAN_ROLLING_DAY>"
         )
 
-    def peak_windows(self) -> list[tuple[str, str]]:
-        """Read current Fat Fish periods without caching or changing its config."""
-        fish = self.fat_fish.discover() if self.fat_fish is not None else None
-        if fish is None:
+    def peak_windows(self, at=None) -> list[tuple[str, str]]:
+        """Return only windows Fat Fish's effective runtime policy marks as peak."""
+        if self.fat_fish is None:
             return []
         try:
-            periods = fish._periods()
+            now = at or self.adapter.current_time()
+            effective = self.fat_fish.effective_peak_periods(now, provider_id=self.provider_id)
         except Exception:
             return []
         result = []
-        for period in periods or []:
+        for period, _midpoint in effective:
             try:
                 start, end = int(period.start), int(period.end)
             except (AttributeError, TypeError, ValueError):
@@ -69,7 +71,7 @@ class RollingDayBridge:
     def _peak_instruction(self, now) -> str:
         if now is None or self.adapter.get_day_policy(now).get("kind") not in {"workday", "adjusted"}:
             return ""
-        windows = self.peak_windows()
+        windows = self.peak_windows(now)
         if not windows:
             return ""
         ranges = "、".join(f"{start}-{end}" for start, end in windows)
@@ -118,7 +120,7 @@ class RollingDayBridge:
         if callable(original_boundary):
             def boundary_wrapper(*args, **kwargs):
                 base = original_boundary(*args, **kwargs)
-                return str(base) + bridge._instruction() + bridge._peak_instruction(kwargs.get("now"))
+                return str(base) + bridge._instruction()
 
             self._original_boundary_prompt = original_boundary
             self._boundary_wrapper = boundary_wrapper

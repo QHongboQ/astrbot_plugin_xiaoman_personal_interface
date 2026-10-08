@@ -39,7 +39,8 @@ class Main(Star):
         self._fat_fish_bridge = FatFishBridge(self.context, self._time_awareness)
         self._fat_fish_bridge.install()
         self._rolling_day_bridge = RollingDayBridge(
-            self.context, self._time_awareness, self._fat_fish_bridge)
+            self.context, self._time_awareness, self._fat_fish_bridge,
+            provider_id=str(cfg.get("provider_id", "") or ""))
         if cfg.get("rolling_day_bridge_enabled", True):
             self._rolling_day_bridge.install()
         if not cfg.get("enable", False):
@@ -70,6 +71,12 @@ class Main(Star):
             self._rolling_day_bridge.ensure_installed()
         adapter = self._time_awareness or TimeAwarenessAdapter(self.context)
         return await adapter.get_daily_schedule(session, at=at, allow_generate=allow_generate)
+
+    async def _regenerate_schedule_dates(self, service, admin_umo, dates):
+        """Regenerate the same Persona used by broadcast reads, not the admin chat."""
+        source_session = await service.regeneration_source_session(admin_umo)
+        return [await self._time_awareness.regenerate_date(source_session, target_date)
+                for target_date in dates]
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("xiaoman_broadcast")
@@ -124,8 +131,8 @@ class Main(Star):
                 dates = [now.date() + timedelta(days=1)]
             else:
                 dates = self._time_awareness.rolling_day_dates(now)
-            results = [await self._time_awareness.regenerate_date(
-                event.unified_msg_origin, target_date) for target_date in dates]
+            results = await self._regenerate_schedule_dates(
+                service, event.unified_msg_origin, dates)
             rows = []
             for result in results:
                 if result["status"] == "regenerated":

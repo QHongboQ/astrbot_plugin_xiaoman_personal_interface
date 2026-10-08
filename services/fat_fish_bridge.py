@@ -1,7 +1,7 @@
 """Small runtime bridge for Fat Fish 1.1.1 wallet policy."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone as datetime_timezone
 from importlib import import_module
 from zoneinfo import ZoneInfo
 
@@ -105,6 +105,49 @@ class FatFishBridge:
                 "day_kind": day.get("kind", "unknown"), "day_label": day.get("label", ""),
                 "timezone": timezone, "manual_override": override,
                 "provider_affected": affected, "evaluated_at": local}
+
+    @staticmethod
+    def is_effective_peak(policy):
+        """Whether the existing wallet policy actually blocks at this instant."""
+        return bool(
+            policy.get("found") and policy.get("enabled")
+            and policy.get("provider_affected")
+            and policy.get("manual_override", "auto") == "auto"
+            and policy.get("state") == "peak"
+        )
+
+    def effective_peak_periods(self, at, *, provider_id=None):
+        """Return only active periods Fat Fish evaluates as peak for this date/provider."""
+        fish = self.discover()
+        if fish is None:
+            return []
+        if self.instance is not fish or self._original_cfg is None:
+            self.install()
+        try:
+            periods = fish._periods()
+            timezone = str(self._config("timezone", "Asia/Shanghai") or "Asia/Shanghai")
+            try:
+                zone = ZoneInfo(timezone)
+            except Exception:
+                if timezone not in {"Asia/Shanghai", "UTC", "Etc/UTC"}:
+                    return []
+                zone = datetime_timezone(timedelta(hours=8), "Asia/Shanghai") if timezone == "Asia/Shanghai" else datetime_timezone.utc
+            local = at.replace(tzinfo=zone) if at.tzinfo is None else at.astimezone(zone)
+        except Exception:
+            return []
+        midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+        effective = []
+        for period in periods or []:
+            try:
+                start, end = int(period.start), int(period.end)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if start < 0 or end <= start:
+                continue
+            midpoint = midnight + timedelta(seconds=(start + end) / 2)
+            if self.is_effective_peak(self.get_wallet_policy(at=midpoint, provider_id=provider_id)):
+                effective.append((period, midpoint))
+        return effective
 
     def uninstall(self):
         fish = self.instance
